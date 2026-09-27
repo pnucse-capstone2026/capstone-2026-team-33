@@ -1,0 +1,344 @@
+package com.capstone.decision.infrastructure.dashboard
+
+import com.capstone.decision.application.dashboard.ArtifactIngestStatusView
+import com.capstone.decision.application.dashboard.DashboardArtifactKind
+import com.capstone.decision.application.dashboard.DashboardUnavailableException
+import com.capstone.decision.application.dashboard.DashboardViewPort
+import com.capstone.decision.application.dashboard.LatestArtifactRunView
+import com.capstone.decision.application.dashboard.RecentRiskResultView
+import com.capstone.decision.application.security.AuthenticatedActorRef
+import com.capstone.decision.infrastructure.security.ActorCapabilityBinding
+import com.capstone.decision.infrastructure.security.ActorCapabilityIssuer
+import com.capstone.decision.infrastructure.security.ActorCapabilityRolePolicy
+import org.springframework.beans.factory.ObjectProvider
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate
+import org.springframework.stereotype.Repository
+import tools.jackson.databind.JsonNode
+import tools.jackson.databind.ObjectMapper
+import java.sql.ResultSet
+import java.time.Clock
+import java.time.OffsetDateTime
+
+@Repository
+class JdbcDashboardViewAdapter(
+    private val jdbcProvider: ObjectProvider<NamedParameterJdbcTemplate>,
+    private val objectMapper: ObjectMapper,
+    private val clock: Clock,
+    private val actorCapabilityIssuer: ActorCapabilityIssuer,
+) : DashboardViewPort {
+    override fun artifact(
+        actorUserId: String,
+        securityVersion: Long,
+        kind: DashboardArtifactKind,
+        runId: String,
+    ): JsonNode? =
+        protect {
+            val binding =
+                ActorCapabilityBinding.request(
+                    "READ_DASHBOARD_ARTIFACT",
+                    "DASHBOARD_ARTIFACT",
+                    runId,
+                    ActorCapabilityRolePolicy.OWNER,
+                    kind.name,
+                    runId,
+                )
+            jdbc()
+                .query(
+                    "SELECT * FROM read_dashboard_artifact_view_authorized(:capability,:actor,:version,:kind,:runId)",
+                    mapOf(
+                        "capability" to actorCapabilityIssuer.issue(AuthenticatedActorRef.current(actorUserId, securityVersion), binding),
+                        "actor" to actorUserId,
+                        "version" to securityVersion,
+                        "kind" to kind.name,
+                        "runId" to runId,
+                    ),
+                ) { result, _ ->
+                    val envelope = objectMapper.readTree(result.getString("projection_json"))
+                    require(envelope.path("success").asBoolean() && envelope.path("data").isObject)
+                    val embedded = envelope.path("data")
+                    val viewState = embedded.path("viewState").stringValue()
+                    require(viewState in setOf("READY", "EMPTY", "STALE"))
+                    node(
+                        mapOf(
+                            "viewState" to viewState,
+                            "asOf" to result.instant("as_of").toString(),
+                            "freshUntil" to result.instant("fresh_until").toString(),
+                            "evidenceMode" to result.getString("evidence_mode"),
+                            "performanceClaimAllowed" to false,
+                            "view" to embedded.path("view"),
+                        ),
+                    )
+                }.singleOrNull()
+        }
+
+    override fun latestArtifactRun(
+        actorUserId: String,
+        securityVersion: Long,
+        kind: DashboardArtifactKind,
+    ): LatestArtifactRunView? =
+        protect {
+            val binding =
+                ActorCapabilityBinding.request(
+                    "READ_DASHBOARD_ARTIFACT",
+                    "DASHBOARD_ARTIFACT",
+                    "latest",
+                    ActorCapabilityRolePolicy.OWNER,
+                    kind.name,
+                    "latest",
+                )
+            jdbc()
+                .query(
+                    "SELECT * FROM latest_dashboard_artifact_run_authorized(:capability,:actor,:version,:kind)",
+                    mapOf(
+                        "capability" to actorCapabilityIssuer.issue(AuthenticatedActorRef.current(actorUserId, securityVersion), binding),
+                        "actor" to actorUserId,
+                        "version" to securityVersion,
+                        "kind" to kind.name,
+                    ),
+                ) { result, _ ->
+                    LatestArtifactRunView(
+                        runId = result.getString("run_id"),
+                        fixtureClass = result.getString("fixture_class"),
+                        asOf = result.instant("as_of"),
+                    )
+                }.singleOrNull()
+        }
+
+    override fun risk(
+        actorUserId: String,
+        securityVersion: Long,
+        decisionId: String,
+    ): JsonNode? =
+        protect {
+            val binding =
+                ActorCapabilityBinding.target(
+                    "READ_DASHBOARD_RISK",
+                    "RISK_DECISION",
+                    decisionId,
+                    ActorCapabilityRolePolicy.OWNER,
+                )
+            jdbc()
+                .query(
+                    "SELECT * FROM read_dashboard_risk_view_authorized(:capability,:actor,:version,:decisionId)",
+                    mapOf(
+                        "capability" to actorCapabilityIssuer.issue(AuthenticatedActorRef.current(actorUserId, securityVersion), binding),
+                        "actor" to actorUserId,
+                        "version" to securityVersion,
+                        "decisionId" to decisionId,
+                    ),
+                ) { result, _ ->
+                    val asOf = result.instant("evaluation_as_of")
+                    val freshUntil = result.instant("valid_until")
+                    node(
+                        mapOf(
+                            "viewState" to if (freshUntil.isBefore(clock.instant())) "STALE" else "READY",
+                            "asOf" to asOf.toString(),
+                            "freshUntil" to freshUntil.toString(),
+                            "evidenceMode" to "STORED_RUNTIME",
+                            "performanceClaimAllowed" to false,
+                            "view" to
+                                mapOf(
+                                    "decisionId" to result.getString("decision_id"),
+                                    "action" to result.getString("outcome"),
+                                    "reasons" to json(result, "reasons"),
+                                    "principles" to json(result, "principles"),
+                                    "riskItems" to json(result, "risk_items"),
+                                ),
+                        ),
+                    )
+                }.singleOrNull()
+        }
+
+    override fun latestRisk(
+        actorUserId: String,
+        securityVersion: Long,
+    ): RecentRiskResultView? =
+        riskIndex(actorUserId, securityVersion, "latest", "LATEST_RISK", "latest_dashboard_risk_result_authorized")
+            .singleOrNull()
+
+    override fun recentRisks(
+        actorUserId: String,
+        securityVersion: Long,
+    ): List<RecentRiskResultView> =
+        riskIndex(actorUserId, securityVersion, "recent", "RECENT_RISK", "recent_dashboard_risk_results_authorized")
+
+    private fun riskIndex(
+        actorUserId: String,
+        securityVersion: Long,
+        targetId: String,
+        payloadKind: String,
+        functionName: String,
+    ): List<RecentRiskResultView> =
+        protect {
+            val binding =
+                ActorCapabilityBinding.request(
+                    "READ_DASHBOARD_RISK",
+                    "RISK_DECISION",
+                    targetId,
+                    ActorCapabilityRolePolicy.OWNER,
+                    payloadKind,
+                    targetId,
+                )
+            jdbc().query(
+                "SELECT * FROM $functionName(:capability,:actor,:version)",
+                mapOf(
+                    "capability" to actorCapabilityIssuer.issue(AuthenticatedActorRef.current(actorUserId, securityVersion), binding),
+                    "actor" to actorUserId,
+                    "version" to securityVersion,
+                ),
+            ) { result, _ ->
+                RecentRiskResultView(
+                    decisionId = result.getString("decision_id"),
+                    action = result.getString("outcome"),
+                    symbol = result.getString("symbol"),
+                    asOf = result.instant("evaluation_as_of"),
+                    validUntil = result.instant("valid_until"),
+                )
+            }
+        }
+
+    override fun rag(
+        actorUserId: String,
+        securityVersion: Long,
+        answerId: String,
+    ): JsonNode? =
+        protect {
+            val binding =
+                ActorCapabilityBinding.target(
+                    "READ_DASHBOARD_RAG",
+                    "RAG_ANSWER",
+                    answerId,
+                    ActorCapabilityRolePolicy.OWNER,
+                )
+            jdbc()
+                .query(
+                    "SELECT * FROM read_dashboard_rag_sources_authorized(:capability,:actor,:version,:answerId)",
+                    mapOf(
+                        "capability" to actorCapabilityIssuer.issue(AuthenticatedActorRef.current(actorUserId, securityVersion), binding),
+                        "actor" to actorUserId,
+                        "version" to securityVersion,
+                        "answerId" to answerId,
+                    ),
+                ) { result, _ ->
+                    val createdAt = result.instant("created_at")
+                    val expiresAt = result.instant("expires_at")
+                    val sources = json(result, "sources")
+                    node(
+                        mapOf(
+                            "viewState" to if (expiresAt.isBefore(clock.instant())) "STALE" else "READY",
+                            "asOf" to createdAt.toString(),
+                            "freshUntil" to expiresAt.toString(),
+                            "evidenceMode" to "STORED_RUNTIME",
+                            "performanceClaimAllowed" to false,
+                            "view" to
+                                mapOf(
+                                    "answerId" to result.getString("answer_id"),
+                                    "topSources" to sources.take(3),
+                                    "expandableSources" to sources.take(5),
+                                ),
+                        ),
+                    )
+                }.singleOrNull()
+        }
+
+    override fun artifactStatuses(
+        actorUserId: String,
+        securityVersion: Long,
+    ): List<ArtifactIngestStatusView>? =
+        protect {
+            val binding =
+                ActorCapabilityBinding.request(
+                    "LIST_ARTIFACT_STATUS",
+                    "ARTIFACT_STATUS_LIST",
+                    "artifact-statuses",
+                    ActorCapabilityRolePolicy.ADMIN_ONLY,
+                )
+            jdbc().query(
+                "SELECT * FROM list_artifact_ingest_status_authorized(:capability,:actor,:version)",
+                mapOf(
+                    "capability" to actorCapabilityIssuer.issue(AuthenticatedActorRef.current(actorUserId, securityVersion), binding),
+                    "actor" to actorUserId,
+                    "version" to securityVersion,
+                ),
+            ) { result, _ ->
+                ArtifactIngestStatusView(
+                    artifactId = result.getString("artifact_id"),
+                    fileName = result.getString("file_name"),
+                    producer = result.getString("producer"),
+                    runId = result.getString("run_id"),
+                    fileHash = result.getString("file_hash"),
+                    schemaVersion = result.getString("schema_version"),
+                    status = result.getString("status"),
+                    lastIngestedAt = result.getObject("last_ingested_at", OffsetDateTime::class.java)?.toInstant(),
+                    duplicate = result.getBoolean("duplicate"),
+                )
+            }
+        }
+
+    override fun performanceReport(
+        actorUserId: String,
+        securityVersion: Long,
+    ): JsonNode? =
+        protect {
+            val binding =
+                ActorCapabilityBinding.request(
+                    "READ_DASHBOARD_ARTIFACT",
+                    "DASHBOARD_ARTIFACT",
+                    "performance-latest",
+                    ActorCapabilityRolePolicy.OWNER,
+                    "PERFORMANCE_REPORT",
+                    "latest",
+                )
+            jdbc()
+                .query(
+                    """
+                    SELECT * FROM read_latest_owner_performance_report_authorized_v1(
+                      :capability,:actor,:version
+                    )
+                    """.trimIndent(),
+                    mapOf(
+                        "capability" to
+                            actorCapabilityIssuer.issue(
+                                AuthenticatedActorRef.current(actorUserId, securityVersion),
+                                binding,
+                            ),
+                        "actor" to actorUserId,
+                        "version" to securityVersion,
+                    ),
+                ) { result, _ ->
+                    val report = objectMapper.readTree(result.getString("report_json"))
+                    require(report.path("contractId").stringValue() == "owner-performance-report.v1")
+                    require(report.path("sections").isObject)
+                    val failureCode = result.getString("last_failure_code")
+                    val failureAt = result.getObject("last_failure_at", OffsetDateTime::class.java)?.toInstant()
+                    node(
+                        mapOf(
+                            "report" to report,
+                            "lastRefreshStatus" to if (failureCode == null) "SUCCESS" else "FAILED_LAST_SUCCESS_PRESERVED",
+                            "lastFailureCode" to failureCode,
+                            "lastFailureAt" to failureAt?.toString(),
+                        ),
+                    )
+                }.singleOrNull()
+        }
+
+    private fun ResultSet.instant(column: String) = getObject(column, OffsetDateTime::class.java).toInstant()
+
+    private fun json(
+        result: ResultSet,
+        column: String,
+    ): JsonNode = objectMapper.readTree(result.getString(column))
+
+    private fun node(value: Any): JsonNode = objectMapper.readTree(objectMapper.writeValueAsString(value))
+
+    private fun jdbc(): NamedParameterJdbcTemplate = jdbcProvider.getIfAvailable() ?: throw DashboardUnavailableException()
+
+    private fun <T> protect(block: () -> T): T =
+        try {
+            block()
+        } catch (exception: DashboardUnavailableException) {
+            throw exception
+        } catch (exception: RuntimeException) {
+            throw DashboardUnavailableException(exception)
+        }
+}

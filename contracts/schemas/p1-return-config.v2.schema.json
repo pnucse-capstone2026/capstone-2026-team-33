@@ -1,0 +1,80 @@
+{
+  "$id": "contracts/schemas/p1-return-config.v2.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "contractId": {
+      "const": "p1-return-config.v2"
+    },
+    "fileName": {
+      "const": "config.json"
+    },
+    "semantic": {
+      "additionalProperties": false,
+      "properties": {
+        "deterministicAlgorithms": {
+          "const": true
+        },
+        "dropout": {
+          "exclusiveMaximum": 1,
+          "minimum": 0,
+          "type": "number"
+        },
+        "hiddenSize": {
+          "maximum": 1024,
+          "minimum": 8,
+          "type": "integer"
+        },
+        "layerCount": {
+          "maximum": 8,
+          "minimum": 1,
+          "type": "integer"
+        },
+        "learningRate": {
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "type": "number"
+        },
+        "loss": {
+          "const": "SmoothL1"
+        },
+        "optimizer": {
+          "const": "Adam"
+        },
+        "outputSize": {
+          "const": 1
+        },
+        "seed": {
+          "const": 0
+        },
+        "threadCount": {
+          "const": 1
+        },
+        "windowSize": {
+          "const": 20
+        }
+      },
+      "required": [
+        "windowSize",
+        "hiddenSize",
+        "layerCount",
+        "dropout",
+        "outputSize",
+        "loss",
+        "optimizer",
+        "learningRate",
+        "seed",
+        "threadCount",
+        "deterministicAlgorithms"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "contractId",
+    "fileName",
+    "semantic"
+  ],
+  "title": "p1-return-config.v2",
+  "type": "object"
+}

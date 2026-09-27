@@ -1,0 +1,232 @@
+{
+  "autonomy": {
+    "activationRemainsManualCas": true,
+    "automaticModelActivation": false,
+    "automaticRetrain": true,
+    "exitCodes": {
+      "needsHuman": 2,
+      "noProgress": 1,
+      "progress": 0
+    },
+    "forwardOnlyExceptRequalification": true,
+    "needsHumanIsTerminalWithoutOperator": true,
+    "noProgressIsNotFailure": true,
+    "phases": [
+      "MATERIALIZING",
+      "QUALIFYING",
+      "SERVING",
+      "NEEDS_HUMAN"
+    ],
+    "requalificationReentersFrom": "SERVING",
+    "stateFile": "state.json",
+    "stateHistoryAppendOnly": true,
+    "stateHistoryFile": "state-history.jsonl",
+    "stateVersion": "s5-run-state-v1",
+    "tickEntrypoint": "s5-tick",
+    "tickIsIdempotent": true,
+    "tickReliesOnJournalQueryIdempotence": true
+  },
+  "calendar": {
+    "authorityOrder": [
+      "KIS_CTCA0903R_OPND_YN",
+      "NON_EXPIRED_HEALTHY_NON_CONFLICTED_PRIOR_CANONICAL",
+      "PINNED_XKRX_BASE"
+    ],
+    "baseCalendar": "XKRX",
+    "baseLibrary": "exchange-calendars",
+    "baseVersion": "4.13.2",
+    "correctionSetSha256": "20e17fc6bf8b21b2ad8acfc18e8f541535f300471e77f08464cfbfa70c6cdeb9",
+    "corrections": [
+      {
+        "evidenceClass": "CTCA0903R_CONFIRMED_CALENDAR_CORRECTION",
+        "isOpen": false,
+        "reason": "2026_LOCAL_ELECTION_MARKET_CLOSURE",
+        "sessionDate": "2026-06-03"
+      },
+      {
+        "evidenceClass": "CTCA0903R_CONFIRMED_CALENDAR_CORRECTION",
+        "isOpen": false,
+        "reason": "2026_CONSTITUTION_DAY_MARKET_CLOSURE",
+        "sessionDate": "2026-07-17"
+      }
+    ],
+    "policyVersion": "xkrx-4.13.2-kis-corrections-v1",
+    "supersededCorrectionSets": [
+      {
+        "correctionSetSha256": "82fbb91db94aaae154323be3340648f37afcead3e42ab8b600c1b22699475ad5",
+        "sessionDates": [],
+        "usage": "READ_ONLY_RECOVERY_VALIDATION"
+      },
+      {
+        "correctionSetSha256": "30530e6f4ff06ac3ab71a748c910c87cd9233c70382f348e00c387684cdde169",
+        "sessionDates": [
+          "2026-06-03"
+        ],
+        "usage": "READ_ONLY_RECOVERY_VALIDATION"
+      }
+    ],
+    "supersededGenerationsArePreserved": true
+  },
+  "contractId": "s5-bootstrap-calendar-recovery-lock.v1",
+  "coverage": {
+    "diagnosticLedger": "diagnostics.jsonl",
+    "fixedEtfCoverageRule": "FULL_RAW_WINDOW",
+    "kisCoverageAuthority": "COLLECTED_KRX_DAILY_TRADING_EVIDENCE",
+    "kisCoverageRule": "EXACT_MATCH_WITH_KRX_TRADING_EVIDENCE",
+    "ledgerCarriesProviderPayload": false,
+    "ledgerNamesDivergingSymbol": true,
+    "pagingStopsWhenEvidenceIsSatisfied": true,
+    "pagingWindowSource": "PACKET_RAW_WINDOW",
+    "providerCallsDuringBlock": 0,
+    "tradedSessionsMustBeContiguous": true
+  },
+  "derivedDimensions": {
+    "dailyTotalMax": "dailyKrx + dailyKis + dailyKisToken + dailyEcos",
+    "ecosChunkDays": "<= ECOS_MAX_ROWS_PER_REQUEST",
+    "eligibleSessionCount": "RAW_SESSION_COUNT - WARMUP_SESSIONS - LABEL_TAIL_SESSIONS",
+    "kisMaxGet": "HORIZON_UNION_SIZE * ceil(RAW_SESSION_COUNT / 100)",
+    "kisSourceRowCap": "HORIZON_UNION_SIZE * RAW_SESSION_COUNT",
+    "krxMaxGet": "RAW_SESSION_COUNT * 4 + MONTHLY_SCHEDULE_COUNT * 3",
+    "literalDuplicationOfDerivedDimension": false,
+    "totalMaxPhysicalCalls": "krx + kis + kisToken + ecos",
+    "walkForwardBlockSizesRemainLiteral": true,
+    "walkForwardExpectedSessions": "ELIGIBLE_SESSION_COUNT"
+  },
+  "diagnostics": {
+    "appendOnly": true,
+    "carriesProviderPayload": false,
+    "eventVersion": "s5-diagnostic-event-v1",
+    "ledgerFile": "diagnostics.jsonl",
+    "maxExcludedUnitRatio": 0.01,
+    "outcomeClasses": [
+      "BUDGET_EXHAUSTED",
+      "CONTRACT_VIOLATION",
+      "EVIDENCE_GAP",
+      "RETRYABLE_TRANSIENT"
+    ],
+    "recordingFailureChangesCollectionOutcome": false,
+    "reportKinds": [
+      "CALENDAR_DIVERGENCE_SUSPECTED",
+      "COVERAGE_REPORT",
+      "QUALIFICATION_REPORT"
+    ],
+    "reportKindsAreNotOutcomeClasses": true,
+    "unclassifiedFailureOutcome": "CONTRACT_VIOLATION"
+  },
+  "divergence": {
+    "blockBytesDependOnPacketAndCandidatesOnly": true,
+    "blockFile": "calendar-divergence-candidates.json",
+    "blockIsGateTokenNotLedgerEntry": true,
+    "blockVersion": "s5-calendar-divergence-block-v1",
+    "evidenceClasses": [
+      {
+        "detection": "EMPTY_DAILY_PROJECTION_ON_CLAIMED_SESSION",
+        "evidence": "EMPTY_DAILY_PROJECTION",
+        "resumePacketAuthored": false,
+        "unresolvedBlockStopsResume": true
+      },
+      {
+        "detection": "SINGLE_SESSION_FAILURE_AFTER_HEALTHY_NEIGHBOURS",
+        "evidence": "SINGLE_SESSION_QUERY_FAILURE",
+        "resumePacketAuthored": true,
+        "unresolvedBlockStopsResume": false
+      }
+    ],
+    "mirroredToDiagnosticLedger": true,
+    "providerCallsDuringBlock": 0,
+    "result": "CALENDAR_DIVERGENCE_SUSPECTED"
+  },
+  "downstream": {
+    "openApiChange": 0,
+    "orderWiring": 0,
+    "providerRawArtifactInGit": 0,
+    "riskDecisionWiring": 0,
+    "signalContractChange": 0
+  },
+  "holidayAuthority": {
+    "attestationStatuses": [
+      "API_CONFIRMED",
+      "CALENDAR_AUTHORITY_CONFLICT",
+      "CALENDAR_AUTHORITY_UNVERIFIED"
+    ],
+    "canonicalTable": "trading_sessions",
+    "maxPhysicalCalls": 32,
+    "mode": "LIVE_ONLY",
+    "packetHashRemainsStatic": true,
+    "requiredRole": "decision_collector",
+    "scope": "DIVERGENCE_CANDIDATE_SESSIONS_ONLY",
+    "separateFromBootstrapBudget": true,
+    "sourceId": "kis-holiday-ctca0903r",
+    "transactionId": "CTCA0903R",
+    "unobservedCorrectionResult": "CALENDAR_AUTHORITY_UNVERIFIED"
+  },
+  "issue": 135,
+  "packet": {
+    "currentVersion": "s5-production-bootstrap-packet-v2",
+    "freshAuthorityFile": "fresh-bootstrap-authority.v1.json",
+    "freshAuthorityMode": "IMMUTABLE_ABSENT_TO_SHA_CAS",
+    "freshExecutionsPerApprovedRoot": 1,
+    "historicalV1Mode": "READ_ONLY_RECOVERY_VALIDATION",
+    "recoveryBindingRequired": true,
+    "recoveryLineageMode": "CALENDAR_RECOVERY",
+    "rootLockFile": ".bootstrap-root.lock"
+  },
+  "recovery": {
+    "adoptedProvidersCarryingChunks": [
+      "KRX",
+      "KIS"
+    ],
+    "adoptionJournalRequired": true,
+    "allowanceBindingSurfaces": [
+      "PACKET_BYTES",
+      "RECOVERY_BINDING_PREIMAGE",
+      "RECOVERY_RECEIPT",
+      "ADOPTION_JOURNAL"
+    ],
+    "approvedKrxMaxPhysicalGet": 4441,
+    "blockBeforeProviderClientWhenCapacityExhausted": true,
+    "chainHeadDerivedFromConsumedQueryMultiset": true,
+    "chainableFromSupersededRecoveryPacket": true,
+    "cumulativeFailedAttemptsConsumeBudget": true,
+    "kisLogicalQuerySetDerivedFromCollectedKrxEvidence": true,
+    "kisTokenSuccessAdoptable": false,
+    "logicalQueryCountUnchangedByAllowance": true,
+    "maxSupersededAllowance": 8,
+    "perQueryRetryBudgetScope": "CURRENT_GENERATION",
+    "physicalAttemptsPerLogicalQuery": 2,
+    "priorJournalReadUnderItsOwnGeneration": true,
+    "priorPacketIsChainHead": true,
+    "providerCallsDuringAssessment": 0,
+    "receiptCarriesSupersededQuerySet": true,
+    "receiptMissingResult": "PACKET_OR_ROOT_INVALID",
+    "successfulChunkRecall": 0,
+    "supersedeMustChangePacketIdentity": true,
+    "supersededAllowanceDerivation": "PROVEN_SUPERSEDED_CONSUMED_CALLS",
+    "supersededAllowanceEqualsSupersededConsumedCalls": true,
+    "supersededAllowanceLineage": "CALENDAR_RECOVERY",
+    "supersededConsumedCallsCountTowardCumulativeBudget": true,
+    "supersededProviders": [
+      "KRX",
+      "KIS"
+    ],
+    "supersededQueryIdentityResolvedAcrossApprovedGenerations": true,
+    "temporalReceiptRebindingRequired": true
+  },
+  "trainingAppend": {
+    "chunksCopiedNotReferenced": true,
+    "conflictingSessionEvidenceRefused": true,
+    "directory": "append",
+    "historyRecollection": 0,
+    "holidayTickIsNoOpByCalendarAuthority": true,
+    "indexAppendOnly": true,
+    "indexFile": "index.jsonl",
+    "indexVersion": "s5-training-append-index-v1",
+    "maxChunksPerSession": 41,
+    "newMonthlyMemberWithoutWarmupIsEvidenceGap": true,
+    "packetWindowUnchanged": true,
+    "replayIsIdempotent": true,
+    "trainingWindowCutoffRederivedFromLatestSession": true,
+    "trainingWindowDerivedFrom": "BUNDLE_UNION_APPEND",
+    "trainingWindowKeepsApprovedDimensions": true
+  }
+}

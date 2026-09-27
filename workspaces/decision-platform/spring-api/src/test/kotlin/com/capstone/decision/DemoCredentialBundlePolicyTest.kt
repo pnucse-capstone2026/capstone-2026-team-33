@@ -1,0 +1,394 @@
+package com.capstone.decision
+
+import com.capstone.decision.infrastructure.brokerage.BrokerageProperties
+import com.capstone.decision.infrastructure.decision.DecisionProperties
+import com.capstone.decision.infrastructure.grpc.BrokerageGrpcProperties
+import com.capstone.decision.infrastructure.grpc.DecisionGrpcProperties
+import com.capstone.decision.infrastructure.grpc.FinancialEngineeringGrpcProperties
+import com.capstone.decision.infrastructure.grpc.RagGrpcProperties
+import com.capstone.decision.infrastructure.principle.PrincipleProperties
+import com.capstone.decision.infrastructure.rag.RagGuardHistoryProperties
+import com.capstone.decision.infrastructure.security.DemoAccounts
+import com.capstone.decision.infrastructure.security.DemoCredentialBootstrapProperties
+import com.capstone.decision.infrastructure.security.DemoCredentialBundlePolicy
+import com.capstone.decision.infrastructure.security.JwtProperties
+import com.capstone.decision.infrastructure.security.LoginAttemptLimiterProperties
+import com.capstone.decision.infrastructure.security.SecurityConfig
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotEquals
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertDoesNotThrow
+import org.junit.jupiter.api.assertThrows
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder
+import java.security.MessageDigest
+import java.util.Base64
+
+// bundle 정책은 BCrypt의 정상적인 salt 차이를 plaintext 분리 증거로 오인하지 않도록 고정한다.
+class DemoCredentialBundlePolicyTest {
+    private val encoder = BCryptPasswordEncoder(12)
+    private val separationKey = ByteArray(32) { index -> (index + 1).toByte() }
+    private val user = DemoAccounts.identities.single { it.username == "demo-user" }
+    private val admin = DemoAccounts.identities.single { it.username == "demo-admin" }
+
+    @Test
+    fun `same plaintext with different bcrypt salts has one reuse tag and is rejected`() {
+        val plaintext = "synthetic-shared-demo-password"
+        val userBundle = prepare(user.userId, plaintext)
+        val adminBundle = prepare(admin.userId, plaintext)
+        val verifiedUser = DemoCredentialBundlePolicy.verify(userBundle, user, separationKey)
+        val verifiedAdmin = DemoCredentialBundlePolicy.verify(adminBundle, admin, separationKey)
+
+        assertNotEquals(verifiedUser.passwordHash, verifiedAdmin.passwordHash)
+        assertTrue(MessageDigest.isEqual(verifiedUser.reuseTag, verifiedAdmin.reuseTag))
+        assertThrows<IllegalArgumentException> {
+            DemoCredentialBundlePolicy.requireSeparated(verifiedUser, verifiedAdmin)
+        }
+    }
+
+    @Test
+    fun `distinct plaintexts produce valid separated role bound bundles`() {
+        val verifiedUser =
+            DemoCredentialBundlePolicy.verify(
+                prepare(user.userId, "synthetic-user-password"),
+                user,
+                separationKey,
+            )
+        val verifiedAdmin =
+            DemoCredentialBundlePolicy.verify(
+                prepare(admin.userId, "synthetic-admin-password"),
+                admin,
+                separationKey,
+            )
+
+        assertFalse(MessageDigest.isEqual(verifiedUser.reuseTag, verifiedAdmin.reuseTag))
+        assertDoesNotThrow { DemoCredentialBundlePolicy.requireSeparated(verifiedUser, verifiedAdmin) }
+    }
+
+    @Test
+    fun `bundle rejects role swap version change and independently edited evidence`() {
+        val serialized = prepare(user.userId, "synthetic-user-password")
+        val fields = serialized.split(":").toMutableList()
+        assertTrue(fields.size == 5)
+
+        assertThrows<IllegalArgumentException> {
+            DemoCredentialBundlePolicy.verify(serialized, admin, separationKey)
+        }
+        assertThrows<IllegalArgumentException> {
+            DemoCredentialBundlePolicy.verify(fields.copyOfChanged(0, "s21-v2"), user, separationKey)
+        }
+        assertThrows<IllegalArgumentException> {
+            DemoCredentialBundlePolicy.verify(
+                fields.copyOfChanged(2, Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32) { 7 })),
+                user,
+                separationKey,
+            )
+        }
+        assertThrows<IllegalArgumentException> {
+            DemoCredentialBundlePolicy.verify(
+                fields.copyOfChanged(3, requireNotNull(encoder.encode("different-valid-password"))),
+                user,
+                separationKey,
+            )
+        }
+        assertThrows<IllegalArgumentException> {
+            DemoCredentialBundlePolicy.verify(
+                fields.copyOfChanged(4, Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32) { 9 })),
+                user,
+                separationKey,
+            )
+        }
+    }
+
+    @Test
+    fun `bundle key is exact base64url 32 bytes and distinct from other auth secrets`() {
+        val encodedKey = Base64.getUrlEncoder().withoutPadding().encodeToString(separationKey)
+        val userBundle = prepare(user.userId, "synthetic-user-password")
+        val adminBundle = prepare(admin.userId, "synthetic-admin-password")
+        val properties =
+            DemoCredentialBootstrapProperties(
+                userCredentialBundle = userBundle,
+                adminCredentialBundle = adminBundle,
+                separationKey = encodedKey,
+            )
+        val jwt = JwtProperties(secret = "j".repeat(32), issuer = "issuer", audience = "audience")
+        val login = LoginAttemptLimiterProperties(scopeHmacKey = "l".repeat(32))
+        val principle = PrincipleProperties(cursorHmacKey = "p".repeat(32))
+        val decision = DecisionProperties(idempotencyScopeHmacKey = "d".repeat(32))
+        val brokerage =
+            BrokerageProperties(
+                idempotencyScopeHmacKey = "b".repeat(32),
+            )
+        val rag =
+            RagGuardHistoryProperties(
+                historySecretDirectory = "/tmp/synthetic-rag-history-secrets",
+                idempotencyScopeHmacKey = "i".repeat(32),
+                requestFingerprintHmacKey = "f".repeat(32),
+                providerUsageHmacKey = "u".repeat(32),
+                rateLimitHmacKey = "r".repeat(32),
+                historyCursorHmacKey = "h".repeat(32),
+            )
+        val decisionGrpc = DecisionGrpcProperties(sharedSecret = "D".repeat(32))
+        val brokerageGrpc = BrokerageGrpcProperties(enabled = true, sharedSecret = "G".repeat(32))
+        val ragGrpc = RagGrpcProperties(enabled = true, sharedSecret = "W".repeat(32))
+        val financialEngineeringGrpc =
+            FinancialEngineeringGrpcProperties(enabled = true, sharedSecret = "F".repeat(32))
+
+        assertDoesNotThrow {
+            SecurityConfig().authSecretSeparation(
+                jwt,
+                login,
+                properties,
+                principle,
+                decision,
+                brokerage,
+                rag,
+                decisionGrpc,
+                brokerageGrpc,
+                ragGrpc,
+                financialEngineeringGrpcProperties = financialEngineeringGrpc,
+            )
+        }
+        for (publicMode in listOf("DEMO", "FULL")) {
+            assertDoesNotThrow {
+                SecurityConfig().authSecretSeparation(
+                    jwt,
+                    login,
+                    DemoCredentialBootstrapProperties(),
+                    principle,
+                    decision,
+                    brokerage,
+                    rag,
+                    decisionGrpc,
+                    brokerageGrpc,
+                    ragGrpc,
+                    financialEngineeringGrpcProperties = financialEngineeringGrpc,
+                    rawMode = publicMode,
+                )
+            }
+        }
+        assertThrows<IllegalArgumentException> {
+            SecurityConfig().authSecretSeparation(
+                jwt,
+                login,
+                properties,
+                principle,
+                decision,
+                brokerage,
+                rag,
+                decisionGrpc,
+                brokerageGrpc,
+                ragGrpc,
+                financialEngineeringGrpcProperties = financialEngineeringGrpc,
+                rawMode = "DEMO",
+            )
+        }
+        assertThrows<IllegalArgumentException> {
+            SecurityConfig().authSecretSeparation(
+                jwt,
+                login,
+                DemoCredentialBootstrapProperties(),
+                principle,
+                decision,
+                brokerage,
+                rag,
+                decisionGrpc,
+                brokerageGrpc,
+                ragGrpc,
+                financialEngineeringGrpcProperties = financialEngineeringGrpc,
+                rawMode = "LOCAL",
+            )
+        }
+        financialEngineeringGrpc.sharedSecret = decisionGrpc.sharedSecret
+        assertThrows<IllegalArgumentException> {
+            SecurityConfig().authSecretSeparation(
+                jwt,
+                login,
+                properties,
+                principle,
+                decision,
+                brokerage,
+                rag,
+                decisionGrpc,
+                brokerageGrpc,
+                ragGrpc,
+                financialEngineeringGrpcProperties = financialEngineeringGrpc,
+            )
+        }
+        financialEngineeringGrpc.sharedSecret = "F".repeat(32)
+        assertThrows<IllegalArgumentException> {
+            DemoCredentialBundlePolicy.decodeSeparationKey(
+                Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(31)),
+            )
+        }
+
+        properties.separationKey =
+            Base64.getUrlEncoder().withoutPadding().encodeToString(jwt.secret.toByteArray())
+        assertThrows<IllegalArgumentException> {
+            SecurityConfig().authSecretSeparation(
+                jwt,
+                login,
+                properties,
+                principle,
+                decision,
+                brokerage,
+                rag,
+                decisionGrpc,
+                brokerageGrpc,
+                ragGrpc,
+            )
+        }
+
+        properties.separationKey = encodedKey
+        principle.cursorHmacKey = "p".repeat(32)
+        properties.separationKey =
+            Base64.getUrlEncoder().withoutPadding().encodeToString(login.scopeHmacKey.toByteArray())
+        assertThrows<IllegalArgumentException> {
+            SecurityConfig().authSecretSeparation(
+                jwt,
+                login,
+                properties,
+                principle,
+                decision,
+                brokerage,
+                rag,
+                decisionGrpc,
+                brokerageGrpc,
+                ragGrpc,
+            )
+        }
+
+        properties.separationKey = encodedKey
+        principle.cursorHmacKey = jwt.secret
+        assertThrows<IllegalArgumentException> {
+            SecurityConfig().authSecretSeparation(
+                jwt,
+                login,
+                properties,
+                principle,
+                decision,
+                brokerage,
+                rag,
+                decisionGrpc,
+                brokerageGrpc,
+                ragGrpc,
+            )
+        }
+
+        principle.cursorHmacKey = "p".repeat(32)
+        rag.historyCursorHmacKey = rag.rateLimitHmacKey
+        assertThrows<IllegalArgumentException> {
+            SecurityConfig().authSecretSeparation(
+                jwt,
+                login,
+                properties,
+                principle,
+                decision,
+                brokerage,
+                rag,
+                decisionGrpc,
+                brokerageGrpc,
+                ragGrpc,
+            )
+        }
+
+        rag.historyCursorHmacKey = "h".repeat(32)
+        ragGrpc.sharedSecret = jwt.secret
+        assertThrows<IllegalArgumentException> {
+            SecurityConfig().authSecretSeparation(
+                jwt,
+                login,
+                properties,
+                principle,
+                decision,
+                brokerage,
+                rag,
+                decisionGrpc,
+                brokerageGrpc,
+                ragGrpc,
+            )
+        }
+
+        ragGrpc.sharedSecret = brokerage.idempotencyScopeHmacKey
+        assertThrows<IllegalArgumentException> {
+            SecurityConfig().authSecretSeparation(
+                jwt,
+                login,
+                properties,
+                principle,
+                decision,
+                brokerage,
+                rag,
+                decisionGrpc,
+                brokerageGrpc,
+                ragGrpc,
+            )
+        }
+
+        ragGrpc.sharedSecret = brokerageGrpc.sharedSecret
+        assertThrows<IllegalArgumentException> {
+            SecurityConfig().authSecretSeparation(
+                jwt,
+                login,
+                properties,
+                principle,
+                decision,
+                brokerage,
+                rag,
+                decisionGrpc,
+                brokerageGrpc,
+                ragGrpc,
+            )
+        }
+    }
+
+    @Test
+    fun `enabled RAG grpc requires a secret distinct from the Decision grpc secret`() {
+        val decisionGrpc = DecisionGrpcProperties(sharedSecret = "d".repeat(32))
+        val ragGrpc = RagGrpcProperties(enabled = true, sharedSecret = "r".repeat(32))
+
+        assertDoesNotThrow {
+            SecurityConfig().ragGrpcSecretSeparation(decisionGrpc, ragGrpc)
+        }
+
+        ragGrpc.sharedSecret = decisionGrpc.sharedSecret
+        assertThrows<IllegalArgumentException> {
+            SecurityConfig().ragGrpcSecretSeparation(decisionGrpc, ragGrpc)
+        }
+
+        ragGrpc.sharedSecret = ""
+        assertThrows<IllegalArgumentException> {
+            SecurityConfig().ragGrpcSecretSeparation(decisionGrpc, ragGrpc)
+        }
+
+        ragGrpc.enabled = false
+        assertDoesNotThrow {
+            SecurityConfig().ragGrpcSecretSeparation(decisionGrpc, ragGrpc)
+        }
+    }
+
+    @Test
+    fun `preparation rejects plaintext beyond the bcrypt 72 byte equivalence boundary`() {
+        assertThrows<IllegalArgumentException> {
+            prepare(user.userId, "p".repeat(73))
+        }
+    }
+
+    private fun prepare(
+        userId: String,
+        password: String,
+    ): String {
+        val identity = DemoAccounts.byUserId(userId) ?: error("unknown test identity")
+        val chars = password.toCharArray()
+        return try {
+            DemoCredentialBundlePolicy.prepare(identity, chars, separationKey, encoder)
+        } finally {
+            chars.fill('\u0000')
+        }
+    }
+
+    private fun List<String>.copyOfChanged(
+        index: Int,
+        value: String,
+    ): String = toMutableList().also { it[index] = value }.joinToString(":")
+}

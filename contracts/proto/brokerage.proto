@@ -1,0 +1,156 @@
+syntax = "proto3";
+
+package capstone.decision.v1;
+
+option java_multiple_files = true;
+option java_outer_classname = "BrokerageContract";
+option java_package = "com.capstone.decision.contract.v1";
+
+// Internal only. Ciphertext is read with an exact owner/account DB capability;
+// neither raw KIS keys nor the account number travel in this contract.
+message BoundMockCredentialEnvelope {
+  string owner_user_id = 1;
+  string account_id = 2;
+  int64 revision = 3;
+  string credential_state = 4;
+  string kek_version = 5;
+  bytes wrap_nonce = 6;
+  bytes wrapped_dek = 7;
+  bytes wrap_tag = 8;
+  bytes payload_nonce = 9;
+  bytes payload_ciphertext = 10;
+  bytes payload_tag = 11;
+}
+
+message SubmitMockCashOrderRequest {
+  string request_id = 1;
+  string order_id = 2;
+  string account_id = 3;
+  string symbol = 4;
+  string side = 5;
+  string order_type = 6;
+  int64 quantity = 7;
+  int64 estimated_price_krw = 8;
+  BoundMockCredentialEnvelope credential = 9;
+}
+
+message SubmitMockCashOrderResponse {
+  string order_id = 1;
+  bool accepted = 2;
+  string provider_order_ref_hash = 3;
+  string tr_id = 4;
+  string received_at = 5;
+}
+
+message CancelMockCashOrderRequest {
+  string request_id = 1;
+  string order_id = 2;
+  string account_id = 3;
+  BoundMockCredentialEnvelope credential = 4;
+}
+
+message CancelMockCashOrderResponse {
+  string order_id = 1;
+  string status = 2;
+  string received_at = 3;
+}
+
+message GetMockBalanceRequest {
+  string request_id = 1;
+  string account_id = 2;
+  BoundMockCredentialEnvelope credential = 3;
+}
+
+message MockBalancePosition {
+  string symbol = 1;
+  int64 quantity = 2;
+  int64 market_value_krw = 3;
+  bool is_gold_etf_etn = 4;
+}
+
+message GetMockBalanceResponse {
+  string account_id = 1;
+  int64 cash_krw = 2;
+  int64 portfolio_equity_krw = 3;
+  int64 margin_requirement_krw = 4;
+  repeated MockBalancePosition positions = 5;
+  string observed_at = 6;
+  string source_version = 7;
+}
+
+message GetMockBuyableRequest {
+  string request_id = 1;
+  string account_id = 2;
+  string symbol = 3;
+  int64 estimated_price_krw = 4;
+  BoundMockCredentialEnvelope credential = 5;
+}
+
+message GetMockBuyableResponse {
+  string account_id = 1;
+  string symbol = 2;
+  int64 estimated_price_krw = 3;
+  int64 buyable_quantity = 4;
+  int64 buyable_amount_krw = 5;
+  int64 cash_krw = 6;
+  string observed_at = 7;
+  string source_version = 8;
+}
+
+message VerifyMockConnectionRequest {
+  string request_id = 1;
+  string account_id = 2;
+  BoundMockCredentialEnvelope credential = 3;
+}
+
+message VerifyMockConnectionResponse {
+  string account_id = 1;
+  bool connected = 2;
+  // 연결 확인이 실제로 읽은 KIS 모의계좌 잔고. 계좌번호·원문은 싣지 않는다. positions_complete 가
+  // false 면(보유 종목이 한 쪽을 넘음) host 는 이 값을 위험 잔고 관측으로 쓰지 않는다.
+  int64 cash_krw = 3;
+  int64 portfolio_equity_krw = 4;
+  repeated MockBalancePosition positions = 5;
+  bool positions_complete = 6;
+}
+
+// Server-selected fixed KIS_MOCK test: one 005930 share at its current lower limit,
+// followed by cancellation, execution/open-order checks, and a pre/post balance digest.
+// No caller-controlled symbol, side, quantity, or price is accepted.
+message CertifyMockCredentialRequest {
+  string request_id = 1;
+  string owner_user_id = 2;
+  string account_id = 3;
+  string certification_id = 4;
+  BoundMockCredentialEnvelope credential = 5;
+  bool recovery = 6;
+  string session_date = 7;
+}
+
+enum MockCredentialCertificationState {
+  MOCK_CREDENTIAL_CERTIFICATION_UNSPECIFIED = 0;
+  MOCK_CREDENTIAL_CERTIFICATION_PASS = 1;
+  MOCK_CREDENTIAL_CERTIFICATION_FAILED = 2;
+  MOCK_CREDENTIAL_CERTIFICATION_RECOVERY_REQUIRED = 3;
+}
+
+message CertifyMockCredentialResponse {
+  string account_id = 1;
+  string certification_id = 2;
+  MockCredentialCertificationState state = 3;
+  string receipt_sha256 = 4;
+  string session_date = 5;
+  int32 quote_calls = 6;
+  int32 brokerage_calls = 7;
+  int32 token_calls = 8;
+  string failure_code = 9;
+}
+
+service BrokerageService {
+  rpc SubmitMockCashOrder(SubmitMockCashOrderRequest) returns (SubmitMockCashOrderResponse);
+  rpc CancelMockCashOrder(CancelMockCashOrderRequest) returns (CancelMockCashOrderResponse);
+  rpc GetMockBalance(GetMockBalanceRequest) returns (GetMockBalanceResponse);
+  rpc GetMockBuyable(GetMockBuyableRequest) returns (GetMockBuyableResponse);
+  rpc VerifyMockConnection(VerifyMockConnectionRequest) returns (VerifyMockConnectionResponse);
+  rpc CertifyMockCredential(CertifyMockCredentialRequest) returns (CertifyMockCredentialResponse);
+}

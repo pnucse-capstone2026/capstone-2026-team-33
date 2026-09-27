@@ -1,0 +1,682 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+STATE_DIR=${P1_STATE_DIR:-$SCRIPT_DIR/.state}
+SECRETS_DIR=$STATE_DIR/secrets
+RUNTIME_ENV=$STATE_DIR/runtime.env
+ADAPTER_FILE=$STATE_DIR/adapter
+DB_COMPOSE=$SCRIPT_DIR/compose.db.yml
+KAFKA_COMPOSE=$SCRIPT_DIR/compose.kafka.yml
+OFFLINE_DB_COMPOSE=$SCRIPT_DIR/compose.offline.db.yml
+OFFLINE_KAFKA_COMPOSE=$SCRIPT_DIR/compose.offline.kafka.yml
+RELEASE_ENV=$SCRIPT_DIR/release.env
+RELEASE_MANIFEST=$SCRIPT_DIR/../../release-manifest.json
+RELEASE_GUARD=$SCRIPT_DIR/release_guard.py
+RELEASE_SOURCE_ROOT=$SCRIPT_DIR/../..
+SEALED_RELEASE_PARENT=''
+DOCKER_BIN=/usr/bin/docker
+[[ -x $DOCKER_BIN ]] || DOCKER_BIN=$(command -v docker 2>/dev/null || true)
+
+docker() {
+  [[ -n $DOCKER_BIN ]] || die missing_docker
+  "$DOCKER_BIN" "$@"
+}
+
+die() { printf 'P1_ERROR=%s\n' "$1" >&2; exit 1; }
+# 부분 실패한 초기화는 재개할 수 없다. 오류 코드만으로는 복구 방법을 알 수 없어 신규 clone이
+# 여기서 막힌다. 확인 명령을 함께 주되 무조건 삭제를 안내하지는 않는다 — mock/ 에는 재발급이
+# 장중에만 가능한 KIS Mock 인증이, artifacts/ 에는 재수집이 필요한 시장데이터가 들어 있을 수 있다.
+die_state_init_resume() {
+  printf 'P1_ERROR=%s\n' "$1" >&2
+  printf 'P1_HINT=partial_state_cannot_resume\n' >&2
+  printf 'P1_INSPECT=ls -A %s\n' "$STATE_DIR" >&2
+  printf 'P1_RECOVERY=%s\n' \
+    "위 경로에 mock/ 나 artifacts/ 가 없으면 지우고 다시 up 하세요. 있으면 지우지 말고 문의하세요." >&2
+  exit 1
+}
+require_command() { command -v "$1" >/dev/null 2>&1 || die "missing_$1"; }
+random_secret() { openssl rand -hex 32; }
+# Fernet은 padding을 포함한 44자 urlsafe base64만 받는다. padding을 지우면 안 된다.
+base64url_key() { openssl rand -base64 32 | tr '+/' '-_' | tr -d '\n'; }
+# 반대로 demo credential separation key는 padding이 없는 43자만 받는다.
+# DemoCredentialBundlePolicy.decodeSeparationKey()가 canonical unpadded Base64url을 요구하고
+# 디코드 후 재인코딩 결과까지 대조하므로(DemoCredentialBundle.kt:132-141) 44자는 거부된다.
+# 같은 생성자를 두 소비자가 나눠 쓰면 신규 clone이 `demo credential author failed: invalid_input`
+# 으로 전부 막히므로 소비자별로 분리한다.
+base64url_key_unpadded() { base64url_key | tr -d '='; }
+generate_actor_tls() {
+  local server_password=$1 client_password=$2
+  (
+    local tls_tmp
+    tls_tmp=$(mktemp -d)
+    trap 'rm -rf -- "$tls_tmp"' EXIT
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -sha256 \
+      -subj '/CN=Capstone P1 Actor CA' -keyout "$tls_tmp/ca.key" -out "$tls_tmp/ca.crt" >/dev/null 2>&1
+    openssl req -new -newkey rsa:2048 -nodes -sha256 -subj '/CN=actor-authority' \
+      -addext 'subjectAltName=DNS:actor-authority' -addext 'extendedKeyUsage=serverAuth' \
+      -keyout "$tls_tmp/server.key" -out "$tls_tmp/server.csr" >/dev/null 2>&1
+    openssl x509 -req -days 825 -sha256 -copy_extensions copy -in "$tls_tmp/server.csr" \
+      -CA "$tls_tmp/ca.crt" -CAkey "$tls_tmp/ca.key" -CAcreateserial -out "$tls_tmp/server.crt" >/dev/null 2>&1
+    openssl req -new -newkey rsa:2048 -nodes -sha256 -subj '/CN=decision-platform' \
+      -addext 'extendedKeyUsage=clientAuth' -keyout "$tls_tmp/client.key" -out "$tls_tmp/client.csr" >/dev/null 2>&1
+    openssl x509 -req -days 825 -sha256 -copy_extensions copy -in "$tls_tmp/client.csr" \
+      -CA "$tls_tmp/ca.crt" -CAkey "$tls_tmp/ca.key" -CAcreateserial -out "$tls_tmp/client.crt" >/dev/null 2>&1
+    openssl pkcs12 -export -name actor-authority -inkey "$tls_tmp/server.key" -in "$tls_tmp/server.crt" \
+      -certfile "$tls_tmp/ca.crt" -passout "pass:$server_password" -out "$tls_tmp/server.p12" >/dev/null 2>&1
+    openssl pkcs12 -export -name decision-platform -inkey "$tls_tmp/client.key" -in "$tls_tmp/client.crt" \
+      -certfile "$tls_tmp/ca.crt" -passout "pass:$client_password" -out "$tls_tmp/client.p12" >/dev/null 2>&1
+    state_write_file "$SECRETS_DIR/actor-tls-ca.crt" 0640 < "$tls_tmp/ca.crt"
+    state_write_file "$SECRETS_DIR/actor-server.p12" 0640 < "$tls_tmp/server.p12"
+    state_write_file "$SECRETS_DIR/actor-client.p12" 0640 < "$tls_tmp/client.p12"
+  )
+}
+state_relative() {
+  [[ $1 == "$STATE_DIR/"* ]] || die state_path
+  printf '%s\n' "${1#"$STATE_DIR/"}"
+}
+state_write_file() {
+  local path=$1 mode=$2
+  python3 "$RELEASE_GUARD" state-write "$STATE_DIR" "$(state_relative "$path")" "$mode"
+}
+write_line() {
+  printf '%s=%s\n' "$1" "$2" | python3 "$RELEASE_GUARD" state-append "$STATE_DIR" "$(state_relative "$3")" 0640
+}
+# compose 에 넘기는 호스트 경로는 프로젝트 디렉터리 기준 상대 경로로 고정한다.
+# compose 가 플랫폼마다 알아서 해석하므로 리눅스, WSL, macOS 에서 같은 파일이 그대로
+# 동작한다. 예전에는 Docker Desktop 의 socket 존재와 npipe context 를 보고 경로 표기를
+# 분기했는데, 그러면 compose 파일이 특정 데스크톱 제품 상태에 묶이고 그 상태가 어긋나면
+# 실제로 존재하는 파일에 대해 "bind source path does not exist" 가 난다.
+COMPOSE_SECRETS_DIR='./.state-app/secrets'
+COMPOSE_MOCK_RUNTIME_DIR='./.state-app/mock'
+PROJECT_NAME=${P1_PROJECT_NAME:-capstone-p1-offline-demo}
+[[ $PROJECT_NAME =~ ^[a-z0-9][a-z0-9_-]{2,62}$ ]] || die invalid_project_name
+
+cleanup_sealed_release() {
+  [[ -z $SEALED_RELEASE_PARENT ]] || rm -rf -- "$SEALED_RELEASE_PARENT"
+}
+trap cleanup_sealed_release EXIT
+
+prepare_release_boundary() {
+  [[ -f $RELEASE_ENV ]] || return 0
+  SEALED_RELEASE_PARENT=$(mktemp -d)
+  local sealed_root=$SEALED_RELEASE_PARENT/bundle
+  "$SCRIPT_DIR/verify-release" --stage-to "$sealed_root" "$RELEASE_SOURCE_ROOT" >/dev/null
+  SCRIPT_DIR=$sealed_root/deploy/p1
+  DB_COMPOSE=$SCRIPT_DIR/compose.db.yml
+  KAFKA_COMPOSE=$SCRIPT_DIR/compose.kafka.yml
+  OFFLINE_DB_COMPOSE=$SCRIPT_DIR/compose.offline.db.yml
+  OFFLINE_KAFKA_COMPOSE=$SCRIPT_DIR/compose.offline.kafka.yml
+  RELEASE_ENV=$SCRIPT_DIR/release.env
+  RELEASE_MANIFEST=$sealed_root/release-manifest.json
+  RELEASE_GUARD=$SCRIPT_DIR/release_guard.py
+}
+
+load_release_images() {
+  [[ -e $RELEASE_ENV ]] || return 0
+  [[ -f $RELEASE_ENV && ! -L $RELEASE_ENV && $(stat -c '%s' "$RELEASE_ENV") -le 1024 ]] || die release_env_boundary
+  local seen='|' key value count=0
+  while IFS='=' read -r key value || [[ -n $key$value ]]; do
+    case $key in
+      P1_SPRING_IMAGE)
+        [[ $value =~ ^ghcr\.io/robinhood0107/capstone-spring-api@sha256:[0-9a-f]{64}$ ]] || die release_image_reference
+        ;;
+      P1_PYTHON_IMAGE)
+        [[ $value =~ ^ghcr\.io/robinhood0107/capstone-python-services@sha256:[0-9a-f]{64}$ ]] || die release_image_reference
+        ;;
+      P1_POSTGRES_IMAGE)
+        [[ $value =~ ^ghcr\.io/robinhood0107/capstone-postgres-pgvector@sha256:[0-9a-f]{64}$ ]] || die release_image_reference
+        ;;
+      P1_KAFKA_IMAGE)
+        [[ $value =~ ^ghcr\.io/robinhood0107/capstone-kafka@sha256:[0-9a-f]{64}$ ]] || die release_image_reference
+        ;;
+      *) die release_env_key ;;
+    esac
+    [[ $seen != *"|$key|"* ]] || die release_env_duplicate
+    seen="$seen$key|"
+    export "$key=$value"
+    count=$((count + 1))
+  done < "$RELEASE_ENV"
+  [[ $count == 3 || $count == 4 ]] || die release_env_inventory
+  [[ $seen == *'|P1_SPRING_IMAGE|'* && $seen == *'|P1_PYTHON_IMAGE|'* && $seen == *'|P1_POSTGRES_IMAGE|'* ]] || die release_env_inventory
+  [[ $count == 3 || $seen == *'|P1_KAFKA_IMAGE|'* ]] || die release_env_inventory
+}
+
+compose() {
+  local mode=${1:?mode}; shift
+  local files=(-f "$DB_COMPOSE")
+  if [[ $mode == kafka ]]; then files+=(-f "$KAFKA_COMPOSE"); fi
+  if [[ -f $RELEASE_ENV ]]; then files+=(-f "$OFFLINE_DB_COMPOSE"); fi
+  if [[ $mode == kafka && -f $RELEASE_ENV ]]; then files+=(-f "$OFFLINE_KAFKA_COMPOSE"); fi
+  docker compose --project-name "$PROJECT_NAME" --env-file "$RUNTIME_ENV" "${files[@]}" "$@"
+}
+
+require_state() {
+  python3 "$RELEASE_GUARD" state-check "$STATE_DIR" || die state_boundary
+  [[ -d $STATE_DIR && -f $RUNTIME_ENV && -d $SECRETS_DIR ]] || die not_initialized
+  [[ ! -L $STATE_DIR && ! -L $SECRETS_DIR && ! -L $RUNTIME_ENV ]] || die state_symlink
+  [[ $(stat -c '%a' "$STATE_DIR") == 700 ]] || die state_mode
+  [[ $(stat -c '%a' "$SECRETS_DIR") == 700 ]] || die secrets_mode
+  [[ $(stat -c '%a' "$RUNTIME_ENV") == 600 ]] || die runtime_env_mode
+}
+
+verify_runtime_env() {
+  local expected_secrets expected_mock_runtime seen='|' key value count=0 api_port='' secret_gid='' operator_uid='' required
+  expected_secrets=$COMPOSE_SECRETS_DIR
+  expected_mock_runtime=$COMPOSE_MOCK_RUNTIME_DIR
+  while IFS='=' read -r key value || [[ -n $key$value ]]; do
+    [[ $seen != *"|$key|"* ]] || die runtime_env_duplicate
+    case $key in
+      # 새 상태는 상대 경로를 쓴다. 이미 절대 경로로 만들어진 상태도 그대로 유효하다 -
+      # compose 가 둘 다 같은 디렉터리로 해석한다.
+      P1_SECRETS_DIR)
+        [[ $value == "$expected_secrets" || $value == "$SECRETS_DIR" ]] \
+          || die runtime_env_secrets_path
+        ;;
+      P1_SECRET_GID) secret_gid=$value ;;
+      P1_OPERATOR_UID) operator_uid=$value ;;
+      P1_KIS_MOCK_RUNTIME_DIR)
+        [[ $value == "$expected_mock_runtime" || $value == "$STATE_DIR/mock" ]] \
+          || die runtime_env_mock_path
+        ;;
+      # RAG v2 로컬 루트는 운영자가 다른 경로에 둘 수 있다. 기존 절대 경로도 유지하되,
+      # Docker Desktop이 WSL 절대 경로를 빈 mount로 보지 않도록 레포 안의 canonical 상대
+      # 경로도 허용한다. 임의 상대 경로나 symlink는 계속 받지 않는다.
+      P1_RAG_RUNTIME_DIR)
+        if [[ $value == ../../capstone-rag/runtime/p1-rag-v2-root ]]; then
+          [[ -d $SCRIPT_DIR/$value && ! -L $SCRIPT_DIR/$value ]] || die runtime_env_rag_path
+        else
+          [[ $value == /* && $value != *..* && -d $value && ! -L $value ]] || die runtime_env_rag_path
+        fi
+        ;;
+      P1_API_PORT) api_port=$value ;;
+      P1_SPRING_IMAGE)
+        # Public fresh-install bundle authoring may use the Docker Hub API image,
+        # but only by immutable digest. Moving tags could change the credential tool.
+        [[ $value == capstone-spring-api:p1-local || $value == capstone-decision-platform:p1-local || $value =~ ^ghcr\.io/robinhood0107/capstone-(spring-api|decision-platform)@sha256:[0-9a-f]{64}$ || $value =~ ^pjjpjj111/mars-(demo|full)@sha256:[0-9a-f]{64}$ ]] || die runtime_env_image
+        ;;
+      P1_PYTHON_IMAGE)
+        [[ $value == capstone-python-services:p1-local || $value == capstone-decision-platform:p1-local || $value =~ ^ghcr\.io/robinhood0107/capstone-(python-services|decision-platform)@sha256:[0-9a-f]{64}$ || $value =~ ^pjjpjj111/mars-(demo|full)@sha256:[0-9a-f]{64}$ ]] || die runtime_env_image
+        ;;
+      P1_POSTGRES_IMAGE)
+        [[ $value == capstone-postgres-pgvector:p1-local || $value =~ ^ghcr\.io/robinhood0107/capstone-postgres-pgvector@sha256:[0-9a-f]{64}$ ]] || die runtime_env_image
+        ;;
+      P1_KAFKA_IMAGE)
+        [[ $value == capstone-kafka:p1-local || $value =~ ^ghcr\.io/robinhood0107/capstone-kafka@sha256:[0-9a-f]{64}$ ]] || die runtime_env_image
+        ;;
+      # 런타임 기능 플래그. compose.yml 이 `${VAR:-false}` 로 읽고 full-appctl 이
+      # `--mock` 여부에 따라 다섯 개를 export 한다. 상태 파일에 적힌 값도 같은 뜻이다.
+      # 임의 키 주입을 막는 성질은 값 형태를 못박아 유지한다.
+      GDELT_WORLD_NEWS_ENABLED|P1_AUTOMATION_RUNTIME_ENABLED|P1_KIS_MOCK_ONLINE_ENABLED\
+|P1_LOCAL_CERTIFICATION_VALID|WORLD_NEWS_RETENTION_ENABLED)
+        [[ $value == true || $value == false ]] || die runtime_env_flag
+        ;;
+      P1_KIS_OFFLINE)
+        [[ $value == 0 || $value == 1 ]] || die runtime_env_flag
+        ;;
+      *) die runtime_env_key ;;
+    esac
+    seen="$seen$key|"
+    count=$((count + 1))
+  done < "$RUNTIME_ENV"
+  # 필수 10개는 그대로 요구한다. 플래그는 선택이므로 총 개수는 10..16 이다.
+  for required in P1_SECRETS_DIR P1_SECRET_GID P1_OPERATOR_UID P1_KIS_MOCK_RUNTIME_DIR \
+    P1_RAG_RUNTIME_DIR P1_API_PORT P1_SPRING_IMAGE P1_PYTHON_IMAGE P1_POSTGRES_IMAGE \
+    P1_KAFKA_IMAGE; do
+    [[ $seen == *"|$required|"* ]] || die runtime_env_inventory
+  done
+  [[ $count -ge 10 && $count -le 16 ]] || die runtime_env_inventory
+  [[ $secret_gid == "$(id -g)" ]] || die runtime_env_secret_gid
+  [[ $operator_uid == "$(id -u)" ]] || die runtime_env_operator_uid
+  [[ $api_port =~ ^[0-9]{4,5}$ && $api_port -ge 1024 && $api_port -le 65535 ]] || die runtime_env_api_port
+}
+
+author_bundle() {
+  local image=$1 user_id=$2 password_file=$3 output=$4
+  local secrets_mount attempt bind_ready=0
+  # 이건 compose 가 아니라 직접 docker run 이므로 실제 호스트 경로를 쓴다.
+  secrets_mount=$SECRETS_DIR
+  # Docker Desktop may observe a newly created WSL directory a moment after Linux does.
+  # Validate only the bind mount before invoking the credential author; never print secrets.
+  for attempt in {1..10}; do
+    if docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+      --mount "type=bind,src=$secrets_mount,dst=/secrets" \
+      --entrypoint java "$image" -version >/dev/null 2>&1; then
+      bind_ready=1
+      break
+    fi
+    sleep 1
+  done
+  [[ $bind_ready == 1 ]] || die secrets_bind_unavailable
+  docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+    --user "$(id -u):$(id -g)" --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+    --mount "type=bind,src=$secrets_mount,dst=/secrets" \
+    --entrypoint java \
+    -e "DEMO_CREDENTIAL_USER_ID=$user_id" \
+    -e "DEMO_CREDENTIAL_PASSWORD_FILE=/secrets/$(basename "$password_file")" \
+    -e DEMO_CREDENTIAL_SEPARATION_KEY_FILE=/secrets/demo-credential-separation.key \
+    -e "DEMO_CREDENTIAL_BUNDLE_OUTPUT=/secrets/$(basename "$output")" \
+    "$image" -Dloader.main=com.capstone.decision.infrastructure.security.DemoCredentialBundleAuthor \
+    -cp /app/app.jar org.springframework.boot.loader.launch.PropertiesLauncher >/dev/null
+}
+
+verify_release_boundary() {
+  [[ -f $RELEASE_ENV ]] || return 0
+  "$SCRIPT_DIR/verify-release" --sealed "$SCRIPT_DIR/../.." >/dev/null
+}
+
+accept_release() {
+  [[ -f $RELEASE_ENV ]] || return 0
+  python3 "$RELEASE_GUARD" release-accept "$STATE_DIR" "$RELEASE_MANIFEST" || die release_rollback_or_collision
+}
+
+prepare_initial_state() {
+  if [[ ! -e $STATE_DIR ]]; then
+    python3 "$RELEASE_GUARD" state-init "$STATE_DIR" || die state_init
+    return
+  fi
+  python3 "$RELEASE_GUARD" state-check "$STATE_DIR" || die_state_init_resume state_init_resume_boundary
+  [[ ! -e $RUNTIME_ENV ]] || die already_initialized
+  local inventory
+  inventory=$(find "$STATE_DIR" -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
+  [[ $inventory == secrets || $inventory == $'full-app-stage\nsecrets' ]] || die_state_init_resume state_init_resume_inventory
+  [[ -z $(find "$SECRETS_DIR" -mindepth 1 -maxdepth 1 -print -quit) ]] || die_state_init_resume state_init_resume_secrets
+  if [[ -e $STATE_DIR/full-app-stage ]]; then
+    [[ -f $STATE_DIR/full-app-stage && ! -L $STATE_DIR/full-app-stage && $(stat -c '%a' "$STATE_DIR/full-app-stage") == 600 ]] \
+      || die_state_init_resume state_init_resume_marker
+  fi
+}
+
+init_state() {
+  require_command docker
+  require_command openssl
+  require_command python3
+  verify_release_boundary
+  prepare_initial_state
+  # 이 레포는 spring/python 을 하나의 이미지로 빌드한다(full-appctl:75). 실제로 존재하는
+  # 이름은 이것뿐이다. 옛 이름을 기본값으로 두면 p1ctl 직접 실행이 spring_image_missing 으로 죽는다.
+  local spring_image=${P1_SPRING_IMAGE:-capstone-decision-platform:p1-local}
+  docker image inspect "$spring_image" >/dev/null 2>&1 || die spring_image_missing
+
+  local user_password admin_password separation_key broker_digest
+  user_password=$(random_secret)
+  admin_password=$(random_secret)
+  separation_key=$(base64url_key_unpadded)
+  broker_digest=$(random_secret | sha256sum | awk '{print $1}')
+  printf '%s' "$user_password" | state_write_file "$SECRETS_DIR/demo-user.password" 0640
+  printf '%s' "$admin_password" | state_write_file "$SECRETS_DIR/demo-admin.password" 0640
+  printf '%s' "$separation_key" | state_write_file "$SECRETS_DIR/demo-credential-separation.key" 0640
+  # SecretFileRagHistoryKekProvider accepts an ASCII hex/base64 envelope, not
+  # raw binary. Keep 32 random key bytes and serialize them as exact hex.
+  openssl rand -hex 32 | tr -d '\n' | state_write_file "$SECRETS_DIR/rag-history-kek-v1.key" 0640
+  author_bundle "$spring_image" usr_demo_user "$SECRETS_DIR/demo-user.password" "$SECRETS_DIR/demo-user.bundle"
+  author_bundle "$spring_image" usr_demo_admin "$SECRETS_DIR/demo-admin.password" "$SECRETS_DIR/demo-admin.bundle"
+  local authored_bundle
+  authored_bundle=$(<"$SECRETS_DIR/demo-user.bundle")
+  printf "%s" "$authored_bundle" | state_write_file "$SECRETS_DIR/demo-user.bundle" 0640
+  authored_bundle=$(<"$SECRETS_DIR/demo-admin.bundle")
+  printf "%s" "$authored_bundle" | state_write_file "$SECRETS_DIR/demo-admin.bundle" 0640
+  unset authored_bundle
+
+  declare -A db
+  local role
+  for role in APP MIGRATION COLLECTOR DISCLOSURE_READER MARKET_WRITER PORTFOLIO_WRITER RISK_WRITER \
+    FILL_WRITER RAG_WRITER RAG_ADMIN RAG_QUERY SIGNAL_WRITER SIGNAL_SCHEDULER SIGNAL_ADMIN WORKER REPLAY \
+    AUTOMATION_RUNTIME OUTBOX_PUBLISHER POISON_RECORDER IDENTITY AUTH REPLAY_AUTHORIZER DEMO; do
+    db[$role]=$(random_secret)
+  done
+  local postgres_password redis_password grpc_secret brokerage_grpc_secret partition_key
+  postgres_password=$(random_secret)
+  redis_password=$(random_secret)
+  grpc_secret=$(random_secret)
+  brokerage_grpc_secret=$(random_secret)
+  partition_key=$(random_secret)
+  local kafka_admin_password kafka_publisher_password kafka_worker_password poison_recorder_secret
+  kafka_admin_password=$(random_secret)
+  kafka_publisher_password=$(random_secret)
+  kafka_worker_password=$(random_secret)
+  poison_recorder_secret=$(random_secret)
+  local kafka_private_der_b64 kafka_public_der_b64 kafka_private_key kafka_public_key
+  kafka_private_der_b64=$(openssl genpkey -algorithm ED25519 | openssl pkey -outform DER | base64 -w0)
+  kafka_public_der_b64=$(printf '%s' "$kafka_private_der_b64" | base64 -d | openssl pkey -inform DER -pubout -outform DER | base64 -w0)
+  kafka_private_key=$(printf '%s' "$kafka_private_der_b64" | tr '+/' '-_' | tr -d '=')
+  kafka_public_key=$(printf '%s' "$kafka_public_der_b64" | tr '+/' '-_' | tr -d '=')
+  local actor_capability_secret actor_private_der_b64 actor_public_der_b64 actor_private_key actor_public_key
+  actor_capability_secret=$(random_secret)
+  actor_private_der_b64=$(openssl genpkey -algorithm ED25519 | openssl pkey -outform DER | base64 -w0)
+  actor_public_der_b64=$(printf '%s' "$actor_private_der_b64" | base64 -d | openssl pkey -inform DER -pubout -outform DER | base64 -w0)
+  actor_private_key=$(printf '%s' "$actor_private_der_b64" | tr '+/' '-_' | tr -d '=')
+  actor_public_key=$(printf '%s' "$actor_public_der_b64" | tr '+/' '-_' | tr -d '=')
+  local actor_server_tls_password actor_client_tls_password
+  actor_server_tls_password=$(random_secret)
+  actor_client_tls_password=$(random_secret)
+  generate_actor_tls "$actor_server_tls_password" "$actor_client_tls_password"
+
+  printf '' | state_write_file "$SECRETS_DIR/postgres.env" 0640
+  write_line POSTGRES_PASSWORD "$postgres_password" "$SECRETS_DIR/postgres.env"
+  for role in "${!db[@]}"; do write_line "POSTGRES_${role}_PASSWORD" "${db[$role]}" "$SECRETS_DIR/postgres.env"; done
+  LC_ALL=C sort -o "$SECRETS_DIR/postgres.env" "$SECRETS_DIR/postgres.env"
+  printf '' | state_write_file "$SECRETS_DIR/role-bootstrap.env" 0640
+  write_line POSTGRES_ADMIN_USER postgres "$SECRETS_DIR/role-bootstrap.env"
+  write_line POSTGRES_PASSWORD "$postgres_password" "$SECRETS_DIR/role-bootstrap.env"
+  write_line POSTGRES_AUTH_PASSWORD "${db[AUTH]}" "$SECRETS_DIR/role-bootstrap.env"
+  write_line POSTGRES_AUTOMATION_RUNTIME_PASSWORD "${db[AUTOMATION_RUNTIME]}" "$SECRETS_DIR/role-bootstrap.env"
+  write_line POSTGRES_OUTBOX_PUBLISHER_PASSWORD "${db[OUTBOX_PUBLISHER]}" "$SECRETS_DIR/role-bootstrap.env"
+  write_line POSTGRES_POISON_RECORDER_PASSWORD "${db[POISON_RECORDER]}" "$SECRETS_DIR/role-bootstrap.env"
+  printf 'REDIS_PASSWORD=%s\n' "$redis_password" | state_write_file "$SECRETS_DIR/redis.env" 0640
+
+  local user_bundle admin_bundle
+  user_bundle=$(<"$SECRETS_DIR/demo-user.bundle")
+  admin_bundle=$(<"$SECRETS_DIR/demo-admin.bundle")
+  printf '' | state_write_file "$SECRETS_DIR/migration.env" 0640
+  write_line DEMO_CREDENTIAL_SEPARATION_KEY "$separation_key" "$SECRETS_DIR/migration.env"
+  write_line DEMO_USER_CREDENTIAL_BUNDLE "$user_bundle" "$SECRETS_DIR/migration.env"
+  write_line DEMO_ADMIN_CREDENTIAL_BUNDLE "$admin_bundle" "$SECRETS_DIR/migration.env"
+  write_line POSTGRES_MIGRATION_PASSWORD "${db[MIGRATION]}" "$SECRETS_DIR/migration.env"
+  write_line BROKERAGE_DB_CAPABILITY_TOKEN_SHA256 "$broker_digest" "$SECRETS_DIR/migration.env"
+  printf '' | state_write_file "$SECRETS_DIR/seed-import.env" 0640
+  write_line P1_SEED_DATABASE_DSN "postgresql://flyway:${db[MIGRATION]}@postgres:5432/capstone_p1?sslmode=disable" "$SECRETS_DIR/seed-import.env"
+  printf '' | state_write_file "$SECRETS_DIR/bootstrap.env" 0640
+  write_line POSTGRES_MIGRATION_PASSWORD "${db[MIGRATION]}" "$SECRETS_DIR/bootstrap.env"
+  write_line DEMO_CREDENTIAL_SEPARATION_KEY "$separation_key" "$SECRETS_DIR/bootstrap.env"
+  write_line DEMO_USER_CREDENTIAL_BUNDLE "$user_bundle" "$SECRETS_DIR/bootstrap.env"
+  write_line DEMO_ADMIN_CREDENTIAL_BUNDLE "$admin_bundle" "$SECRETS_DIR/bootstrap.env"
+
+  printf '' | state_write_file "$SECRETS_DIR/spring.env" 0640
+  write_line POSTGRES_APP_PASSWORD "${db[APP]}" "$SECRETS_DIR/spring.env"
+  write_line POSTGRES_WORKER_PASSWORD "${db[WORKER]}" "$SECRETS_DIR/spring.env"
+  write_line POSTGRES_AUTH_PASSWORD "${db[AUTH]}" "$SECRETS_DIR/spring.env"
+  write_line ACTOR_CAPABILITY_SHARED_SECRET "$actor_capability_secret" "$SECRETS_DIR/spring.env"
+  write_line ACTOR_CAPABILITY_PUBLIC_KEY "$actor_public_key" "$SECRETS_DIR/spring.env"
+  write_line ACTOR_CAPABILITY_TLS_KEY_STORE_PASSWORD "$actor_client_tls_password" "$SECRETS_DIR/spring.env"
+  printf '' | state_write_file "$SECRETS_DIR/actor-capability-authority.env" 0640
+  write_line POSTGRES_IDENTITY_PASSWORD "${db[IDENTITY]}" "$SECRETS_DIR/actor-capability-authority.env"
+  write_line ACTOR_CAPABILITY_SHARED_SECRET "$actor_capability_secret" "$SECRETS_DIR/actor-capability-authority.env"
+  write_line ACTOR_CAPABILITY_PRIVATE_KEY "$actor_private_key" "$SECRETS_DIR/actor-capability-authority.env"
+  write_line ACTOR_CAPABILITY_PUBLIC_KEY "$actor_public_key" "$SECRETS_DIR/actor-capability-authority.env"
+  write_line ACTOR_CAPABILITY_TLS_KEY_STORE_PASSWORD "$actor_server_tls_password" "$SECRETS_DIR/actor-capability-authority.env"
+  write_line REDIS_PASSWORD "$redis_password" "$SECRETS_DIR/spring.env"
+  write_line JWT_ISSUER capstone-p1-offline-demo "$SECRETS_DIR/spring.env"
+  write_line JWT_AUDIENCE capstone-p1-offline-demo-users "$SECRETS_DIR/spring.env"
+  write_line DEMO_CREDENTIAL_SEPARATION_KEY "$separation_key" "$SECRETS_DIR/spring.env"
+  write_line DEMO_USER_CREDENTIAL_BUNDLE "$user_bundle" "$SECRETS_DIR/spring.env"
+  write_line DEMO_ADMIN_CREDENTIAL_BUNDLE "$admin_bundle" "$SECRETS_DIR/spring.env"
+  write_line ASYNC_PARTITION_HMAC_KEY "$partition_key" "$SECRETS_DIR/spring.env"
+  write_line ASYNC_WORKER_GRPC_SHARED_SECRET "$grpc_secret" "$SECRETS_DIR/spring.env"
+  write_line BROKERAGE_GRPC_SHARED_SECRET "$brokerage_grpc_secret" "$SECRETS_DIR/spring.env"
+  printf '' | state_write_file "$SECRETS_DIR/return-inference.env" 0640
+  write_line RETURN_INFERENCE_GRPC_SHARED_SECRET "$(random_secret)" "$SECRETS_DIR/return-inference.env"
+  local key
+  for key in JWT_SECRET LOGIN_SCOPE_HMAC_KEY PRINCIPLE_CURSOR_HMAC_KEY DECISION_IDEMPOTENCY_SCOPE_HMAC_KEY \
+    DECISION_GRPC_SHARED_SECRET BROKERAGE_IDEMPOTENCY_SCOPE_HMAC_KEY RAG_IDEMPOTENCY_SCOPE_HMAC_KEY RAG_REQUEST_FINGERPRINT_HMAC_KEY \
+    RAG_PROVIDER_USAGE_HMAC_KEY RAG_RATE_LIMIT_HMAC_KEY RAG_HISTORY_CURSOR_HMAC_KEY ASYNC_CURSOR_HMAC_KEY; do
+    write_line "$key" "$(random_secret)" "$SECRETS_DIR/spring.env"
+  done
+
+  printf '' | state_write_file "$SECRETS_DIR/python.env" 0640
+  write_line ASYNC_WORKER_DATABASE_DSN "postgresql://decision_worker:${db[WORKER]}@postgres:5432/capstone_p1?sslmode=disable" "$SECRETS_DIR/python.env"
+  write_line ASYNC_PARTITION_HMAC_KEY "$partition_key" "$SECRETS_DIR/python.env"
+  write_line ASYNC_WORKER_GRPC_SHARED_SECRET "$grpc_secret" "$SECRETS_DIR/python.env"
+  write_line KAFKA_SASL_USERNAME p1_async_worker "$SECRETS_DIR/python.env"
+  write_line KAFKA_SASL_PASSWORD "$kafka_worker_password" "$SECRETS_DIR/python.env"
+  write_line KAFKA_ENVELOPE_PUBLIC_KEY "$kafka_public_key" "$SECRETS_DIR/python.env"
+  write_line POISON_RECORDER_URL http://127.0.0.1:18082/internal/kafka/poison-receipts "$SECRETS_DIR/python.env"
+  write_line POISON_RECORDER_SHARED_SECRET "$poison_recorder_secret" "$SECRETS_DIR/python.env"
+  printf '' | state_write_file "$SECRETS_DIR/automation-runtime.env" 0640
+  write_line P1_AUTOMATION_DATABASE_DSN "postgresql://decision_automation_runtime:${db[AUTOMATION_RUNTIME]}@postgres:5432/capstone_p1?sslmode=disable" "$SECRETS_DIR/automation-runtime.env"
+  write_line AUTOMATION_RUNTIME_SHARED_SECRET "$(random_secret)" "$SECRETS_DIR/automation-runtime.env"
+  write_line P1_AUTOMATION_OWNER_USER_ID usr_demo_user "$SECRETS_DIR/automation-runtime.env"
+  # runtime bridge가 Spring을 부를 때 소유자 세션이 필요하다. actor capability는 인증된
+  # 세션에서만 발급되므로 shared secret만으로는 brokerage/decision 명령이 열리지 않는다.
+  write_line P1_AUTOMATION_OWNER_USERNAME demo-user "$SECRETS_DIR/automation-runtime.env"
+  write_line P1_AUTOMATION_OWNER_PASSWORD "$user_password" "$SECRETS_DIR/automation-runtime.env"
+  printf '' | state_write_file "$SECRETS_DIR/market-data.env" 0640
+  write_line MARKET_DATA_WRITER_DSN "postgresql://decision_market_writer:${db[MARKET_WRITER]}@postgres:5432/capstone_p1?sslmode=disable" "$SECRETS_DIR/market-data.env"
+  printf '' | state_write_file "$SECRETS_DIR/after-hours-replay.env" 0640
+  write_line P1_AFTER_HOURS_REPLAY_DATABASE_DSN "postgresql://decision_replay:${db[REPLAY]}@postgres:5432/capstone_p1?sslmode=disable" "$SECRETS_DIR/after-hours-replay.env"
+  write_line P1_AFTER_HOURS_REPLAY_ISOLATED true "$SECRETS_DIR/after-hours-replay.env"
+  printf '' | state_write_file "$SECRETS_DIR/automation-gate-author.env" 0640
+  write_line P1_AUTOMATION_GATE_AUTHOR_DSN "postgresql://decision_replay_authorizer:${db[REPLAY_AUTHORIZER]}@postgres:5432/capstone_p1?sslmode=disable" "$SECRETS_DIR/automation-gate-author.env"
+  # 자동운용 런타임이 RiskEngine 관측 표에 잔고·위험지표를 남길 때 쓰는 좁은 writer 두 개다.
+  # automation-runtime.env 에 넣으면 그 파일을 마운트하는 market-data 와 automation-cli 까지
+  # whitelist 를 열어야 해 자격증명이 세 컨테이너로 더 퍼진다. decision-platform 만 마운트하는
+  # 전용 파일로 둬서 역할 분리를 유지한다.
+  printf '' | state_write_file "$SECRETS_DIR/automation-observation.env" 0640
+  write_line DECISION_PORTFOLIO_WRITER_DATABASE_DSN "postgresql://decision_portfolio_writer:${db[PORTFOLIO_WRITER]}@postgres:5432/capstone_p1?sslmode=disable" "$SECRETS_DIR/automation-observation.env"
+  write_line DECISION_RISK_WRITER_DATABASE_DSN "postgresql://decision_risk_writer:${db[RISK_WRITER]}@postgres:5432/capstone_p1?sslmode=disable" "$SECRETS_DIR/automation-observation.env"
+  # 시세 관측의 신선도 창은 관측 +5분이라 일일 수집기가 하루 한 번 넣는 값으로는 장중 판정을
+  # 만족할 수 없다. 실측으로 RiskEngine 이 PRICE_MISSING/PRICE_STALE 로 HOLD 했고 violations
+  # 는 0 건이었다 - 원칙 위반이 아니라 값이 낡은 것이었다. 주문 직전 실시간 호가를 가진
+  # 프로세스는 자동운용 런타임뿐이므로 그 좁은 writer 를 여기에 둔다.
+  write_line DECISION_MARKET_WRITER_DATABASE_DSN "postgresql://decision_market_writer:${db[MARKET_WRITER]}@postgres:5432/capstone_p1?sslmode=disable" "$SECRETS_DIR/automation-observation.env"
+  printf '' | state_write_file "$SECRETS_DIR/calendar-offline-seed.env" 0640
+  write_line P1_CALENDAR_OFFLINE_SEED_DSN "postgresql://decision_collector:${db[COLLECTOR]}@postgres:5432/capstone_p1?sslmode=disable" "$SECRETS_DIR/calendar-offline-seed.env"
+  # S4.1 출처 registry. 대시보드의 "이 시스템이 참고하는 자료" 패널이 이 표를 읽는데
+  # 등록 CLI 가 어디에도 배선돼 있지 않아 rag_sources 가 0 행이었고 패널이 비어 있었다.
+  # seed 는 코드에 커밋돼 있으므로 provider 호출 없이 등록만 하면 된다.
+  printf '' | state_write_file "$SECRETS_DIR/rag-source-register.env" 0640
+  write_line RAG_SOURCE_WRITER_DATABASE_DSN "postgresql://decision_rag_writer:${db[RAG_WRITER]}@postgres:5432/capstone_p1?sslmode=disable" "$SECRETS_DIR/rag-source-register.env"
+  write_line RAG_SOURCE_REGISTER_TARGET local "$SECRETS_DIR/rag-source-register.env"
+  printf '' | state_write_file "$SECRETS_DIR/artifact-import.env" 0640
+  write_line P1_ARTIFACT_IMPORT_DATABASE_DSN "postgresql://decision_worker:${db[WORKER]}@postgres:5432/capstone_p1?sslmode=disable" "$SECRETS_DIR/artifact-import.env"
+  printf '' | state_write_file "$SECRETS_DIR/team-a-acceptance.env" 0640
+  write_line P1_TEAM_A_ACCEPTANCE_DATABASE_DSN "postgresql://postgres:$postgres_password@postgres:5432/capstone_p1?sslmode=disable" "$SECRETS_DIR/team-a-acceptance.env"
+  printf '' | state_write_file "$SECRETS_DIR/kis-mock.env" 0640
+  write_line KIS_MOCK_CONFIGURED false "$SECRETS_DIR/kis-mock.env"
+  write_line KIS_MOCK_APP_KEY DISABLED00 "$SECRETS_DIR/kis-mock.env"
+  write_line KIS_MOCK_APP_SECRET DISABLED00 "$SECRETS_DIR/kis-mock.env"
+  write_line KIS_MOCK_ACCOUNT_NO 00000000-00 "$SECRETS_DIR/kis-mock.env"
+  write_line KIS_MOCK_BOUND_ACCOUNT_ID "acct_00000000000000000000000000000000" "$SECRETS_DIR/kis-mock.env"
+  write_line KIS_MOCK_ORDER_REFERENCE_KEY "$(base64url_key)" "$SECRETS_DIR/kis-mock.env"
+  write_line KIS_BROKERAGE_TOKEN_P_PHYSICAL_CAP 1 "$SECRETS_DIR/kis-mock.env"
+  write_line KIS_BROKERAGE_PHYSICAL_CAP 32 "$SECRETS_DIR/kis-mock.env"
+  printf '' | state_write_file "$SECRETS_DIR/market-data-provider.env" 0640
+  write_line KIS_MOCK_CONFIGURED false "$SECRETS_DIR/market-data-provider.env"
+  write_line KIS_MOCK_APP_KEY DISABLED00 "$SECRETS_DIR/market-data-provider.env"
+  write_line KIS_MOCK_APP_SECRET DISABLED00 "$SECRETS_DIR/market-data-provider.env"
+  write_line REDIS_PASSWORD "$redis_password" "$SECRETS_DIR/market-data-provider.env"
+  local approval_key_tmp approval_public_digest
+  approval_key_tmp=$(mktemp -d)
+  openssl genpkey -algorithm ED25519 -out "$approval_key_tmp/private.pem" >/dev/null 2>&1
+  openssl pkey -in "$approval_key_tmp/private.pem" -pubout -out "$approval_key_tmp/public.pem" >/dev/null 2>&1
+  state_write_file "$SECRETS_DIR/kis-mock-approval-private.pem" 0640 < "$approval_key_tmp/private.pem"
+  state_write_file "$SECRETS_DIR/kis-mock-approval-public.pem" 0640 < "$approval_key_tmp/public.pem"
+  approval_public_digest=$(sha256sum "$approval_key_tmp/public.pem" | awk '{print $1}')
+  printf '{"contractId":"p1-approval-trust-root.v1","issuerKeyId":"CAPSTONE.KISMOCK.V1","publicKeyPath":"/run/secrets/kis_mock_approval_public","publicKeySha256":"%s"}' "$approval_public_digest" \
+    | state_write_file "$SECRETS_DIR/kis-mock-approval-trust-policy.json" 0640
+  rm -rf -- "$approval_key_tmp"
+  printf 'postgresql://decision_replay:%s@postgres:5432/capstone_p1?sslmode=disable' "${db[REPLAY]}" \
+    | state_write_file "$SECRETS_DIR/p1-provider-claim.dsn" 0640
+  printf '' | state_write_file "$SECRETS_DIR/kafka-publisher.env" 0640
+  write_line OUTBOX_PUBLISHER_DATABASE_DSN "postgresql://decision_outbox_publisher:${db[OUTBOX_PUBLISHER]}@postgres:5432/capstone_p1?sslmode=disable" "$SECRETS_DIR/kafka-publisher.env"
+  write_line KAFKA_SASL_USERNAME p1_outbox_publisher "$SECRETS_DIR/kafka-publisher.env"
+  write_line KAFKA_SASL_PASSWORD "$kafka_publisher_password" "$SECRETS_DIR/kafka-publisher.env"
+  write_line KAFKA_ENVELOPE_PRIVATE_KEY "$kafka_private_key" "$SECRETS_DIR/kafka-publisher.env"
+  printf '' | state_write_file "$SECRETS_DIR/poison-recorder.env" 0640
+  write_line POISON_RECORDER_DATABASE_DSN "postgresql://decision_poison_recorder:${db[POISON_RECORDER]}@postgres:5432/capstone_p1?sslmode=disable" "$SECRETS_DIR/poison-recorder.env"
+  write_line POISON_RECORDER_SHARED_SECRET "$poison_recorder_secret" "$SECRETS_DIR/poison-recorder.env"
+  # RAG v2 질의 경로. Spring이 decision_app으로 인가하고 이 writer가 사용량을 예약한다.
+  # VOYAGE_API_KEY는 생성하지 않는다. 운영자가 직접 넣는다.
+  printf '' | state_write_file "$SECRETS_DIR/rag-v2.env" 0640
+  write_line RAG_V2_QUERY_DATABASE_DSN "postgresql://decision_rag_query:${db[RAG_QUERY]}@postgres:5432/capstone_p1?sslmode=disable" "$SECRETS_DIR/rag-v2.env"
+  write_line RAG_V2_VOYAGE_QUERY_WRITER_DSN "postgresql://decision_rag_writer:${db[RAG_WRITER]}@postgres:5432/capstone_p1?sslmode=disable" "$SECRETS_DIR/rag-v2.env"
+  write_line RAG_V2_GRPC_SHARED_SECRET "$(random_secret)" "$SECRETS_DIR/rag-v2.env"
+  printf '' | state_write_file "$SECRETS_DIR/kafka-admin.env" 0640
+  write_line KAFKA_SASL_USERNAME p1_kafka_admin "$SECRETS_DIR/kafka-admin.env"
+  write_line KAFKA_SASL_PASSWORD "$kafka_admin_password" "$SECRETS_DIR/kafka-admin.env"
+  printf '%s\n' \
+    'KafkaServer {' \
+    '  org.apache.kafka.common.security.plain.PlainLoginModule required' \
+    "  username=\"p1_kafka_admin\"" \
+    "  password=\"$kafka_admin_password\"" \
+    "  user_p1_kafka_admin=\"$kafka_admin_password\"" \
+    "  user_p1_outbox_publisher=\"$kafka_publisher_password\"" \
+    "  user_p1_async_worker=\"$kafka_worker_password\";" \
+    '};' | state_write_file "$SECRETS_DIR/kafka-broker-jaas.conf" 0640
+  printf '' | state_write_file "$SECRETS_DIR/demo.env" 0640
+  write_line P1_DEMO_DATABASE_DSN "postgresql://decision_demo:${db[DEMO]}@postgres:5432/capstone_p1?sslmode=disable" "$SECRETS_DIR/demo.env"
+  write_line ASYNC_PARTITION_HMAC_KEY "$partition_key" "$SECRETS_DIR/demo.env"
+  local compose_secrets_dir=$COMPOSE_SECRETS_DIR
+  install -d -m 0700 "$STATE_DIR/mock"
+  local compose_mock_runtime_dir=$COMPOSE_MOCK_RUNTIME_DIR
+  install -d -m 0700 "$STATE_DIR/rag-v2-root"
+  # RAG 루트는 운영자가 다른 위치에 둘 수 있어 절대 경로를 그대로 쓴다.
+  local compose_rag_runtime_dir=$STATE_DIR/rag-v2-root
+  printf '%s\n' \
+    "P1_SECRETS_DIR=$compose_secrets_dir" \
+    "P1_SECRET_GID=$(id -g)" \
+    "P1_OPERATOR_UID=$(id -u)" \
+    "P1_KIS_MOCK_RUNTIME_DIR=$compose_mock_runtime_dir" \
+    "P1_RAG_RUNTIME_DIR=$compose_rag_runtime_dir" \
+    "P1_API_PORT=${P1_API_PORT:-18080}" \
+    "P1_SPRING_IMAGE=$spring_image" \
+    "P1_PYTHON_IMAGE=${P1_PYTHON_IMAGE:-capstone-decision-platform:p1-local}" \
+    "P1_POSTGRES_IMAGE=${P1_POSTGRES_IMAGE:-capstone-postgres-pgvector:p1-local}" \
+    "P1_KAFKA_IMAGE=${P1_KAFKA_IMAGE:-capstone-kafka:p1-local}" \
+    | state_write_file "$RUNTIME_ENV" 0600
+  chmod 640 "$SECRETS_DIR"/*
+  accept_release
+  printf 'P1_INITIALIZED=TRUE\nP1_LOGIN_PASSWORD_FILES=%s,%s\n' \
+    "$SECRETS_DIR/demo-user.password" "$SECRETS_DIR/demo-admin.password"
+}
+
+verify_state() {
+  require_state
+  verify_runtime_env
+  local expected=(actor-capability-authority.env actor-client.p12 actor-server.p12 actor-tls-ca.crt after-hours-replay.env artifact-import.env automation-gate-author.env automation-runtime.env market-data.env market-data-provider.env bootstrap.env demo-admin.bundle demo-admin.password demo-credential-separation.key demo.env demo-user.bundle \
+    demo-user.password kafka-admin.env kafka-broker-jaas.conf kafka-publisher.env migration.env poison-recorder.env rag-v2.env \
+    kis-mock.env kis-mock-approval-private.pem kis-mock-approval-public.pem kis-mock-approval-trust-policy.json p1-provider-claim.dsn postgres.env python.env rag-history-kek-v1.key redis.env return-inference.env role-bootstrap.env seed-import.env spring.env)
+  expected+=(team-a-acceptance.env)
+  expected+=(calendar-offline-seed.env automation-observation.env rag-source-register.env)
+  # 공시 근거 수집기의 writer DSN 과 OpenDART 인증정보. upgrade_state 가 매 실행마다 다시
+  # 쓰므로(리포 .env 의 key 를 나중에 채워도 켜지게) 이 목록에 없으면 up 이 죽는다.
+  expected+=(disclosure-collector.env)
+  # TLS 리버스 프록시는 --profile tls 로만 뜨는 선택 구성이다. 인증서도 같은 성격이라
+  # 같은 방법으로 다룬다 - 목록에 넣지 않으면 운영자가 인증서를 두는 순간 up 이
+  # secret_inventory 로 죽어 프록시를 켤 방법이 없어진다.
+  if [[ -e $SECRETS_DIR/proxy-tls.crt || -e $SECRETS_DIR/proxy-tls.key ]]; then
+    expected+=(proxy-tls.crt proxy-tls.key)
+  fi
+  local actual
+  actual=$(find "$SECRETS_DIR" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
+  [[ $actual == "$(printf '%s\n' "${expected[@]}" | LC_ALL=C sort)" ]] || die secret_inventory
+  local secret_mode
+  while IFS= read -r file; do
+    # Ed25519 서명 개인키는 packet reader가 owner-only 0600만 허용한다. 나머지 secret은
+    # 컨테이너 그룹이 읽어야 하므로 640을 유지한다.
+    case "${file##*/}" in
+      kis-mock-approval-private.pem | p1-provider-claim.dsn) secret_mode=600 ;;
+      *) secret_mode=640 ;;
+    esac
+    [[ ! -L $file && -f $file && $(stat -c '%a' "$file") == "$secret_mode" ]] || die secret_boundary
+  done < <(find "$SECRETS_DIR" -mindepth 1 -maxdepth 1 -print)
+  local rag_kek_file=$SECRETS_DIR/rag-history-kek-v1.key rag_kek_size
+  rag_kek_size=$(stat -c '%s' "$rag_kek_file")
+  if [[ $rag_kek_size == 32 ]]; then
+    # Compatibility with the previous raw 32-byte state format. The container
+    # entrypoint hex-encodes these same bytes without rotating the key.
+    :
+  elif [[ $rag_kek_size == 64 ]]; then
+    LC_ALL=C grep -Eq '^[0-9a-f]{64}$' "$rag_kek_file" || die rag_history_kek_format
+  else
+    die rag_history_kek_format
+  fi
+  compose db config --quiet
+  compose kafka config --quiet
+  local image arch
+  while IFS= read -r image; do
+    arch=$(docker image inspect "$image" --format '{{.Architecture}}')
+    [[ $arch == amd64 ]] || die image_architecture
+  done < <(sed -n 's/^P1_\(SPRING\|PYTHON\|POSTGRES\)_IMAGE=//p' "$RUNTIME_ENV")
+  printf 'P1_VERIFY=PASS\n'
+}
+
+up_mode() {
+  local mode=${1:-}
+  [[ $mode == db || $mode == kafka ]] || die invalid_mode
+  require_state
+  verify_state >/dev/null
+  local running
+  running=$(compose kafka ps --status running --services 2>/dev/null || true)
+  if grep -qx spring-api <<<"$running"; then die stop_before_adapter_switch; fi
+  if [[ $mode == db ]]; then
+    compose kafka rm -f -s kafka kafka-topic-init >/dev/null
+  fi
+  verify_release_boundary
+  accept_release
+  compose "$mode" up -d --force-recreate
+  printf '%s\n' "$mode" | state_write_file "$ADAPTER_FILE" 0600
+  printf 'P1_UP=%s\n' "$mode"
+}
+
+smoke() {
+  require_command curl
+  require_command python3
+  require_state
+  [[ -f $ADAPTER_FILE && ! -L $ADAPTER_FILE && $(stat -c '%a' "$ADAPTER_FILE") == 600 ]] || die adapter_state
+  local mode
+  mode=$(<"$ADAPTER_FILE")
+  [[ $mode == db || $mode == kafka ]] || die adapter_state
+  local base="http://127.0.0.1:$(sed -n 's/^P1_API_PORT=//p' "$RUNTIME_ENV")"
+  local attempt status=000
+  for attempt in {1..60}; do
+    status=$(curl --silent --output /dev/null --write-out '%{http_code}' "$base/actuator/health" || true)
+    [[ $status == 200 ]] && break
+    sleep 2
+  done
+  [[ $status == 200 ]] || die health_timeout
+  P1_BASE_URL=$base P1_USER_PASSWORD_FILE="$SECRETS_DIR/demo-user.password" python3 - <<'PY'
+import json, os, urllib.request
+password = open(os.environ["P1_USER_PASSWORD_FILE"], encoding="utf-8").read()
+request = urllib.request.Request(
+    os.environ["P1_BASE_URL"] + "/api/v1/auth/login",
+    data=json.dumps({"username": "demo-user", "password": password}).encode(),
+    headers={"Content-Type": "application/json"},
+)
+with urllib.request.urlopen(request, timeout=5) as response:
+    body = json.load(response)
+if response.status != 200:
+    raise SystemExit("P1_ERROR=login_status")
+if body.get("data", {}).get("user", {}).get("userId") != "usr_demo_user":
+    raise SystemExit("P1_ERROR=login_user")
+if body["data"]["user"].get("role") != "USER":
+    raise SystemExit("P1_ERROR=login_role")
+token = body["data"].get("accessToken")
+if not isinstance(token, str) or not token:
+    raise SystemExit("P1_ERROR=login_token")
+PY
+  compose "$mode" --profile smoke run --rm --no-deps -e "P1_SMOKE_MODE=${mode^^}" synthetic-async-smoke
+  printf 'P1_SMOKE=PASS ADAPTER=%s\n' "${mode^^}"
+}
+
+stop_services() {
+  require_state
+  compose kafka stop
+  printf 'P1_STOPPED_VOLUMES_PRESERVED=TRUE\n'
+}
+
+logs_redacted() {
+  require_state
+  compose kafka logs --no-color --tail 500 | sed -E \
+    -e 's/(Bearer )[A-Za-z0-9._~-]+/\1[REDACTED]/g' \
+    -e 's#(postgresql://[^:/[:space:]]+:)[^@/[:space:]]+@#\1[REDACTED]@#Ig' \
+    -e 's/(password|secret|token|account|credential|bundle|hmac|jwt|private[_-]?key|kek|dsn)([=:][^ ,}]*)/\1=[REDACTED]/Ig' \
+    -e 's/\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}/[BCRYPT_REDACTED]/g'
+}
+
+prepare_release_boundary
+load_release_images
+
+case ${1:-} in
+  init) [[ $# == 1 ]] || die unexpected_arguments; init_state ;;
+  verify) [[ $# == 1 ]] || die unexpected_arguments; verify_state ;;
+  up) [[ $# == 2 ]] || die unexpected_arguments; up_mode "$2" ;;
+  smoke) [[ $# == 1 ]] || die unexpected_arguments; smoke ;;
+  status) [[ $# == 1 ]] || die unexpected_arguments; require_state; compose kafka ps ;;
+  logs) [[ ${2:-} == --redacted && $# == 2 ]] || die logs_requires_redacted; logs_redacted ;;
+  stop) [[ $# == 1 ]] || die unexpected_arguments; stop_services ;;
+  backup) P1_STATE_DIR="$STATE_DIR" P1_PROJECT_NAME="$PROJECT_NAME" "$SCRIPT_DIR/backup" ;;
+  restore-test) P1_STATE_DIR="$STATE_DIR" P1_PROJECT_NAME="$PROJECT_NAME" "$SCRIPT_DIR/restore-test" ;;
+  *) die usage_init_verify_up_smoke_status_logs_stop_backup_restore_test ;;
+esac

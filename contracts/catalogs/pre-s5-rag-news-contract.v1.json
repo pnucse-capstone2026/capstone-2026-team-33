@@ -1,0 +1,350 @@
+{
+  "contractId": "pre-s5-rag-news-contract.v1",
+  "decisionPlatformOwner": "DECISION_PLATFORM",
+  "foreignNews": {
+    "endpoint": "/api/v2/market-evidence/{symbol}/foreign-news-sentiment",
+    "lanes": [
+      {
+        "allowedRetainedFields": [
+          "OWNER_LOCAL_DERIVED_AGGREGATE"
+        ],
+        "articleMetadataStored": false,
+        "attachmentAllowed": false,
+        "boundedTransientParseOnly": false,
+        "credentialMode": "OWNER_PERSONAL_LOCAL_ONLY",
+        "credentialStored": false,
+        "derivedCacheDeletionOnExpiryRequired": true,
+        "endpointAllowance": "MARKET_AND_COMPANY_NEWS_ONLY",
+        "externalEntityAllowed": false,
+        "fixedOriginBinding": "FINNHUB_FIXED_API_HOST",
+        "headlineSummaryBodyStored": false,
+        "laneId": "FINNHUB_PERSONAL_LOCAL",
+        "mode": "CONTRACT_ONLY",
+        "ownerLocalDerivedOnly": true,
+        "providerCallsAllowed": false,
+        "queryOrHeaderStored": false,
+        "rawForwardedToVertex": false,
+        "rawProviderDataStored": false,
+        "redirectAllowed": false,
+        "sharedHostedKeyAllowed": false
+      },
+      {
+        "allowedRetainedFields": [
+          "CONTENT_HASH",
+          "DERIVED_AGGREGATE",
+          "OFFICIAL_RELEASE_LOCATOR"
+        ],
+        "articleMetadataStored": false,
+        "attachmentAllowed": false,
+        "boundedTransientParseOnly": true,
+        "credentialMode": "OFFICIAL_ORIGIN_NO_KEY",
+        "credentialStored": false,
+        "derivedCacheDeletionOnExpiryRequired": false,
+        "endpointAllowance": "OFFICIAL_RELEASES_ONLY",
+        "externalEntityAllowed": false,
+        "fixedOriginBinding": "SEC_GOV_OFFICIAL",
+        "headlineSummaryBodyStored": false,
+        "laneId": "SEC_OFFICIAL",
+        "mode": "CONTRACT_ONLY",
+        "ownerLocalDerivedOnly": false,
+        "providerCallsAllowed": false,
+        "queryOrHeaderStored": false,
+        "rawForwardedToVertex": false,
+        "rawProviderDataStored": false,
+        "redirectAllowed": false,
+        "sharedHostedKeyAllowed": false
+      },
+      {
+        "allowedRetainedFields": [
+          "CONTENT_HASH",
+          "DERIVED_AGGREGATE",
+          "OFFICIAL_RELEASE_LOCATOR"
+        ],
+        "articleMetadataStored": false,
+        "attachmentAllowed": false,
+        "boundedTransientParseOnly": true,
+        "credentialMode": "OFFICIAL_ORIGIN_NO_KEY",
+        "credentialStored": false,
+        "derivedCacheDeletionOnExpiryRequired": false,
+        "endpointAllowance": "OFFICIAL_RELEASES_ONLY",
+        "externalEntityAllowed": false,
+        "fixedOriginBinding": "FEDERAL_RESERVE_GOV_OFFICIAL",
+        "headlineSummaryBodyStored": false,
+        "laneId": "FED_OFFICIAL",
+        "mode": "CONTRACT_ONLY",
+        "ownerLocalDerivedOnly": false,
+        "providerCallsAllowed": false,
+        "queryOrHeaderStored": false,
+        "rawForwardedToVertex": false,
+        "rawProviderDataStored": false,
+        "redirectAllowed": false,
+        "sharedHostedKeyAllowed": false
+      },
+      {
+        "allowedRetainedFields": [
+          "OFFLINE_AGGREGATE_REFERENCE"
+        ],
+        "articleMetadataStored": false,
+        "attachmentAllowed": false,
+        "boundedTransientParseOnly": false,
+        "credentialMode": "NONE",
+        "credentialStored": false,
+        "derivedCacheDeletionOnExpiryRequired": false,
+        "endpointAllowance": "NONE",
+        "externalEntityAllowed": false,
+        "fixedOriginBinding": "NONE",
+        "gdeltAdapterAdded": false,
+        "gdeltExecutorAdded": false,
+        "gdeltOutboundCalls": 0,
+        "headlineSummaryBodyStored": false,
+        "laneId": "GDELT_OFFLINE_REFERENCE",
+        "mode": "DECISION_PLATFORM_OFFLINE_REFERENCE_ONLY",
+        "ownerLocalDerivedOnly": false,
+        "providerCallsAllowed": false,
+        "queryOrHeaderStored": false,
+        "rawForwardedToVertex": false,
+        "rawProviderDataStored": false,
+        "redirectAllowed": false,
+        "sharedHostedKeyAllowed": false
+      }
+    ],
+    "modelSelection": {
+      "candidates": [
+        "PROSUSAI_FINBERT",
+        "YIYANGHKUST_FINBERT_TONE",
+        "LOUGHRAN_MCDONALD_BASELINE"
+      ],
+      "criticalNegationNumberUnitErrorsMaximum": 0,
+      "eceMaximum": 0.1,
+      "macroF1Minimum": 0.8,
+      "neutralF1Minimum": 0.75,
+      "perClassRecallMinimum": 0.75,
+      "selectionOrder": [
+        "VALIDATION_MACRO_F1_DESC",
+        "ECE_ASC",
+        "CPU_P95_ASC",
+        "FOOTPRINT_ASC"
+      ],
+      "testEvaluationAfterSelectionOnly": true,
+      "testEvaluationMaximumCount": 1
+    },
+    "providerProbeRuntime": {
+      "executionState": "ONE_SHOT_PACKET_GATED_LOCAL_ONLY",
+      "firstFailureStopsRemainingCalls": true,
+      "modelGate": "SELECTED_BLIND_TEST_PASSED_ONLY",
+      "physicalCallCapPerPacket": 1,
+      "providerCallsAllowed": "ONE_SHOT_PACKET_ONLY",
+      "providerFamilies": [
+        "FINNHUB_PERSONAL_LOCAL",
+        "SEC_OFFICIAL",
+        "FED_OFFICIAL"
+      ],
+      "rawHeaderStored": false,
+      "rawProviderDataStored": false,
+      "rawQueryStored": false,
+      "receiptExecutionAllowed": "LOCAL_CONTENT_FREE_ONLY",
+      "retryCount": 0
+    },
+    "responseInvariants": {
+      "allowedUses": [
+        "EXPLANATION_ONLY"
+      ],
+      "articleMetadataStored": false,
+      "decisionAuthority": "NONE",
+      "rawProviderDataStored": false,
+      "riskDecisionHashIncluded": false,
+      "s5FeatureEligible": false
+    }
+  },
+  "frozenCompatibility": {
+    "generatorVerifiedInputs": [
+      "contracts/openapi/openapi.json",
+      "contracts/proto/rag.proto",
+      "contracts/schemas/rag-source-card-v1.schema.json",
+      "contracts/schemas/rag-source-card-v2.schema.json",
+      "contracts/schemas/news_sentiment_summary.v2.schema.json",
+      "contracts/catalogs/s4-rag-v2-contract.v1.json",
+      "contracts/openapi/rag-v2.openapi.json",
+      "contracts/proto/rag_v2.proto",
+      "contracts/proto/rag_v2.descriptor.pb",
+      "contracts/proto/rag_v2.descriptor.sha256",
+      "capstone-rag/manifests/s4-7d-oa140-release.v1.json",
+      "capstone-rag/manifests/s4-7d-oa140-curriculum-map.v1.md",
+      "capstone-rag/manifests/s4-7d-oa140-distribution.v1.json",
+      "capstone-rag/manifests/s4-7d-oa140-checksums.sha256"
+    ],
+    "verificationState": "EXACT_BYTES_VERIFIED_BY_GENERATOR"
+  },
+  "oa112": {
+    "physicalActivation": "NOT_MATERIALIZED",
+    "requiredActivationPermissions": [
+      "machineFetchAllowed",
+      "localProcessingAllowed",
+      "externalEmbeddingAllowed",
+      "externalGenerationAllowed"
+    ],
+    "reserveAutomaticPromotion": false,
+    "reserveMaximumSources": 28,
+    "sourceCount": 112,
+    "sourcesPerTrack": 8,
+    "status": "OA112_ACTIVE_CONTRACT_LOCKED",
+    "trackCount": 14
+  },
+  "ragV2": {
+    "inheritedSurface": {
+      "legacyBytesBinding": "RAG_V2_OPENAPI_FROZEN",
+      "paths": [
+        "/api/v2/rag/ask",
+        "/api/v2/rag/corpus-status",
+        "/api/v2/rag/history",
+        "/api/v2/rag/history/{answerId}"
+      ]
+    },
+    "ownerDeleteTicket": {
+      "documentBound": true,
+      "ownerBound": true,
+      "ownerRawCopyAllowed": false,
+      "singleUse": true,
+      "sourceScope": "OWNER_PRIVATE",
+      "ttlSeconds": 300
+    },
+    "vertex": {
+      "activationEvidenceRequired": [
+        "SERVICE_ACCOUNT_ENV_SECURITY",
+        "DATA_GOVERNANCE_STATE",
+        "ABUSE_MONITORING_STATE",
+        "MODEL_AVAILABILITY"
+      ],
+      "ambientCredentialAllowed": false,
+      "authentication": [
+        "SERVICE_ACCOUNT_OAUTH"
+      ],
+      "contextCacheAllowed": false,
+      "credentialEnvKey": "MARS_VERTEX_SERVICE_ACCOUNT_JSON_B64",
+      "developerApiAllowed": false,
+      "fallbackAllowed": false,
+      "fileUploadAllowed": false,
+      "generationMethod": "generateContent",
+      "generationUnavailableStatus": "GENERATION_UNAVAILABLE",
+      "maximumEvidenceCount": 5,
+      "maximumGenerateContentCallsPerQuestion": 1,
+      "maximumOAuthTokenCallsPerQuestion": 1,
+      "modelId": "gemini-3.5-flash",
+      "modelIdEnvironmentVariable": "VERTEX_MODEL_ID",
+      "modelSelectionPacketBound": true,
+      "oauthScope": "https://www.googleapis.com/auth/cloud-platform",
+      "oauthTokenEndpoint": "https://oauth2.googleapis.com/token",
+      "openAiCallsAllowed": false,
+      "preparedScopeControlPlane": {
+        "headerName": "X-Rag-V2-Vertex-Scope-Claim",
+        "packetOwnerIdentityStored": false,
+        "rawEvidenceStored": false,
+        "rawQuestionStored": false,
+        "sameParsedAskCommandFingerprintBound": true,
+        "sameRequestIdRequired": true,
+        "scopeTtlSeconds": 120
+      },
+      "rawResponseStored": false,
+      "rerankerAllowed": false,
+      "retryCount": 0,
+      "sanitizedUsageLedgerOnly": true,
+      "searchMapsGroundingAllowed": false,
+      "serviceAccountOnly": true,
+      "sessionResumptionAllowed": false,
+      "toolsFunctionsAllowed": false,
+      "verifierAllowed": false
+    },
+    "voyage": {
+      "activationEvidenceRequired": [
+        "ORGANIZATION_TRAINING_OPT_OUT",
+        "PAYMENT_METHOD_PRIVACY_EVIDENCE"
+      ],
+      "activationMode": "EXACT_MANIFEST_BOUND_RESUMABLE_BATCH_SET",
+      "batchApiAllowed": false,
+      "bgePublicExecution": "TERMINALLY_SUPERSEDED_NO_FURTHER_BGE_RUN",
+      "dimension": 1024,
+      "documentBatchLimits": {
+        "completedBatchReuseRequired": true,
+        "maximumChunksPerRequest": 16000,
+        "maximumGroupsPerRequest": 1000,
+        "maximumPacketTtlSeconds": 7200,
+        "maximumResponseBytes": 16777216,
+        "operationalInputTokenCap": 110000,
+        "operationalMaximumChunksPerRequest": 672,
+        "packetByteCapCoversEstimateRequired": true,
+        "providerInputTokenCap": 120000,
+        "requestPacketPhysicalCallCap": 1,
+        "responseEnvelopeHeadroomBytes": 262144,
+        "responseEstimateBytesPerChunk": 24576,
+        "sourceCheckpointReuseRequired": true,
+        "stopRemainingBatchesAfterFirstFailure": true,
+        "tokenHeadroom": 10000
+      },
+      "filesApiAllowed": false,
+      "fullBundleScope": [
+        "EXACT30",
+        "OA112",
+        "OWNER_PRIVATE"
+      ],
+      "generationFallback": "NO_BGE_FALLBACK_RESUME_VOYAGE_BATCHES_EVALUATE_CAS",
+      "modelId": "voyage-context-4",
+      "officialTokenizer": {
+        "artifactAutoDownloadAllowed": false,
+        "batchAuthoringRequiresInstalledArtifact": true,
+        "bootstrapAcquisitionApprovalRequired": true,
+        "bootstrapEndpoint": "/voyageai/voyage-context-4/raw/8ca946072a18e398cd61f2ad0243b56d0350b1db/tokenizer.json",
+        "bootstrapMaximumPacketTtlSeconds": 300,
+        "bootstrapPhysicalCallCap": 1,
+        "bootstrapRevision": "8ca946072a18e398cd61f2ad0243b56d0350b1db",
+        "localArtifactOnly": true,
+        "packetHashBindingRequired": true,
+        "preflightExpectedInputTokenLedgerRequired": true,
+        "providerTokenCountCallAllowed": false,
+        "utf8ByteApproximationAllowed": false
+      },
+      "orderedPrechunkedDocumentGroupsRequired": true,
+      "outboundCallsAllowed": false,
+      "ownerPrivateSentinel": {
+        "allowed": true,
+        "orderedGroupCount": 0,
+        "ownerScopeSha256": null,
+        "publicBaseOnly": true,
+        "sourceScope": "OWNER_PRIVATE"
+      },
+      "partialProfileMixAllowed": false,
+      "queryEvaluationBatches": {
+        "completedBatchReuseRequired": true,
+        "componentBatchCount": 2,
+        "durableVectorStageRequired": true,
+        "exact30LogicalQueryCount": 10,
+        "maximumPacketTtlSeconds": 7200,
+        "oa112LogicalQueryCount": 112,
+        "singletonQueryGroupsRequired": true
+      },
+      "queryUnitFallbackAllowed": false,
+      "retryCount": 0,
+      "runtimeEnvironmentVariable": "VOYAGE_API_KEY"
+    }
+  },
+  "s48Optional3": {
+    "entitlementState": "PACKET_GATED_LOCAL_ONLY",
+    "physicalCallCapPerPacket": 1,
+    "providerCallsAllowed": "ONE_SHOT_PACKET_ONLY",
+    "providerFamilies": [
+      "FINNHUB_OPTIONAL3",
+      "TWELVE_DATA",
+      "MASSIVE"
+    ],
+    "rawProviderDataStored": false,
+    "receiptExecutionAllowed": "LOCAL_CONTENT_FREE_ONLY",
+    "retryCount": 0
+  },
+  "schemaVersion": 1,
+  "status": "RAG_AND_GLOBAL_NEWS_CONTRACT_LOCKED",
+  "trackedPayloads": {
+    "embeddings": 0,
+    "extractedText": 0,
+    "oaRaw": 0,
+    "ownerRawCopies": 0
+  }
+}

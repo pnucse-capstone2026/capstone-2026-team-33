@@ -1,0 +1,354 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * 테마.
+ *
+ * 밝은 테마가 기본이고 어두운 테마는 같은 이름의 변수만 다시 정의한다. 세 가지 상태를
+ * 모두 지원한다 - 사용자가 고른 값(`data-theme`)이 최우선이고, 고르지 않았으면 OS 설정
+ * (`prefers-color-scheme`)을 따른다.
+ *
+ * 어두운 테마의 상태색은 밝은 테마 값을 그대로 쓰지 않는다. #067A46 같은 진한 색은 어두운
+ * 바탕에서 대비가 무너져 읽히지 않는다. 어두운 바탕 기준으로 명도를 올려 잡았다.
+ */
+:root {
+  color-scheme: light;
+  --font-body: "Gothic A1";
+  --font-numeric: "Figtree";
+  /* 두 테마는 동일한 모양과 레이아웃을 공유한다. */
+  --radius-control: 10px;
+  --radius-card: 16px;
+
+  --c-ink: 12 15 20;
+  --c-muted: 89 97 109;
+  --c-faint: 139 147 159;
+  --c-surface: 244 245 247;
+  --c-panel: 255 255 255;
+  --c-subtle: 247 248 250;
+  --c-line: 233 235 239;
+  --c-rule: 223 227 233;
+  --c-navy: 43 95 217;
+  --c-brand: 43 95 217;
+  --c-on-brand: 255 255 255;
+  --c-allow: 6 122 70;
+  --c-warn: 178 94 9;
+  --c-hold: 74 84 98;
+  --c-block: 179 38 30;
+  --c-abstain: 152 160 171;
+
+  /* 국내 시장 관행: 상승 적, 하락 청. 판정색(allow/block)과 토큰을 공유하지 않는다. */
+  --c-up: 214 56 62;
+  --c-down: 43 95 217;
+
+  --c-scrollbar: 223 227 233;
+  --c-focus: 43 95 217;
+
+  --google-signin-background: #ffffff;
+  --google-signin-outline: #747775;
+  --google-signin-text: #1f1f1f;
+  --google-signin-hover: #f8f9fa;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+  --font-body: "Noto Sans KR";
+  --font-numeric: "Instrument Serif";
+  --hero-background: linear-gradient(#f3f5fa0d 1px, transparent 1px) 0 0 / 48px 48px,
+    linear-gradient(90deg, #f3f5fa0d 1px, transparent 1px) 0 0 / 48px 48px,
+    radial-gradient(58% 70% at 82% 20%, #ffac661f, transparent 66%), #0b0e15;
+  --hero-art-opacity: 0;
+
+    --c-ink: 243 245 249;
+    --c-muted: 174 177 184;
+    --c-faint: 137 140 146;
+    --c-surface: 13 15 21;
+    --c-panel: 21 24 31;
+    --c-subtle: 30 34 41;
+    --c-line: 44 50 61;
+    --c-rule: 58 65 78;
+    --c-navy: 255 156 86;
+    --c-brand: 255 156 86;
+    --c-on-brand: 32 19 8;
+    --c-allow: 62 190 126;
+    --c-warn: 252 190 84;
+    --c-hold: 154 163 176;
+    --c-block: 240 116 106;
+    --c-abstain: 128 137 150;
+
+    --c-up: 255 111 105;
+    --c-down: 115 182 250;
+
+    --c-scrollbar: 58 65 78;
+    --c-focus: 255 156 86;
+
+    --google-signin-background: #131314;
+    --google-signin-outline: #8e918f;
+    --google-signin-text: #e3e3e3;
+    --google-signin-hover: #1d1d1f;
+  }
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --font-body: "Noto Sans KR";
+  --font-numeric: "Instrument Serif";
+  --hero-background: linear-gradient(#f3f5fa0d 1px, transparent 1px) 0 0 / 48px 48px,
+    linear-gradient(90deg, #f3f5fa0d 1px, transparent 1px) 0 0 / 48px 48px,
+    radial-gradient(58% 70% at 82% 20%, #ffac661f, transparent 66%), #0b0e15;
+  --hero-art-opacity: 0;
+
+  --c-ink: 243 245 249;
+  --c-muted: 174 177 184;
+  --c-faint: 137 140 146;
+  --c-surface: 13 15 21;
+  --c-panel: 21 24 31;
+  --c-subtle: 30 34 41;
+  --c-line: 44 50 61;
+  --c-rule: 58 65 78;
+  --c-navy: 255 156 86;
+  --c-brand: 255 156 86;
+  --c-on-brand: 32 19 8;
+  --c-allow: 62 190 126;
+  --c-warn: 252 190 84;
+  --c-hold: 154 163 176;
+  --c-block: 240 116 106;
+  --c-abstain: 128 137 150;
+
+  --c-up: 255 111 105;
+  --c-down: 115 182 250;
+
+  --c-scrollbar: 58 65 78;
+  --c-focus: 255 156 86;
+
+  --google-signin-background: #131314;
+  --google-signin-outline: #8e918f;
+  --google-signin-text: #e3e3e3;
+  --google-signin-hover: #1d1d1f;
+}
+
+html,
+body {
+  background: rgb(var(--c-surface));
+  color: rgb(var(--c-ink));
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+/* 제목은 한 단계 좁게. 한글/숫자가 섞인 금융 화면에서 자간이 벌어지면 산만해진다. */
+h1,
+h2,
+h3 {
+  letter-spacing: -0.015em;
+}
+
+/* 모든 수치는 자릿수 정렬을 유지한다: 표/카드 간 세로 비교가 이 대시보드의 주된 읽기 방식이다. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+}
+
+/*
+ * ABSTAIN / 미제공 값의 시각 언어.
+ * 명세: 결측을 0이나 임의 값으로 합성하지 않는다. 따라서 "빈 칸"이 아니라
+ * 사선 해치로 "여기에 값이 들어올 자리가 있으나 근거가 없다"를 명시한다.
+ * 개편 후에도 의미는 그대로 두고 대비만 낮춰 카드 위에서 튀지 않게 한다.
+ */
+.hatch {
+  background-image: repeating-linear-gradient(
+    -45deg,
+    rgb(var(--c-faint) / 0.24) 0px,
+    rgb(var(--c-faint) / 0.24) 1px,
+    transparent 1px,
+    transparent 6px
+  );
+}
+
+/* 링크·버튼의 상태 전환은 눈에 띄지 않을 만큼만 준다. */
+a,
+button,
+input,
+textarea,
+select {
+  transition:
+    background-color 150ms cubic-bezier(0.16, 1, 0.3, 1),
+    border-color 150ms cubic-bezier(0.16, 1, 0.3, 1),
+    color 150ms cubic-bezier(0.16, 1, 0.3, 1),
+    box-shadow 150ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* 실제로 누르는 대상에만 쓰는 탭 피드백. 누르면 살짝 눌리는 느낌을 준다. */
+.tap {
+  transition: transform 120ms cubic-bezier(0.4, 0, 0.6, 1);
+}
+.tap:active {
+  transform: scale(0.97);
+}
+
+/* Google's custom sign-in button tokens. The brand G itself stays on white in both themes. */
+.google-signin-button {
+  position: relative;
+  background-color: var(--google-signin-background);
+  border-color: var(--google-signin-outline);
+  font-family: 'Google Sans', 'Noto Sans KR', Arial, sans-serif;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 20px;
+}
+.google-signin-button:hover {
+  background-color: var(--google-signin-hover);
+}
+/* Kakao's custom-button guide requires the platform's default system font. */
+.kakao-signin-button {
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+}
+.provider-signin-button {
+  width: 100%;
+  min-height: 56px;
+  aspect-ratio: 4.5 / 1;
+}
+
+/*
+ * 눈금자 슬라이더. OS 기본 슬라이더(둥근 회색 트랙 + 동그라미)는 화면에서 가장 티가 나는
+ * "손대지 않은 기본값"이다. 채워진 구간을 파랑으로, 나머지는 괘선색으로 — 값 자체가
+ * 보이게 만든다. --range-fill은 각 입력의 인라인 스타일에서 채워진 비율(%)로 정해준다.
+ */
+input[type='range'].ink-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 2px;
+  background: linear-gradient(
+    to right,
+    rgb(var(--c-navy)) 0%,
+    rgb(var(--c-navy)) var(--range-fill, 0%),
+    rgb(var(--c-line)) var(--range-fill, 0%),
+    rgb(var(--c-line)) 100%
+  );
+  outline-offset: 6px;
+}
+input[type='range'].ink-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  background: rgb(var(--c-navy));
+  border: 2px solid rgb(var(--c-panel));
+  box-shadow: 0 0 0 1px rgb(var(--c-line));
+  cursor: pointer;
+  margin-top: 0;
+}
+input[type='range'].ink-slider::-moz-range-track {
+  height: 2px;
+  background: linear-gradient(
+    to right,
+    rgb(var(--c-navy)) 0%,
+    rgb(var(--c-navy)) var(--range-fill, 0%),
+    rgb(var(--c-line)) var(--range-fill, 0%),
+    rgb(var(--c-line)) 100%
+  );
+}
+input[type='range'].ink-slider::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  background: rgb(var(--c-navy));
+  border: 2px solid rgb(var(--c-panel));
+  box-shadow: 0 0 0 1px rgb(var(--c-line));
+  cursor: pointer;
+}
+input[type='range'].ink-slider:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* 체크박스. OS 기본 파란 사각형 대신 우리 파랑으로 채우는 정사각 박스. */
+.ink-checkbox {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  border: 1.5px solid rgb(var(--c-line));
+  border-radius: 5px;
+  background: rgb(var(--c-panel));
+  position: relative;
+  cursor: pointer;
+}
+.ink-checkbox:hover {
+  border-color: rgb(var(--c-navy));
+}
+.ink-checkbox:checked {
+  background: rgb(var(--c-navy));
+  border-color: rgb(var(--c-navy));
+}
+.ink-checkbox:checked::after {
+  content: '';
+  position: absolute;
+  left: 5px;
+  top: 2px;
+  width: 4px;
+  height: 8px;
+  border: solid rgb(var(--c-on-brand));
+  border-width: 0 1.5px 1.5px 0;
+  transform: rotate(45deg);
+}
+.ink-checkbox:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+*:focus-visible {
+  outline: 2px solid rgb(var(--c-focus));
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+
+::selection {
+  background: rgb(var(--c-navy) / 0.18);
+}
+
+/* 스크롤바가 화면을 가르지 않도록 얇게. 데스크톱 시연 캡처에서 특히 차이가 난다. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgb(var(--c-scrollbar)) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background-color: rgb(var(--c-scrollbar));
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background-clip: content-box;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Cinder의 주요 수치는 서체로 위계를 주고 작은 표는 가독성을 유지한다. */
+.forecast-number, .hero-number { font-family: var(--font-numeric), var(--font-body), serif; font-weight: 400; }
+
+.overview-hero { background: var(--hero-background, #12151f); }
+.overview-hero > svg { opacity: var(--hero-art-opacity, 1); }
+
+/* 한글 단어를 중간에서 끊지 않고 긴 식별자만 필요할 때 줄바꿈한다. */
+body { word-break: keep-all; overflow-wrap: anywhere; }

@@ -1,0 +1,1182 @@
+from __future__ import annotations
+
+import base64
+import json
+from dataclasses import replace
+from pathlib import Path
+from typing import cast
+
+import pytest
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+
+from app.strong_llm.models import Evidence, RunRequest
+from app.strong_llm.runtime import BoundedStrongLlmGraph, ProviderResult, _run_result
+from app.strong_llm.vertex_provider import (
+    LangChainVertexProvider,
+    VertexProviderSettings,
+    _canonical_answer_json,
+    _fallback_tools,
+    _normalize_grounded_answer,
+    _plaintext_answer_json,
+    _provider_result,
+    _vertex_response_schema,
+)
+
+
+def _service_account_info() -> dict[str, str]:
+    return {
+        "type": "service_account",
+        "project_id": "project-id",
+        "client_email": "vertex-test@project-id.iam.gserviceaccount.com",
+        "private_key": "fixture-private-key",
+        "token_uri": "https://oauth2.googleapis.com/token",
+    }
+
+
+def _service_account_b64() -> str:
+    return base64.b64encode(json.dumps(_service_account_info()).encode()).decode()
+
+
+def test_grounding_receipts_keep_only_edges_to_retained_sources() -> None:
+    result = ProviderResult(
+        message=AIMessage(content=""),
+        answer_json=_answer(),
+        prompt_tokens=1,
+        output_tokens=1,
+        google_queries=[],
+        google_query_count=0,
+        grounding_roots=[
+            {
+                "result_id": "google_1",
+                "title": "A",
+                "uri": "https://example.com/a",
+                "domain": "example.com",
+                "chunk_index": 0,
+                "citation_id": "cit_1",
+            },
+            {
+                "result_id": "google_2",
+                "title": "B",
+                "uri": "https://example.com/b",
+                "domain": "example.com",
+                "chunk_index": 1,
+                "citation_id": "",
+            },
+        ],
+        grounding_supports=[
+            {"start_index": 0, "end_index": 3, "text": "one", "chunk_indices": (0, 1)},
+            {"start_index": 4, "end_index": 7, "text": "two", "chunk_indices": (1,)},
+        ],
+    )
+    actual = _run_result(result, vertex_calls=2, backend="VERTEX_GOOGLE")
+    assert [support.chunk_indices for support in actual.grounding_supports] == [(0,)]
+    assert [root.chunk_index for root in actual.grounding_roots] == [0]
+
+
+def _answer() -> str:
+    return json.dumps(
+        {
+            "basis": "MODEL_KNOWLEDGE",
+            "answer": "분산투자는 일반적으로 위험 집중을 줄입니다.",
+            "sentences": [
+                {
+                    "text": "분산투자는 일반적으로 위험 집중을 줄입니다.",
+                    "citationIds": [],
+                    "evidenceSpans": [],
+                    "numericSpans": [],
+                }
+            ],
+            "warnings": [],
+        },
+        ensure_ascii=False,
+    )
+
+
+class FakeProvider:
+    def __init__(self, *, google_queries: list[str] | None = None, tool_call: bool = False) -> None:
+        self.google_queries = google_queries or []
+        self.tool_call = tool_call
+        self.invocations: list[tuple[str, bool]] = []
+        self.tool_results: list[str] = []
+
+    def invoke_google(self, request: RunRequest, *, include_owner: bool) -> ProviderResult:
+        self.invocations.append(("google", include_owner))
+        return _result(self.google_queries)
+
+    def invoke_fallback(
+        self,
+        request: RunRequest,
+        messages: list[BaseMessage],
+        *,
+        tools_enabled: bool,
+    ) -> ProviderResult:
+        self.invocations.append(("fallback", tools_enabled))
+        if self.tool_call and not messages:
+            message = AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "capstone_web_search",
+                        "args": {"query": "diversification"},
+                        "id": "call_1",
+                    }
+                ],
+            )
+            result = _result([])
+            result["message"] = message
+            result["answer_json"] = ""
+            return result
+        return _result([])
+
+    def tool_calls(self, message: AIMessage) -> list[dict[str, object]]:
+        return [dict(item) for item in message.tool_calls]
+
+    def append_tool_result(
+        self,
+        messages: list[BaseMessage],
+        message: AIMessage,
+        call: dict[str, object],
+        result_json: str,
+    ) -> list[BaseMessage]:
+        self.tool_results.append(result_json)
+        return [message, AIMessage(content=result_json)]
+
+
+def test_google_path_requires_permit_before_provider_and_preserves_grounding() -> None:
+    provider = FakeProvider(google_queries=["portfolio diversification"])
+    events: list[tuple[str, str, bool]] = []
+    result = BoundedStrongLlmGraph().run(
+        _request(google=True),
+        provider,
+        lambda call_id, phase, attached: events.append((call_id, phase, attached)),
+        lambda *_: pytest.fail("Google native path must not call host tools"),
+    )
+
+    assert events == [
+        ("google_discovery", "GOOGLE_DISCOVERY", True),
+        ("grounded_final", "GROUNDED_FINAL", False),
+    ]
+    assert provider.invocations == [("google", False), ("google", True)]
+    assert result.vertex_generate_call_count == 2
+    assert result.google_grounding_query_count == 1
+    assert result.search_backend == "VERTEX_GOOGLE"
+
+
+def test_owner_google_path_has_discovery_then_tool_free_final() -> None:
+    provider = FakeProvider(google_queries=["portfolio diversification"])
+    permits: list[tuple[str, bool]] = []
+    result = BoundedStrongLlmGraph().run(
+        _request(google=True, owner=True),
+        provider,
+        lambda call_id, _phase, attached: permits.append((call_id, attached)),
+        lambda *_: pytest.fail("Google native path must not call host tools"),
+    )
+
+    assert permits == [("google_discovery", True), ("grounded_final", False)]
+    assert provider.invocations == [("google", False), ("google", True)]
+    assert result.vertex_generate_call_count == 2
+
+
+def test_news_screen_discovery_only_never_requests_structured_final() -> None:
+    provider = FakeProvider(google_queries=["005930 adverse disclosure"])
+    permits: list[tuple[str, str, bool]] = []
+    request = replace(_request(google=True), grounding_discovery_only=True)
+
+    result = BoundedStrongLlmGraph().run(
+        request,
+        provider,
+        lambda call_id, phase, attached: permits.append((call_id, phase, attached)),
+        lambda *_: pytest.fail("Google native path must not call host tools"),
+    )
+
+    assert permits == [("google_discovery", "GOOGLE_DISCOVERY", True)]
+    assert provider.invocations == [("google", False)]
+    assert result.vertex_generate_call_count == 1
+
+
+def test_searxng_fallback_is_bounded_and_returns_tool_result_to_same_message() -> None:
+    provider = FakeProvider(tool_call=True)
+    calls: list[tuple[str, str, dict[str, object]]] = []
+    result = BoundedStrongLlmGraph().run(
+        _request(google=False),
+        provider,
+        lambda *_: None,
+        lambda call_id, name, args: calls.append((call_id, name, args)) or '{"results":[]}',
+    )
+
+    assert calls == [("call_1", "capstone_web_search", {"query": "diversification"})]
+    assert provider.tool_results == ['{"results":[]}']
+    assert result.vertex_generate_call_count == 2
+    assert result.search_backend == "SEARXNG"
+
+
+def test_owner_private_evidence_forces_tool_free_fallback_and_zero_public_queries() -> None:
+    provider = FakeProvider()
+    permits: list[tuple[str, str, bool]] = []
+    public_tool_calls: list[tuple[str, str, dict[str, object]]] = []
+
+    result = BoundedStrongLlmGraph().run(
+        _request(google=False, owner=True),
+        provider,
+        lambda call_id, phase, attached: permits.append((call_id, phase, attached)),
+        lambda call_id, name, args: public_tool_calls.append((call_id, name, args)) or "{}",
+    )
+
+    assert permits == [("owner_final", "OWNER_FINAL", False)]
+    assert provider.invocations == [("fallback", False)]
+    assert public_tool_calls == []
+    assert result.vertex_generate_call_count == 1
+    assert result.search_backend == "NONE"
+    assert result.web_search_queries == ()
+
+
+def test_owner_private_fallback_rejects_model_generated_public_query_before_execution() -> None:
+    provider = FakeProvider(tool_call=True)
+    public_tool_calls: list[tuple[str, str, dict[str, object]]] = []
+
+    with pytest.raises(ValueError, match="STRONG_LLM_OWNER_PUBLIC_DISCOVERY_FORBIDDEN"):
+        BoundedStrongLlmGraph().run(
+            _request(google=False, owner=True),
+            provider,
+            lambda *_: None,
+            lambda call_id, name, args: public_tool_calls.append((call_id, name, args)) or "{}",
+        )
+
+    assert provider.invocations == [("fallback", False)]
+    assert public_tool_calls == []
+
+
+def test_vertex_provider_rejects_owner_evidence_with_public_tools_before_model_call(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invocations: list[object] = []
+
+    class FakeCredentials:
+        project_id = "project-id"
+
+    class FakeModel:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def bind(self, **_kwargs: object) -> FakeModel:
+            return self
+
+        def bind_tools(self, _tools: list[dict[str, object]]) -> FakeModel:
+            return self
+
+        def invoke(self, messages: object) -> AIMessage:
+            invocations.append(messages)
+            return AIMessage(content=_answer())
+
+    monkeypatch.setattr(
+        "app.strong_llm.vertex_provider.service_account.Credentials.from_service_account_info",
+        lambda *_args, **_kwargs: FakeCredentials(),
+    )
+    monkeypatch.setattr("app.strong_llm.vertex_provider.ChatGoogleGenerativeAI", FakeModel)
+    request = _request(google=False, owner=True)
+    provider = LangChainVertexProvider(
+        request,
+        VertexProviderSettings(service_account_info=_service_account_info()),
+    )
+
+    with pytest.raises(ValueError, match="STRONG_LLM_OWNER_PUBLIC_DISCOVERY_FORBIDDEN"):
+        provider.invoke_fallback(request, [], tools_enabled=True)
+
+    assert invocations == []
+
+
+def test_invalid_service_account_env_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MARS_VERTEX_SERVICE_ACCOUNT_JSON_B64", "not-base64")
+
+    with pytest.raises(ValueError, match="STRONG_LLM_VERTEX_SERVICE_ACCOUNT_ENV_INVALID"):
+        VertexProviderSettings.from_env()
+
+
+def test_vertex_timeout_is_bounded_inside_the_host_deadline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MARS_VERTEX_SERVICE_ACCOUNT_JSON_B64", _service_account_b64())
+
+    assert VertexProviderSettings.from_env().timeout_seconds == 50.0
+    assert VertexProviderSettings.from_env().thinking_level == "low"
+    monkeypatch.setenv("RAG_LLM_MAX_OUTPUT_TOKENS", "8192")
+    assert VertexProviderSettings.from_env().max_output_tokens == 8192
+    assert VertexProviderSettings.from_env().for_thinking_level("medium").max_output_tokens == 8192
+    for invalid in ("0", "255", "32769", "not-a-number"):
+        monkeypatch.setenv("RAG_LLM_MAX_OUTPUT_TOKENS", invalid)
+        with pytest.raises(ValueError, match="STRONG_LLM_VERTEX_OUTPUT_CAP_INVALID"):
+            VertexProviderSettings.from_env()
+    monkeypatch.setenv("RAG_LLM_MAX_OUTPUT_TOKENS", "8192")
+    monkeypatch.setenv("STRONG_LLM_VERTEX_TIMEOUT_SECONDS", "55")
+    assert VertexProviderSettings.from_env().timeout_seconds == 55.0
+
+    for invalid in ("not-a-number", "9.9", "55.1", "nan"):
+        monkeypatch.setenv("STRONG_LLM_VERTEX_TIMEOUT_SECONDS", invalid)
+        with pytest.raises(ValueError, match="STRONG_LLM_VERTEX_TIMEOUT_INVALID"):
+            VertexProviderSettings.from_env()
+
+    monkeypatch.setenv("STRONG_LLM_VERTEX_TIMEOUT_SECONDS", "50")
+    for accepted in ("minimal", "low", "medium"):
+        monkeypatch.setenv("STRONG_LLM_VERTEX_THINKING_LEVEL", accepted)
+        assert VertexProviderSettings.from_env().thinking_level == accepted
+    for rejected in ("", "high", "dynamic"):
+        monkeypatch.setenv("STRONG_LLM_VERTEX_THINKING_LEVEL", rejected)
+        with pytest.raises(ValueError, match="STRONG_LLM_VERTEX_THINKING_LEVEL_INVALID"):
+            VertexProviderSettings.from_env()
+
+
+def test_google_search_discovery_is_separate_from_native_schema_final(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    constructor_calls: list[dict[str, object]] = []
+    bind_calls: list[dict[str, object]] = []
+
+    class FakeCredentials:
+        project_id = "project-id"
+
+    class FakeModel:
+        def __init__(self, **kwargs: object) -> None:
+            constructor_calls.append(kwargs)
+
+        def bind(self, **kwargs: object) -> FakeModel:
+            bind_calls.append(kwargs)
+            return self
+
+    monkeypatch.setattr(
+        "app.strong_llm.vertex_provider.service_account.Credentials.from_service_account_info",
+        lambda *_args, **_kwargs: FakeCredentials(),
+    )
+    monkeypatch.setattr("app.strong_llm.vertex_provider.ChatGoogleGenerativeAI", FakeModel)
+
+    LangChainVertexProvider(
+        _request(google=True),
+        VertexProviderSettings(service_account_info=_service_account_info()),
+    )
+
+    assert len(constructor_calls) == 1
+    assert all("response_mime_type" not in call for call in constructor_calls)
+    assert all("response_schema" not in call for call in constructor_calls)
+    assert all(call["timeout"] == 50.0 for call in constructor_calls)
+    assert all(call["thinking_level"] == "low" for call in constructor_calls)
+    assert constructor_calls[0]["max_output_tokens"] == 4_096
+    assert constructor_calls[0]["temperature"] is None
+    assert bind_calls[0]["response_mime_type"] == "application/json"
+    assert "tools" not in bind_calls[0]
+    assert bind_calls[1]["tools"] == [{"google_search": {}}]
+    assert bind_calls[1]["temperature"] == 0.0
+    assert "response_mime_type" not in bind_calls[1]
+    assert "response_schema" not in bind_calls[1]
+
+
+def test_explicit_google_search_stays_on_official_langchain_vertex_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    invocations: list[dict[str, object]] = []
+
+    class FakeCredentials:
+        project_id = "project-id"
+
+    class FakeBoundModel:
+        def __init__(self, binding: dict[str, object]) -> None:
+            self.binding = binding
+
+        def invoke(self, _messages: object) -> AIMessage:
+            invocations.append(self.binding)
+            return AIMessage(content=_answer())
+
+    class FakeModel:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def bind(self, **kwargs: object) -> FakeBoundModel:
+            return FakeBoundModel(kwargs)
+
+    monkeypatch.setattr(
+        "app.strong_llm.vertex_provider.service_account.Credentials.from_service_account_info",
+        lambda *_args, **_kwargs: FakeCredentials(),
+    )
+    monkeypatch.setattr("app.strong_llm.vertex_provider.ChatGoogleGenerativeAI", FakeModel)
+    request = replace(
+        _request(google=True),
+        question="Google Search로 현재 SEC 보도자료를 확인해 주세요.",
+    )
+    provider = LangChainVertexProvider(
+        request,
+        VertexProviderSettings(service_account_info=_service_account_info()),
+    )
+
+    result = provider.invoke_google(request, include_owner=False)
+
+    assert invocations == [
+        {
+            "tools": [{"google_search": {}}],
+            "temperature": 0.0,
+        }
+    ]
+    assert result["google_query_count"] == 0
+    assert json.loads(result["answer_json"])["basis"] == "INSUFFICIENT_EVIDENCE"
+
+
+def test_unbound_provisional_google_citation_keeps_answer_as_model_knowledge() -> None:
+    """결속되지 않은 인용은 떼어 내되 설명 문장은 남긴다.
+
+    예전에는 이 경우 답을 통째로 비웠다. 그러나 인용을 결속할 수 없다는 것은 설명이
+    틀렸다는 뜻이 아니라 근거를 붙일 수 없다는 뜻이다. 문장은 그대로 두고 basis로
+    근거 없음을 밝히면 사용자는 읽을 것을 얻고, 무엇이 검증되지 않았는지도 안다.
+    """
+
+    answer = {
+        "basis": "EVIDENCE",
+        "answer": "Current SEC release.",
+        "sentences": [
+            {
+                "text": "Current SEC release.",
+                "citationIds": [],
+                "evidenceSpans": [{"citationId": "", "quote": "Current SEC release."}],
+                "numericSpans": [],
+            }
+        ],
+        "warnings": [],
+    }
+
+    normalized = json.loads(
+        _normalize_grounded_answer(
+            json.dumps(answer),
+            [],
+            [],
+            allowed_local_ids=set(),
+        )
+    )
+
+    assert normalized == {
+        "basis": "MODEL_KNOWLEDGE",
+        "answer": "Current SEC release.",
+        "sentences": [
+            {
+                "text": "Current SEC release.",
+                "citationIds": [],
+                "evidenceSpans": [],
+                "numericSpans": [],
+            }
+        ],
+        "warnings": [],
+    }
+
+
+def test_fallback_function_call_does_not_require_intermediate_text() -> None:
+    message = AIMessage(
+        content="I will inspect a current public source before answering.",
+        tool_calls=[
+            {
+                "name": "capstone_web_search",
+                "args": {"query": "next total solar eclipse United States"},
+                "id": "call_1",
+                "type": "tool_call",
+            }
+        ],
+        usage_metadata={"input_tokens": 17, "output_tokens": 5, "total_tokens": 22},
+    )
+
+    result = _provider_result(message, allowed_local_ids=set())
+
+    assert result["message"] is message
+    assert result["prompt_tokens"] == 17
+    assert result["output_tokens"] == 5
+    assert json.loads(result["answer_json"])["basis"] == "INSUFFICIENT_EVIDENCE"
+
+
+def test_fallback_tool_round_keeps_native_structured_output_binding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bind_calls: list[dict[str, object]] = []
+    tool_calls: list[list[dict[str, object]]] = []
+
+    class FakeCredentials:
+        project_id = "project-id"
+
+    class FakeModel:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def bind(self, **kwargs: object) -> FakeModel:
+            bind_calls.append(kwargs)
+            return self
+
+        def bind_tools(self, tools: list[dict[str, object]]) -> FakeModel:
+            tool_calls.append(tools)
+            return self
+
+        def invoke(self, _messages: object) -> AIMessage:
+            return AIMessage(content=_answer())
+
+    monkeypatch.setattr(
+        "app.strong_llm.vertex_provider.service_account.Credentials.from_service_account_info",
+        lambda *_args, **_kwargs: FakeCredentials(),
+    )
+    monkeypatch.setattr("app.strong_llm.vertex_provider.ChatGoogleGenerativeAI", FakeModel)
+    request = _request(google=False)
+    provider = LangChainVertexProvider(
+        request,
+        VertexProviderSettings(service_account_info=_service_account_info()),
+    )
+
+    result = provider.invoke_fallback(request, [], tools_enabled=True)
+
+    assert tool_calls == [_fallback_tools()]
+    assert bind_calls[-1]["response_mime_type"] == "application/json"
+    assert bind_calls[-1]["response_schema"] == _vertex_response_schema()
+    assert json.loads(result["answer_json"])["basis"] == "MODEL_KNOWLEDGE"
+
+
+def test_fallback_tool_result_preserves_initial_policy_and_question(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool_message = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "capstone_web_search",
+                "args": {"query": "portfolio diversification"},
+                "id": "call_search_1",
+                "type": "tool_call",
+            }
+        ],
+    )
+
+    class FakeCredentials:
+        project_id = "project-id"
+
+    class FakeModel:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def bind(self, **_kwargs: object) -> FakeModel:
+            return self
+
+        def bind_tools(self, _tools: list[dict[str, object]]) -> FakeModel:
+            return self
+
+        def invoke(self, _messages: object) -> AIMessage:
+            return tool_message
+
+    monkeypatch.setattr(
+        "app.strong_llm.vertex_provider.service_account.Credentials.from_service_account_info",
+        lambda *_args, **_kwargs: FakeCredentials(),
+    )
+    monkeypatch.setattr("app.strong_llm.vertex_provider.ChatGoogleGenerativeAI", FakeModel)
+    request = _request(google=False)
+    provider = LangChainVertexProvider(
+        request,
+        VertexProviderSettings(service_account_info=_service_account_info()),
+    )
+
+    first = provider.invoke_fallback(request, [], tools_enabled=True)
+    history = provider.append_tool_result(
+        [],
+        first["message"],
+        dict(first["message"].tool_calls[0]),
+        '{"results":[]}',
+    )
+
+    assert isinstance(history[0], SystemMessage)
+    assert isinstance(history[1], HumanMessage)
+    assert request.question in str(history[1].content)
+    assert history[2] is tool_message
+    assert isinstance(history[3], ToolMessage)
+
+
+def test_fallback_final_accepts_only_host_issued_read_citation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    answer = json.dumps(
+        {
+            "basis": "EVIDENCE",
+            "answer": "분산투자는 위험 집중을 줄일 수 있습니다.",
+            "sentences": [
+                {
+                    "text": "분산투자는 위험 집중을 줄일 수 있습니다.",
+                    "citationIds": ["cit_5"],
+                    "evidenceSpans": [
+                        {"citationId": "cit_5", "quote": "분산투자는 위험 집중을 줄일 수 있습니다."}
+                    ],
+                    "numericSpans": [],
+                }
+            ],
+            "warnings": [],
+        },
+        ensure_ascii=False,
+    )
+
+    class FakeCredentials:
+        project_id = "project-id"
+
+    class FakeModel:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def bind(self, **_kwargs: object) -> FakeModel:
+            return self
+
+        def bind_tools(self, _tools: list[dict[str, object]]) -> FakeModel:
+            return self
+
+        def invoke(self, _messages: object) -> AIMessage:
+            return AIMessage(content=answer)
+
+    monkeypatch.setattr(
+        "app.strong_llm.vertex_provider.service_account.Credentials.from_service_account_info",
+        lambda *_args, **_kwargs: FakeCredentials(),
+    )
+    monkeypatch.setattr("app.strong_llm.vertex_provider.ChatGoogleGenerativeAI", FakeModel)
+    request = _request(google=False)
+    provider = LangChainVertexProvider(
+        request,
+        VertexProviderSettings(service_account_info=_service_account_info()),
+    )
+    messages: list[BaseMessage] = [
+        ToolMessage(
+            content=json.dumps(
+                {
+                    "resultId": "searxng_1",
+                    "citationId": "cit_5",
+                    "text": "분산투자는 위험 집중을 줄일 수 있습니다.",
+                },
+                ensure_ascii=False,
+            ),
+            tool_call_id="call_read_1",
+        )
+    ]
+
+    result = provider.invoke_fallback(request, messages, tools_enabled=False)
+
+    assert json.loads(result["answer_json"])["sentences"][0]["citationIds"] == ["cit_5"]
+
+
+def test_insufficient_evidence_empty_answer_is_normalized_to_null() -> None:
+    answer = json.dumps(
+        {
+            "basis": "INSUFFICIENT_EVIDENCE",
+            "answer": "",
+            "sentences": [],
+            "warnings": [],
+        }
+    )
+
+    normalized = json.loads(_normalize_grounded_answer(answer, [], [], allowed_local_ids=set()))
+
+    assert normalized["answer"] is None
+
+
+def test_vertex_schema_uses_only_the_provider_supported_structural_subset() -> None:
+    schema = _vertex_response_schema()
+    serialized = json.dumps(schema, sort_keys=True)
+
+    for unsupported in (
+        "$defs",
+        "$ref",
+        "additionalProperties",
+        "minLength",
+        "maxLength",
+        "pattern",
+    ):
+        assert unsupported not in serialized
+    assert schema["required"] == ["basis", "answer", "sentences", "warnings"]
+
+
+def test_grounding_metadata_accepts_null_optional_segment_offsets() -> None:
+    message = AIMessage(
+        content=_answer(),
+        response_metadata={
+            "grounding_metadata": {
+                "web_search_queries": ["portfolio diversification"],
+                "grounding_chunks": [
+                    {
+                        "web": {
+                            "uri": "https://www.investor.gov/diversification",
+                            "title": "Diversification",
+                            "domain": "investor.gov",
+                        }
+                    }
+                ],
+                "grounding_supports": [
+                    {
+                        "segment": {"start_index": None, "end_index": None, "text": "분산투자"},
+                        "grounding_chunk_indices": [0],
+                    }
+                ],
+            }
+        },
+        usage_metadata={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+    )
+
+    result = _provider_result(message)
+
+    assert result["grounding_supports"] == [
+        {"start_index": 0, "end_index": 0, "text": "분산투자", "chunk_indices": (0,)}
+    ]
+
+
+def test_grounding_metadata_accepts_google_camel_case_projection() -> None:
+    message = AIMessage(
+        content=_answer(),
+        response_metadata={
+            "grounding_metadata": {
+                "webSearchQueries": ["Investor.gov diversification"],
+                "groundingChunks": [
+                    {
+                        "web": {
+                            "uri": "https://www.investor.gov/diversification",
+                            "title": "Diversification",
+                        }
+                    }
+                ],
+                "groundingSupports": [
+                    {
+                        "segment": {"startIndex": 1, "endIndex": 12, "text": "분산투자"},
+                        "groundingChunkIndices": [0],
+                    }
+                ],
+            }
+        },
+    )
+
+    result = _provider_result(message)
+
+    assert result["google_queries"] == ["Investor.gov diversification"]
+    assert result["grounding_roots"][0]["domain"] == "www.investor.gov"
+    assert result["grounding_supports"] == [
+        {"start_index": 1, "end_index": 12, "text": "분산투자", "chunk_indices": (0,)}
+    ]
+
+
+def test_grounding_null_domain_uses_only_hostname_shaped_title() -> None:
+    message = AIMessage(
+        content=_answer(),
+        response_metadata={
+            "grounding_metadata": {
+                "web_search_queries": ["site:reuters.com 005930"],
+                "grounding_chunks": [
+                    {
+                        "web": {
+                            "uri": "https://vertexaisearch.cloud.google.com/grounding-api-redirect/id",
+                            "title": "reuters.com",
+                            "domain": None,
+                        }
+                    }
+                ],
+                "grounding_supports": [
+                    {
+                        "segment": {"text": "005930 public evidence"},
+                        "grounding_chunk_indices": [0],
+                    }
+                ],
+            }
+        },
+    )
+
+    result = _provider_result(message)
+
+    assert result["grounding_roots"][0]["domain"] == "reuters.com"
+
+
+def test_langchain_content_block_citation_is_the_grounding_fallback() -> None:
+    answer = {
+        "basis": "EVIDENCE",
+        "answer": "Diversification can reduce risk.",
+        "sentences": [
+            {
+                "text": "Diversification can reduce risk.",
+                "citationIds": ["provider_label"],
+                "evidenceSpans": [
+                    {"citationId": "provider_label", "quote": "Diversification can reduce risk."}
+                ],
+                "numericSpans": [],
+            }
+        ],
+        "warnings": [],
+    }
+    message = AIMessage(
+        content=[
+            {
+                "type": "text",
+                "text": json.dumps(answer),
+                "annotations": [
+                    {
+                        "type": "citation",
+                        "url": "https://www.investor.gov/diversification",
+                        "title": "Diversification",
+                        "start_index": 0,
+                        "end_index": 32,
+                        "cited_text": "Diversification can reduce risk.",
+                        "extras": {
+                            "google_ai_metadata": {
+                                "web_search_queries": ["Investor.gov diversification"]
+                            }
+                        },
+                    }
+                ],
+            }
+        ],
+        usage_metadata={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+    )
+
+    result = _provider_result(message, allowed_local_ids=set())
+    normalized = json.loads(result["answer_json"])
+
+    assert result["google_queries"] == ["Investor.gov diversification"]
+    assert result["grounding_roots"][0]["uri"] == "https://www.investor.gov/diversification"
+    assert normalized["sentences"][0]["citationIds"] == ["cit_1"]
+
+
+def test_google_support_segment_may_exactly_contain_the_structured_sentence() -> None:
+    answer = {
+        "basis": "EVIDENCE",
+        "answer": "Diversification can reduce risk.",
+        "sentences": [
+            {
+                "text": "Diversification can reduce risk.",
+                "citationIds": [],
+                "evidenceSpans": [],
+                "numericSpans": [],
+            }
+        ],
+        "warnings": [],
+    }
+    roots: list[dict[str, object]] = [
+        {
+            "result_id": "google_1",
+            "title": "Diversification",
+            "uri": "https://www.investor.gov/diversification",
+            "domain": "investor.gov",
+            "chunk_index": 0,
+            "citation_id": "",
+        }
+    ]
+    supports: list[dict[str, object]] = [
+        {
+            "start_index": 0,
+            "end_index": 70,
+            "text": '"text":"Diversification can reduce risk.","citationIds":[]',
+            "chunk_indices": (0,),
+        }
+    ]
+
+    normalized = json.loads(
+        _normalize_grounded_answer(
+            json.dumps(answer),
+            roots,
+            supports,
+            allowed_local_ids=set(),
+        )
+    )
+
+    assert normalized["sentences"][0]["citationIds"] == ["cit_1"]
+    assert normalized["sentences"][0]["evidenceSpans"] == [
+        {"citationId": "cit_1", "quote": "Diversification can reduce risk."}
+    ]
+
+
+def test_google_grounding_rebuilds_mismatched_duplicate_sentence_contract() -> None:
+    answer = {
+        "basis": "EVIDENCE",
+        "answer": "2026년 8월 15일 최신 보도자료입니다.",
+        "sentences": [
+            {
+                "text": "모델이 중복 문장 필드를 다르게 작성했습니다.",
+                "citationIds": [],
+                "evidenceSpans": [],
+                "numericSpans": [],
+            }
+        ],
+        "warnings": [],
+    }
+    roots: list[dict[str, object]] = [
+        {
+            "result_id": "google_1",
+            "title": "SEC press releases",
+            "uri": "https://www.sec.gov/newsroom/press-releases",
+            "domain": "sec.gov",
+            "chunk_index": 0,
+            "citation_id": "",
+        }
+    ]
+    supports: list[dict[str, object]] = [
+        {
+            "start_index": 0,
+            "end_index": 18,
+            "text": "2026년 8월 15일 최신 보도자료",
+            "chunk_indices": (0,),
+        }
+    ]
+
+    normalized = json.loads(
+        _normalize_grounded_answer(
+            json.dumps(answer, ensure_ascii=False),
+            roots,
+            supports,
+            allowed_local_ids=set(),
+        )
+    )
+
+    assert normalized["answer"] == "2026년 8월 15일 최신 보도자료입니다."
+    assert normalized["sentences"] == [
+        {
+            "text": "2026년 8월 15일 최신 보도자료입니다.",
+            "citationIds": ["cit_1"],
+            "evidenceSpans": [{"citationId": "cit_1", "quote": "2026년 8월 15일 최신 보도자료"}],
+            "numericSpans": [
+                {"value": "2026년", "citationIds": ["cit_1"]},
+                {"value": "8월", "citationIds": ["cit_1"]},
+                {"value": "15일", "citationIds": ["cit_1"]},
+            ],
+        }
+    ]
+
+
+def test_provider_json_accepts_only_one_object_with_optional_known_fence() -> None:
+    expected = json.loads(_answer())
+
+    assert json.loads(_canonical_answer_json(_answer())) == expected
+    assert json.loads(_canonical_answer_json(f"```json\n{_answer()}\n```")) == expected
+    assert json.loads(_canonical_answer_json(f"```JSON\r\n{_answer()}\r\n```")) == expected
+    assert json.loads(_canonical_answer_json(f"```{_answer()}```")) == expected
+    with pytest.raises(ValueError, match="STRONG_LLM_PROVIDER_TEXT_MISSING"):
+        _canonical_answer_json("  ")
+    with pytest.raises(ValueError, match="STRONG_LLM_PROVIDER_JSON_SURROUNDED_OBJECT"):
+        _canonical_answer_json(f"answer:\n{_answer()}")
+    with pytest.raises(ValueError, match="STRONG_LLM_PROVIDER_JSON_SYNTAX_INVALID"):
+        _canonical_answer_json("{not-json}")
+    with pytest.raises(ValueError, match="STRONG_LLM_PROVIDER_JSON_TRUNCATED"):
+        _canonical_answer_json('{"basis":"EVIDENCE"')
+    with pytest.raises(ValueError, match="STRONG_LLM_PROVIDER_JSON_STRING_INVALID"):
+        _canonical_answer_json('"unterminated')
+    with pytest.raises(ValueError, match="STRONG_LLM_PROVIDER_NON_JSON_TEXT"):
+        _canonical_answer_json("schema unavailable")
+    with pytest.raises(ValueError, match="STRONG_LLM_PROVIDER_JSON_ROOT_INVALID"):
+        _canonical_answer_json("[]")
+
+
+def test_google_support_uses_an_unused_citation_id_without_discarding_local_evidence() -> None:
+    answer = {
+        "basis": "EVIDENCE",
+        "answer": "낮은 상관관계는 위험 집중을 줄일 수 있습니다.",
+        "sentences": [
+            {
+                "text": "낮은 상관관계는 위험 집중을 줄일 수 있습니다.",
+                "citationIds": ["cit_1"],
+                "evidenceSpans": [{"citationId": "cit_1", "quote": "위험 집중"}],
+                "numericSpans": [],
+            }
+        ],
+        "warnings": [],
+    }
+    roots: list[dict[str, object]] = [
+        {
+            "result_id": "google_1",
+            "title": "Investor.gov",
+            "uri": "https://www.investor.gov/introduction-investing/investing-basics/glossary/diversification",
+            "domain": "investor.gov",
+            "chunk_index": 0,
+            "citation_id": "",
+        }
+    ]
+    supports: list[dict[str, object]] = [
+        {
+            "start_index": 0,
+            "end_index": 12,
+            "text": "낮은 상관관계",
+            "chunk_indices": (0,),
+        }
+    ]
+
+    normalized = json.loads(
+        _normalize_grounded_answer(json.dumps(answer, ensure_ascii=False), roots, supports)
+    )
+
+    assert roots[0]["citation_id"] == "cit_2"
+    assert normalized["sentences"][0]["citationIds"] == ["cit_1", "cit_2"]
+    assert normalized["sentences"][0]["evidenceSpans"] == [
+        {"citationId": "cit_1", "quote": "위험 집중"},
+        {"citationId": "cit_2", "quote": "낮은 상관관계"},
+    ]
+    assert normalized["warnings"] == ["GOOGLE_GROUNDING_ONLY"]
+
+
+def test_google_support_rebinds_model_invented_label_only_by_exact_provider_support() -> None:
+    answer = {
+        "basis": "EVIDENCE",
+        "answer": "Diversification can reduce risk.",
+        "sentences": [
+            {
+                "text": "Diversification can reduce risk.",
+                "citationIds": ["cit_3"],
+                "evidenceSpans": [
+                    {"citationId": "cit_3", "quote": "Diversification can reduce risk."}
+                ],
+                "numericSpans": [],
+            }
+        ],
+        "warnings": [],
+    }
+    roots: list[dict[str, object]] = [
+        {
+            "result_id": "google_1",
+            "title": "Investor.gov",
+            "uri": "https://www.investor.gov/diversification",
+            "domain": "investor.gov",
+            "chunk_index": 0,
+            "citation_id": "",
+        }
+    ]
+    supports: list[dict[str, object]] = [
+        {
+            "start_index": 0,
+            "end_index": 32,
+            "text": "Diversification can reduce risk.",
+            "chunk_indices": (0,),
+        }
+    ]
+
+    normalized = json.loads(
+        _normalize_grounded_answer(
+            json.dumps(answer),
+            roots,
+            supports,
+            allowed_local_ids=set(),
+        )
+    )
+
+    assert normalized["sentences"][0]["citationIds"] == ["cit_1"]
+    assert normalized["sentences"][0]["evidenceSpans"] == [
+        {"citationId": "cit_1", "quote": "Diversification can reduce risk."}
+    ]
+
+
+def test_owner_final_accepts_exact_intermediate_support_quote_without_copying_it_into_sentence() -> (
+    None
+):
+    answer = {
+        "basis": "EVIDENCE",
+        "answer": "분산투자는 자산 움직임의 차이를 이용해 전체 위험을 낮출 수 있습니다.",
+        "sentences": [
+            {
+                "text": "분산투자는 자산 움직임의 차이를 이용해 전체 위험을 낮출 수 있습니다.",
+                "citationIds": ["cit_2"],
+                "evidenceSpans": [
+                    {"citationId": "cit_2", "quote": "Diversification can reduce risk."}
+                ],
+                "numericSpans": [],
+            }
+        ],
+        "warnings": [],
+    }
+    roots: list[dict[str, object]] = [
+        {
+            "result_id": "google_1",
+            "title": "Investor.gov",
+            "uri": "https://www.investor.gov/diversification",
+            "domain": "investor.gov",
+            "chunk_index": 0,
+            "citation_id": "cit_2",
+        }
+    ]
+    supports: list[dict[str, object]] = [
+        {
+            "start_index": 0,
+            "end_index": 32,
+            "text": "Diversification can reduce risk.",
+            "chunk_indices": (0,),
+        }
+    ]
+
+    normalized = json.loads(
+        _normalize_grounded_answer(json.dumps(answer, ensure_ascii=False), roots, supports)
+    )
+
+    assert normalized["basis"] == "EVIDENCE"
+    assert normalized["warnings"] == ["GOOGLE_GROUNDING_ONLY"]
+    assert normalized["sentences"][0]["citationIds"] == ["cit_2"]
+
+
+def _request(*, google: bool, owner: bool = False) -> RunRequest:
+    public = Evidence(1, "cit_1", "rag_v2_chk_" + "a" * 32, "public evidence", "a" * 64)
+    private = Evidence(2, "cit_2", "rag_v2_chk_" + "b" * 32, "private evidence", "b" * 64, True)
+    return RunRequest(
+        run_id="s49_run_" + "1" * 32,
+        model_id="gemini-3.5-flash",
+        question="분산투자를 설명해 주세요.",
+        answer_mode="DETAILED",
+        related_symbols=(),
+        topics=("RISK",),
+        public_evidence=(public,),
+        owner_evidence=(private,) if owner else (),
+        google_search_enabled=google,
+        max_tool_rounds=3,
+        current_time="2026-08-15T00:00:00Z",
+        timezone="Asia/Seoul",
+    )
+
+
+def _result(queries: list[str]) -> ProviderResult:
+    return cast(
+        ProviderResult,
+        {
+            "message": AIMessage(content=_answer()),
+            "answer_json": _answer(),
+            "prompt_tokens": 10,
+            "output_tokens": 5,
+            "google_queries": queries,
+            "grounding_roots": [],
+            "grounding_supports": [],
+        },
+    )
+
+
+def test_broken_structured_output_falls_back_to_plaintext_explanation() -> None:
+    """구조화 출력이 깨져도 모델이 쓴 설명은 살린다.
+
+    이 경로가 없던 동안 화면은 GENERATION_UNAVAILABLE만 보여 줬다. 사용자가 읽을 문장이
+    실제로 존재했는데도 그랬다. 폴백은 최후 안전망이며, 근거를 지어내지 않고 인용 없는
+    설명으로만 되살린다.
+    """
+
+    message = AIMessage(
+        content="롤오버는 만기가 다가온 선물을 다음 월물로 교체하는 것이다. "
+        "이 과정에서 월물 간 가격 차이만큼 비용이나 수익이 생긴다."
+    )
+
+    result = _provider_result(message, allowed_local_ids=set())
+
+    payload = json.loads(result["answer_json"])
+    assert payload["basis"] == "MODEL_KNOWLEDGE"
+    assert payload["sentences"]
+    assert payload["answer"] == "\n".join(item["text"] for item in payload["sentences"])
+    assert all(not item["citationIds"] for item in payload["sentences"])
+    assert all(not item["evidenceSpans"] for item in payload["sentences"])
+    assert "롤오버" in payload["answer"]
+
+
+def test_plaintext_fallback_refuses_empty_body_and_judge_mode() -> None:
+    """되살릴 본문이 없거나 판단 모드면 폴백하지 않는다. 점수를 지어내지 않는다."""
+
+    with pytest.raises(ValueError, match="STRONG_LLM_PROVIDER_TEXT_MISSING"):
+        _plaintext_answer_json("   ", mode="EXPLAIN")
+    with pytest.raises(ValueError, match="STRONG_LLM_PROVIDER_JUDGE_PLAINTEXT_FORBIDDEN"):
+        _plaintext_answer_json("무언가 판단", mode="JUDGE")
+
+
+def test_model_selectable_bases_no_longer_offer_an_empty_answer() -> None:
+    """스키마가 빈 답을 고를 여지를 남기지 않는다."""
+
+    schema = _vertex_response_schema("EXPLAIN")
+    bases = schema["properties"]["basis"]["enum"]  # type: ignore[index]
+
+    assert "INSUFFICIENT_EVIDENCE" not in bases
+    assert set(bases) == {"EVIDENCE", "EVIDENCE_WITH_REASONING", "MODEL_KNOWLEDGE"}

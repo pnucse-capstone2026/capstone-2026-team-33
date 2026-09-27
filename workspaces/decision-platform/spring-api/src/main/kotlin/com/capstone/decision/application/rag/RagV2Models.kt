@@ -1,0 +1,127 @@
+package com.capstone.decision.application.rag
+
+import tools.jackson.databind.JsonNode
+import java.time.Instant
+
+data class RagV2CorpusStatus(
+    val state: String,
+    val publicCorpusVersion: String,
+    val privateOverlayState: String,
+    val progressPercent: Int,
+    val failureCode: String?,
+    /** Retired quota fields remain null for wire compatibility; they are not enforced. */
+    val generationDailyCap: Int? = null,
+    /** Best-effort count of today's generation reservations; it never decides whether generation may run. */
+    val generationUsedToday: Int? = null,
+    val generationRemaining: Int? = null,
+    /**
+     * 소유자가 고른 Strong LLM 설정. 쓰기는 `PUT /api/v2/strong-llm/settings`가 하고 읽기는
+     * 여기에 실린다. 읽기 endpoint를 따로 두면 root OpenAPI에 operation이 하나 더 늘고, 그
+     * 사슬은 승인된 전이로만 움직인다.
+     *
+     * 키는 마지막 네 글자만 나온다. 그것이 "키가 들어 있다"를 말하는 데 필요한 전부다.
+     */
+    val strongLlmProvider: String? = null,
+    val strongLlmFallbackProvider: String? = null,
+    val strongLlmModelId: String? = null,
+    val strongLlmFallbackModelId: String? = null,
+    val strongLlmBaseUrl: String? = null,
+    val strongLlmFallbackBaseUrl: String? = null,
+    val strongLlmAnswerLanguage: String? = null,
+    val strongLlmDailyGenerateCallCap: Int? = null,
+    val strongLlmKeyLast4: String? = null,
+    val strongLlmFallbackKeyLast4: String? = null,
+)
+
+data class RagV2Answer(
+    val requestId: String,
+    val answerId: String?,
+    val generationStatus: RagGenerationStatus,
+    val answer: String?,
+    val citationCoverage: Double,
+    val citations: List<JsonNode>,
+    val retrievalFailure: Boolean,
+    val guardrailFlags: List<String>,
+)
+
+data class RagV2HistoryMetadata(
+    val answerId: String,
+    val createdAt: Instant,
+    val expiresAt: Instant,
+    val generationStatus: RagGenerationStatus,
+)
+
+data class RagV2HistoryPage(
+    val items: List<RagV2HistoryMetadata>,
+    val nextCursor: String?,
+)
+
+data class RagV2HistoryDetail(
+    val answerId: String,
+    val question: String,
+    // retrieval-only history encrypts an empty internal payload but must not represent it as an LLM answer.
+    val answer: String?,
+    val generationStatus: RagGenerationStatus,
+    val citations: List<JsonNode>,
+    val createdAt: Instant,
+    val expiresAt: Instant,
+)
+
+data class RagV2ExternalConsentCommand(
+    val action: String,
+    val disclosureDigest: String,
+    val policyDigest: String,
+    val processorSetDigest: String,
+)
+
+data class RagV2EffectiveConsent(
+    val contractId: String = "s4-rag-v2-effective-consent-v1",
+    val schemaVersion: Int = 1,
+    val consentEventId: String,
+    val effective: Boolean,
+    val policyDigest: String,
+    val processorSetDigest: String,
+    val state: String,
+)
+
+data class RagV2ImportTicket(
+    val contractId: String = "s4-rag-v2-import-ticket-v2",
+    val schemaVersion: Int = 2,
+    val ticketId: String,
+    val sourceScope: String = "OWNER_PRIVATE",
+    val embeddingProfileId: String,
+    val issuedAt: Instant,
+    val expiresAt: Instant,
+    val ttlSeconds: Int = 300,
+    val singleUse: Boolean = true,
+    val ownerBound: Boolean = true,
+    val ownerRawCopyAllowed: Boolean = false,
+)
+
+/**
+ * owner document hard-delete capability는 short-lived opaque ticket으로만 local control plane에 전달한다.
+ * owner identity는 응답에 포함하지 않으며, document binding과 consumption은 DB security-definer boundary가 강제한다.
+ */
+data class RagV2DeleteTicket(
+    val contractId: String = "s4-rag-v2-delete-ticket-v1",
+    val schemaVersion: Int = 1,
+    val ticketId: String,
+    val sourceScope: String = "OWNER_PRIVATE",
+    val documentId: String,
+    val issuedAt: Instant,
+    val expiresAt: Instant,
+    val ttlSeconds: Int = 300,
+    val singleUse: Boolean = true,
+    val ownerBound: Boolean = true,
+    val documentBound: Boolean = true,
+    val ownerRawCopyAllowed: Boolean = false,
+)
+
+class RagV2CorpusNotReadyException : RuntimeException("RAG v2 full corpus bundle is not ready.")
+
+class RagV2ExternalConsentRequiredException : RuntimeException("External AI RAG v2 consent is required.")
+
+/** MCP에는 질문·본문 없이 이미 검증된 retrieval failure code만 노출한다. */
+class RagV2McpSearchUnavailableException(
+    failureCode: String,
+) : RuntimeException("S4_9_MCP_RAG_SEARCH_$failureCode")

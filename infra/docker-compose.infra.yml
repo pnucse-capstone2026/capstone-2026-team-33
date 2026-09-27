@@ -1,0 +1,197 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-trading}
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?POSTGRES_ADMIN_PASSWORD is required}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD is required}
+      POSTGRES_MIGRATION_PASSWORD: ${POSTGRES_MIGRATION_PASSWORD:?POSTGRES_MIGRATION_PASSWORD is required}
+      POSTGRES_COLLECTOR_PASSWORD: ${POSTGRES_COLLECTOR_PASSWORD:?POSTGRES_COLLECTOR_PASSWORD is required}
+      POSTGRES_DISCLOSURE_READER_PASSWORD: ${POSTGRES_DISCLOSURE_READER_PASSWORD:?POSTGRES_DISCLOSURE_READER_PASSWORD is required}
+      POSTGRES_MARKET_WRITER_PASSWORD: ${POSTGRES_MARKET_WRITER_PASSWORD:?POSTGRES_MARKET_WRITER_PASSWORD is required}
+      POSTGRES_PORTFOLIO_WRITER_PASSWORD: ${POSTGRES_PORTFOLIO_WRITER_PASSWORD:?POSTGRES_PORTFOLIO_WRITER_PASSWORD is required}
+      POSTGRES_RISK_WRITER_PASSWORD: ${POSTGRES_RISK_WRITER_PASSWORD:?POSTGRES_RISK_WRITER_PASSWORD is required}
+      POSTGRES_FILL_WRITER_PASSWORD: ${POSTGRES_FILL_WRITER_PASSWORD:?POSTGRES_FILL_WRITER_PASSWORD is required}
+      POSTGRES_RAG_WRITER_PASSWORD: ${POSTGRES_RAG_WRITER_PASSWORD:?POSTGRES_RAG_WRITER_PASSWORD is required}
+      POSTGRES_RAG_ADMIN_PASSWORD: ${POSTGRES_RAG_ADMIN_PASSWORD:?POSTGRES_RAG_ADMIN_PASSWORD is required}
+      POSTGRES_RAG_QUERY_PASSWORD: ${POSTGRES_RAG_QUERY_PASSWORD:?POSTGRES_RAG_QUERY_PASSWORD is required}
+      POSTGRES_SIGNAL_WRITER_PASSWORD: ${POSTGRES_SIGNAL_WRITER_PASSWORD:?POSTGRES_SIGNAL_WRITER_PASSWORD is required}
+      POSTGRES_SIGNAL_SCHEDULER_PASSWORD: ${POSTGRES_SIGNAL_SCHEDULER_PASSWORD:?POSTGRES_SIGNAL_SCHEDULER_PASSWORD is required}
+      POSTGRES_SIGNAL_ADMIN_PASSWORD: ${POSTGRES_SIGNAL_ADMIN_PASSWORD:?POSTGRES_SIGNAL_ADMIN_PASSWORD is required}
+      POSTGRES_WORKER_PASSWORD: ${POSTGRES_WORKER_PASSWORD:?POSTGRES_WORKER_PASSWORD is required}
+      POSTGRES_AUTOMATION_RUNTIME_PASSWORD: ${POSTGRES_AUTOMATION_RUNTIME_PASSWORD:?POSTGRES_AUTOMATION_RUNTIME_PASSWORD is required}
+      POSTGRES_OUTBOX_PUBLISHER_PASSWORD: ${POSTGRES_OUTBOX_PUBLISHER_PASSWORD:?POSTGRES_OUTBOX_PUBLISHER_PASSWORD is required}
+      POSTGRES_POISON_RECORDER_PASSWORD: ${POSTGRES_POISON_RECORDER_PASSWORD:?POSTGRES_POISON_RECORDER_PASSWORD is required}
+      POSTGRES_REPLAY_PASSWORD: ${POSTGRES_REPLAY_PASSWORD:?POSTGRES_REPLAY_PASSWORD is required}
+      POSTGRES_IDENTITY_PASSWORD: ${POSTGRES_IDENTITY_PASSWORD:?POSTGRES_IDENTITY_PASSWORD is required}
+      POSTGRES_AUTH_PASSWORD: ${POSTGRES_AUTH_PASSWORD:?POSTGRES_AUTH_PASSWORD is required}
+      POSTGRES_REPLAY_AUTHORIZER_PASSWORD: ${POSTGRES_REPLAY_AUTHORIZER_PASSWORD:?POSTGRES_REPLAY_AUTHORIZER_PASSWORD is required}
+      POSTGRES_DEMO_PASSWORD: ${POSTGRES_DEMO_PASSWORD:?POSTGRES_DEMO_PASSWORD is required}
+    ports: ["127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init/01-extensions.sql:/docker-entrypoint-initdb.d/01-extensions.sql:ro
+      - ./init/02-application-roles.sh:/docker-entrypoint-initdb.d/02-application-roles.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      retries: 10
+
+  role-bootstrap:
+    image: pgvector/pgvector:pg16@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-trading}
+      POSTGRES_USER: ${POSTGRES_ADMIN_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:?POSTGRES_ADMIN_PASSWORD is required}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?POSTGRES_APP_PASSWORD is required}
+      POSTGRES_MIGRATION_PASSWORD: ${POSTGRES_MIGRATION_PASSWORD:?POSTGRES_MIGRATION_PASSWORD is required}
+      POSTGRES_COLLECTOR_PASSWORD: ${POSTGRES_COLLECTOR_PASSWORD:?POSTGRES_COLLECTOR_PASSWORD is required}
+      POSTGRES_DISCLOSURE_READER_PASSWORD: ${POSTGRES_DISCLOSURE_READER_PASSWORD:?POSTGRES_DISCLOSURE_READER_PASSWORD is required}
+      POSTGRES_MARKET_WRITER_PASSWORD: ${POSTGRES_MARKET_WRITER_PASSWORD:?POSTGRES_MARKET_WRITER_PASSWORD is required}
+      POSTGRES_PORTFOLIO_WRITER_PASSWORD: ${POSTGRES_PORTFOLIO_WRITER_PASSWORD:?POSTGRES_PORTFOLIO_WRITER_PASSWORD is required}
+      POSTGRES_RISK_WRITER_PASSWORD: ${POSTGRES_RISK_WRITER_PASSWORD:?POSTGRES_RISK_WRITER_PASSWORD is required}
+      POSTGRES_FILL_WRITER_PASSWORD: ${POSTGRES_FILL_WRITER_PASSWORD:?POSTGRES_FILL_WRITER_PASSWORD is required}
+      POSTGRES_RAG_WRITER_PASSWORD: ${POSTGRES_RAG_WRITER_PASSWORD:?POSTGRES_RAG_WRITER_PASSWORD is required}
+      POSTGRES_RAG_ADMIN_PASSWORD: ${POSTGRES_RAG_ADMIN_PASSWORD:?POSTGRES_RAG_ADMIN_PASSWORD is required}
+      POSTGRES_RAG_QUERY_PASSWORD: ${POSTGRES_RAG_QUERY_PASSWORD:?POSTGRES_RAG_QUERY_PASSWORD is required}
+      POSTGRES_SIGNAL_WRITER_PASSWORD: ${POSTGRES_SIGNAL_WRITER_PASSWORD:?POSTGRES_SIGNAL_WRITER_PASSWORD is required}
+      POSTGRES_SIGNAL_SCHEDULER_PASSWORD: ${POSTGRES_SIGNAL_SCHEDULER_PASSWORD:?POSTGRES_SIGNAL_SCHEDULER_PASSWORD is required}
+      POSTGRES_SIGNAL_ADMIN_PASSWORD: ${POSTGRES_SIGNAL_ADMIN_PASSWORD:?POSTGRES_SIGNAL_ADMIN_PASSWORD is required}
+      POSTGRES_WORKER_PASSWORD: ${POSTGRES_WORKER_PASSWORD:?POSTGRES_WORKER_PASSWORD is required}
+      POSTGRES_AUTOMATION_RUNTIME_PASSWORD: ${POSTGRES_AUTOMATION_RUNTIME_PASSWORD:?POSTGRES_AUTOMATION_RUNTIME_PASSWORD is required}
+      POSTGRES_OUTBOX_PUBLISHER_PASSWORD: ${POSTGRES_OUTBOX_PUBLISHER_PASSWORD:?POSTGRES_OUTBOX_PUBLISHER_PASSWORD is required}
+      POSTGRES_POISON_RECORDER_PASSWORD: ${POSTGRES_POISON_RECORDER_PASSWORD:?POSTGRES_POISON_RECORDER_PASSWORD is required}
+      POSTGRES_REPLAY_PASSWORD: ${POSTGRES_REPLAY_PASSWORD:?POSTGRES_REPLAY_PASSWORD is required}
+      POSTGRES_IDENTITY_PASSWORD: ${POSTGRES_IDENTITY_PASSWORD:?POSTGRES_IDENTITY_PASSWORD is required}
+      POSTGRES_AUTH_PASSWORD: ${POSTGRES_AUTH_PASSWORD:?POSTGRES_AUTH_PASSWORD is required}
+      POSTGRES_REPLAY_AUTHORIZER_PASSWORD: ${POSTGRES_REPLAY_AUTHORIZER_PASSWORD:?POSTGRES_REPLAY_AUTHORIZER_PASSWORD is required}
+      POSTGRES_DEMO_PASSWORD: ${POSTGRES_DEMO_PASSWORD:?POSTGRES_DEMO_PASSWORD is required}
+    volumes:
+      - ./init/02-application-roles.sh:/opt/capstone/02-application-roles.sh:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["bash", "/opt/capstone/02-application-roles.sh"]
+    restart: "no"
+
+  redis:
+    image: redis:7.2-alpine@sha256:dfa18828cbc07b3ae6a95ec7343f6c214fdee2d836197b4be8e9904420762cd8
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    command: ["sh", "/usr/local/bin/redis-secure-entrypoint.sh"]
+    ports: ["127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"]
+    volumes:
+      - redisdata:/data
+      - ./redis-secure-entrypoint.sh:/usr/local/bin/redis-secure-entrypoint.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$${REDIS_PASSWORD}\" redis-cli ping | grep -qx PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  searxng:
+    image: ghcr.io/searxng/searxng:2026.7.28-c01178d03@sha256:80622959f0f3512e6623d6bdbcea9f13c8d22c8d9715c498d0ae2be1c8535930
+    profiles: ["s4-9-web"]
+    environment:
+      SEARXNG_BASE_URL: http://searxng:8080/
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?SEARXNG_SECRET is required}
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    expose: ["8080"]
+    ports: ["127.0.0.1:${SEARXNG_HOST_PORT:-58080}:8080"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  mcp-searxng:
+    image: isokoliuk/mcp-searxng:1.15.0@sha256:a1479fd040f54d977df0d2426924723a4f58742bcf1a037e7e098ff22d0b25dc
+    profiles: ["s4-9-web"]
+    depends_on:
+      searxng:
+        condition: service_healthy
+    environment:
+      SEARXNG_URL: http://searxng:8080
+      SEARXNG_MAX_RESULTS: "10"
+      SEARXNG_DEFAULT_RESPONSE_FORMAT: json
+      SEARXNG_LITE_TOOLS: "true"
+      MCP_HTTP_HOST: 0.0.0.0
+      MCP_HTTP_PORT: "3000"
+      MCP_HTTP_STATELESS: "true"
+      MCP_HTTP_HARDEN: "true"
+      MCP_HTTP_AUTH_TOKEN: ${MCP_SEARXNG_AUTH_TOKEN:?MCP_SEARXNG_AUTH_TOKEN is required}
+      MCP_HTTP_ALLOWED_ORIGINS: http://spring-api:8080,http://127.0.0.1:8080
+      MCP_HTTP_ALLOWED_HOSTS: mcp-searxng,mcp-searxng:3000,127.0.0.1,127.0.0.1:3000
+    expose: ["3000"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    healthcheck:
+      test: ["CMD-SHELL", "wget --header=\"Authorization: Bearer $${MCP_HTTP_AUTH_TOKEN}\" -qO- http://127.0.0.1:3000/health >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  kafka:
+    image: apache/kafka:3.7.0@sha256:41c20d65b0a2180b9deca056d47540771752e69fe9225d5748dd65a25a9675d7
+    profiles: ["kafka"]
+    ports: ["127.0.0.1:${KAFKA_HOST_PORT:-9092}:9092"]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: INTERNAL://:29092,EXTERNAL://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://127.0.0.1:${KAFKA_HOST_PORT:-9092}
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    expose: ["29092"]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server 127.0.0.1:29092 >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  kafka-topic-init:
+    image: apache/kafka:3.7.0@sha256:41c20d65b0a2180b9deca056d47540771752e69fe9225d5748dd65a25a9675d7
+    profiles: ["kafka"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/bash", "/opt/capstone/create-topics.sh"]
+    environment:
+      KAFKA_BOOTSTRAP_SERVER: kafka:29092
+    volumes:
+      - ./kafka/create-topics.sh:/opt/capstone/create-topics.sh:ro
+    restart: "no"
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2@sha256:8f2ff02d64b0a7a2b71b6b3b3148b85f66d00ec20ad40c30bdcd415d46d31818
+    profiles: ["kafka-ui"]
+    depends_on:
+      kafka-topic-init:
+        condition: service_completed_successfully
+    ports: ["127.0.0.1:${KAFKA_UI_HOST_PORT:-8081}:8080"]
+    environment:
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      AUTH_TYPE: LOGIN_FORM
+      SPRING_SECURITY_USER_NAME: ${KAFKA_UI_USERNAME:?KAFKA_UI_USERNAME is required}
+      SPRING_SECURITY_USER_PASSWORD: ${KAFKA_UI_PASSWORD:?KAFKA_UI_PASSWORD is required}
+
+volumes:
+  pgdata: {}
+  redisdata: {}

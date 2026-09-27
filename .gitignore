@@ -1,0 +1,147 @@
+# --- Secrets ---
+.env
+.env.local
+.env.*
+*.env
+!/.env.example
+http-client.private.env.json
+.direnv/
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# --- Generated/raw market data (never commit) ---
+/data/
+/data/kis/**
+workspaces/decision-platform/python-services/data/
+workspaces/decision-platform/python-services/app/data/kis/raw/
+workspaces/decision-platform/python-services/app/data/kis/parquet/
+workspaces/decision-platform/python-services/app/data/kis/output/
+workspaces/decision-platform/python-services/app/data/kis/.cache/
+workspaces/decision-platform/python-services/app/data/opendart/raw/
+workspaces/decision-platform/python-services/app/data/opendart/output/
+workspaces/decision-platform/python-services/app/data/opendart/.cache/
+workspaces/decision-platform/python-services/app/data/kis/**/*.parquet
+workspaces/decision-platform/python-services/app/data/kis/**/*.jsonl
+workspaces/decision-platform/python-services/app/data/kis/**/*.csv
+workspaces/decision-platform/python-services/app/data/opendart/**/*.jsonl
+workspaces/decision-platform/python-services/app/data/opendart/**/*.csv
+!workspaces/decision-platform/python-services/tests/
+!workspaces/decision-platform/python-services/tests/fixtures/
+!workspaces/decision-platform/python-services/tests/fixtures/**
+
+# fixture 허용 규칙 뒤에서도 credential 파일은 다시 추적 대상이 될 수 없다.
+.env
+.env.*
+*.env
+http-client.private.env.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+!/.env.example
+
+# --- Gradle / Kotlin / Java (workspaces/decision-platform/spring-api) ---
+.gradle/
+.kotlin/
+**/build/
+out/
+*.class
+*.jar
+!**/gradle/wrapper/gradle-wrapper.jar
+
+# --- Python (workspaces/decision-platform/python-services) ---
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# --- S1.4X isolated numeric parity research (generated/local only) ---
+workspaces/decision-platform/research/s1-4x-numeric-parity/contract/fixtures/large/generated/
+workspaces/decision-platform/research/s1-4x-numeric-parity/**/.scala-build/
+workspaces/decision-platform/research/s1-4x-numeric-parity/**/.bsp/
+workspaces/decision-platform/research/s1-4x-numeric-parity/**/.stack-work/
+workspaces/decision-platform/research/s1-4x-numeric-parity/haskell/.stack-root/
+workspaces/decision-platform/research/s1-4x-numeric-parity/**/.tool-bin/
+workspaces/decision-platform/research/s1-4x-numeric-parity/**/artifacts/
+
+# --- Node / full-app workspace generated outputs ---
+node_modules/
+.next/
+dist/
+
+# --- full-app v2 upstream intake는 local-only, 검토된 production source만 추적 ---
+workspaces/return-engine/dev/
+workspaces/experience-dashboard/dev/
+workspaces/return-engine/artifacts/
+workspaces/return-engine/cache/
+workspaces/return-engine/output/
+workspaces/return-engine/raw/
+workspaces/return-engine/tmp/
+workspaces/experience-dashboard/artifacts/
+workspaces/experience-dashboard/cache/
+workspaces/experience-dashboard/output/
+workspaces/experience-dashboard/raw/
+workspaces/experience-dashboard/tmp/
+
+# --- artifacts: 계약된 결과물만, 로컬 실행 산출물은 커밋 금지 ---
+artifacts/return-engine/*
+!artifacts/return-engine/.gitkeep
+!artifacts/return-engine/README.md
+artifacts/decision-platform/*
+!artifacts/decision-platform/.gitkeep
+!artifacts/decision-platform/README.md
+# 테스트 판정 증거는 문서와 짝을 이뤄야 의미가 있으므로 세 하위 폴더의 JSON과 provenance
+# 마크다운만 추적한다. `run-001/result.json` 같은 임시 실행 산출물은 계속 무시된다.
+!artifacts/decision-platform/e2e/
+artifacts/decision-platform/e2e/*
+!artifacts/decision-platform/e2e/*.json
+!artifacts/decision-platform/verification/
+artifacts/decision-platform/verification/*
+!artifacts/decision-platform/verification/*.json
+!artifacts/decision-platform/live-rehearsal/
+artifacts/decision-platform/live-rehearsal/*
+!artifacts/decision-platform/live-rehearsal/*.json
+!artifacts/decision-platform/live-rehearsal/*.md
+
+# --- RAG repository-local approved roots ---
+# 정책·manifest·직접 작성한 card/평가 보고서만 추적한다. 원 evidence, secret, runtime
+# 산출물과 Hugging Face 모델 payload는 저장소 안에 두더라도 Git에는 올리지 않는다.
+/capstone-rag/evidence/**
+!/capstone-rag/evidence/README.md
+/capstone-rag/secrets/**
+!/capstone-rag/secrets/README.md
+/capstone-rag/runtime/**
+!/capstone-rag/runtime/README.md
+/capstone-rag/tmp/**
+/huggingface_model/**
+!/huggingface_model/.gitignore
+!/huggingface_model/README.md
+!/huggingface_model/manifests/
+!/huggingface_model/manifests/README.md
+
+# --- IDE ---
+.idea/
+*.iml
+.vscode/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# P1 Trivy generated cache may contain root-owned fanal entries after container scans.
+/.state/p1-trivy-cache/
+
+# P1 Compose credentials and runtime state are always local-only.
+/deploy/p1/.state*/
+
+# 로컬 전용 참고자료. 저장소에 올리지 않는다.
+/private-reference/

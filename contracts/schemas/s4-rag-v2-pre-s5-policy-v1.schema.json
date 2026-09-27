@@ -1,0 +1,533 @@
+{
+  "$id": "contracts/schemas/s4-rag-v2-pre-s5-policy-v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "activeEmbeddingProfile": {
+      "enum": [
+        "NONE",
+        "voyage_context_4_1024_v1",
+        "bge_m3_local_1024_v1"
+      ]
+    },
+    "contractId": {
+      "const": "s4-rag-v2-pre-s5-policy-v1"
+    },
+    "decisionAuthority": {
+      "const": "NONE"
+    },
+    "generationAuthority": {
+      "const": "EXPLANATION_ONLY"
+    },
+    "openAiCallsAllowed": {
+      "const": false
+    },
+    "retrieval": {
+      "additionalProperties": false,
+      "properties": {
+        "channelTopK": {
+          "const": 30
+        },
+        "rrfK": {
+          "const": 60
+        },
+        "topK": {
+          "const": 5
+        }
+      },
+      "required": [
+        "channelTopK",
+        "rrfK",
+        "topK"
+      ],
+      "type": "object"
+    },
+    "runtimeState": {
+      "const": "CONTRACT_ONLY"
+    },
+    "schemaVersion": {
+      "const": 1
+    },
+    "vertex": {
+      "additionalProperties": false,
+      "properties": {
+        "activationEvidenceRequired": {
+          "items": false,
+          "maxItems": 4,
+          "minItems": 4,
+          "prefixItems": [
+            {
+              "const": "SERVICE_ACCOUNT_ENV_SECURITY"
+            },
+            {
+              "const": "DATA_GOVERNANCE_STATE"
+            },
+            {
+              "const": "ABUSE_MONITORING_STATE"
+            },
+            {
+              "const": "MODEL_AVAILABILITY"
+            }
+          ],
+          "type": "array"
+        },
+        "ambientCredentialAllowed": {
+          "const": false
+        },
+        "authentication": {
+          "items": false,
+          "maxItems": 1,
+          "minItems": 1,
+          "prefixItems": [
+            {
+              "const": "SERVICE_ACCOUNT_OAUTH"
+            }
+          ],
+          "type": "array"
+        },
+        "contextCacheAllowed": {
+          "const": false
+        },
+        "credentialEnvKey": {
+          "const": "MARS_VERTEX_SERVICE_ACCOUNT_JSON_B64"
+        },
+        "developerApiAllowed": {
+          "const": false
+        },
+        "fallbackAllowed": {
+          "const": false
+        },
+        "fileUploadAllowed": {
+          "const": false
+        },
+        "generationMethod": {
+          "const": "generateContent"
+        },
+        "generationUnavailableStatus": {
+          "const": "GENERATION_UNAVAILABLE"
+        },
+        "maximumEvidenceCount": {
+          "const": 5
+        },
+        "maximumGenerateContentCallsPerQuestion": {
+          "const": 1
+        },
+        "maximumOAuthTokenCallsPerQuestion": {
+          "const": 1
+        },
+        "modelId": {
+          "const": "gemini-3.5-flash"
+        },
+        "modelIdEnvironmentVariable": {
+          "const": "VERTEX_MODEL_ID"
+        },
+        "modelSelectionPacketBound": {
+          "const": true
+        },
+        "oauthScope": {
+          "const": "https://www.googleapis.com/auth/cloud-platform"
+        },
+        "oauthTokenEndpoint": {
+          "const": "https://oauth2.googleapis.com/token"
+        },
+        "openAiCallsAllowed": {
+          "const": false
+        },
+        "preparedScopeControlPlane": {
+          "additionalProperties": false,
+          "properties": {
+            "headerName": {
+              "const": "X-Rag-V2-Vertex-Scope-Claim"
+            },
+            "packetOwnerIdentityStored": {
+              "const": false
+            },
+            "rawEvidenceStored": {
+              "const": false
+            },
+            "rawQuestionStored": {
+              "const": false
+            },
+            "sameParsedAskCommandFingerprintBound": {
+              "const": true
+            },
+            "sameRequestIdRequired": {
+              "const": true
+            },
+            "scopeTtlSeconds": {
+              "const": 120
+            }
+          },
+          "required": [
+            "headerName",
+            "packetOwnerIdentityStored",
+            "rawEvidenceStored",
+            "rawQuestionStored",
+            "sameParsedAskCommandFingerprintBound",
+            "sameRequestIdRequired",
+            "scopeTtlSeconds"
+          ],
+          "type": "object"
+        },
+        "rawResponseStored": {
+          "const": false
+        },
+        "rerankerAllowed": {
+          "const": false
+        },
+        "retryCount": {
+          "const": 0
+        },
+        "sanitizedUsageLedgerOnly": {
+          "const": true
+        },
+        "searchMapsGroundingAllowed": {
+          "const": false
+        },
+        "serviceAccountOnly": {
+          "const": true
+        },
+        "sessionResumptionAllowed": {
+          "const": false
+        },
+        "toolsFunctionsAllowed": {
+          "const": false
+        },
+        "verifierAllowed": {
+          "const": false
+        }
+      },
+      "required": [
+        "activationEvidenceRequired",
+        "ambientCredentialAllowed",
+        "authentication",
+        "contextCacheAllowed",
+        "credentialEnvKey",
+        "developerApiAllowed",
+        "fallbackAllowed",
+        "fileUploadAllowed",
+        "generationMethod",
+        "generationUnavailableStatus",
+        "maximumEvidenceCount",
+        "maximumGenerateContentCallsPerQuestion",
+        "maximumOAuthTokenCallsPerQuestion",
+        "modelId",
+        "modelIdEnvironmentVariable",
+        "modelSelectionPacketBound",
+        "oauthScope",
+        "oauthTokenEndpoint",
+        "openAiCallsAllowed",
+        "preparedScopeControlPlane",
+        "rawResponseStored",
+        "rerankerAllowed",
+        "retryCount",
+        "sanitizedUsageLedgerOnly",
+        "searchMapsGroundingAllowed",
+        "serviceAccountOnly",
+        "sessionResumptionAllowed",
+        "toolsFunctionsAllowed",
+        "verifierAllowed"
+      ],
+      "type": "object"
+    },
+    "voyage": {
+      "additionalProperties": false,
+      "properties": {
+        "activationEvidenceRequired": {
+          "items": false,
+          "maxItems": 2,
+          "minItems": 2,
+          "prefixItems": [
+            {
+              "const": "ORGANIZATION_TRAINING_OPT_OUT"
+            },
+            {
+              "const": "PAYMENT_METHOD_PRIVACY_EVIDENCE"
+            }
+          ],
+          "type": "array"
+        },
+        "activationMode": {
+          "const": "EXACT_MANIFEST_BOUND_RESUMABLE_BATCH_SET"
+        },
+        "batchApiAllowed": {
+          "const": false
+        },
+        "bgePublicExecution": {
+          "const": "TERMINALLY_SUPERSEDED_NO_FURTHER_BGE_RUN"
+        },
+        "dimension": {
+          "const": 1024
+        },
+        "documentBatchLimits": {
+          "additionalProperties": false,
+          "properties": {
+            "completedBatchReuseRequired": {
+              "const": true
+            },
+            "maximumChunksPerRequest": {
+              "const": 16000
+            },
+            "maximumGroupsPerRequest": {
+              "const": 1000
+            },
+            "maximumPacketTtlSeconds": {
+              "const": 7200
+            },
+            "maximumResponseBytes": {
+              "const": 16777216
+            },
+            "operationalInputTokenCap": {
+              "const": 110000
+            },
+            "operationalMaximumChunksPerRequest": {
+              "const": 672
+            },
+            "packetByteCapCoversEstimateRequired": {
+              "const": true
+            },
+            "providerInputTokenCap": {
+              "const": 120000
+            },
+            "requestPacketPhysicalCallCap": {
+              "const": 1
+            },
+            "responseEnvelopeHeadroomBytes": {
+              "const": 262144
+            },
+            "responseEstimateBytesPerChunk": {
+              "const": 24576
+            },
+            "sourceCheckpointReuseRequired": {
+              "const": true
+            },
+            "stopRemainingBatchesAfterFirstFailure": {
+              "const": true
+            },
+            "tokenHeadroom": {
+              "const": 10000
+            }
+          },
+          "required": [
+            "completedBatchReuseRequired",
+            "maximumChunksPerRequest",
+            "maximumGroupsPerRequest",
+            "maximumPacketTtlSeconds",
+            "maximumResponseBytes",
+            "operationalMaximumChunksPerRequest",
+            "operationalInputTokenCap",
+            "packetByteCapCoversEstimateRequired",
+            "providerInputTokenCap",
+            "requestPacketPhysicalCallCap",
+            "responseEnvelopeHeadroomBytes",
+            "responseEstimateBytesPerChunk",
+            "sourceCheckpointReuseRequired",
+            "stopRemainingBatchesAfterFirstFailure",
+            "tokenHeadroom"
+          ],
+          "type": "object"
+        },
+        "filesApiAllowed": {
+          "const": false
+        },
+        "fullBundleScope": {
+          "items": false,
+          "maxItems": 3,
+          "minItems": 3,
+          "prefixItems": [
+            {
+              "const": "EXACT30"
+            },
+            {
+              "const": "OA112"
+            },
+            {
+              "const": "OWNER_PRIVATE"
+            }
+          ],
+          "type": "array"
+        },
+        "generationFallback": {
+          "const": "NO_BGE_FALLBACK_RESUME_VOYAGE_BATCHES_EVALUATE_CAS"
+        },
+        "modelId": {
+          "const": "voyage-context-4"
+        },
+        "officialTokenizer": {
+          "additionalProperties": false,
+          "properties": {
+            "artifactAutoDownloadAllowed": {
+              "const": false
+            },
+            "batchAuthoringRequiresInstalledArtifact": {
+              "const": true
+            },
+            "bootstrapAcquisitionApprovalRequired": {
+              "const": true
+            },
+            "bootstrapEndpoint": {
+              "const": "/voyageai/voyage-context-4/raw/8ca946072a18e398cd61f2ad0243b56d0350b1db/tokenizer.json"
+            },
+            "bootstrapMaximumPacketTtlSeconds": {
+              "const": 300
+            },
+            "bootstrapPhysicalCallCap": {
+              "const": 1
+            },
+            "bootstrapRevision": {
+              "const": "8ca946072a18e398cd61f2ad0243b56d0350b1db"
+            },
+            "localArtifactOnly": {
+              "const": true
+            },
+            "packetHashBindingRequired": {
+              "const": true
+            },
+            "preflightExpectedInputTokenLedgerRequired": {
+              "const": true
+            },
+            "providerTokenCountCallAllowed": {
+              "const": false
+            },
+            "utf8ByteApproximationAllowed": {
+              "const": false
+            }
+          },
+          "required": [
+            "artifactAutoDownloadAllowed",
+            "batchAuthoringRequiresInstalledArtifact",
+            "bootstrapAcquisitionApprovalRequired",
+            "bootstrapEndpoint",
+            "bootstrapMaximumPacketTtlSeconds",
+            "bootstrapPhysicalCallCap",
+            "bootstrapRevision",
+            "localArtifactOnly",
+            "packetHashBindingRequired",
+            "preflightExpectedInputTokenLedgerRequired",
+            "providerTokenCountCallAllowed",
+            "utf8ByteApproximationAllowed"
+          ],
+          "type": "object"
+        },
+        "orderedPrechunkedDocumentGroupsRequired": {
+          "const": true
+        },
+        "outboundCallsAllowed": {
+          "const": false
+        },
+        "ownerPrivateSentinel": {
+          "additionalProperties": false,
+          "properties": {
+            "allowed": {
+              "const": true
+            },
+            "orderedGroupCount": {
+              "const": 0
+            },
+            "ownerScopeSha256": {
+              "const": null
+            },
+            "publicBaseOnly": {
+              "const": true
+            },
+            "sourceScope": {
+              "const": "OWNER_PRIVATE"
+            }
+          },
+          "required": [
+            "allowed",
+            "orderedGroupCount",
+            "ownerScopeSha256",
+            "publicBaseOnly",
+            "sourceScope"
+          ],
+          "type": "object"
+        },
+        "partialProfileMixAllowed": {
+          "const": false
+        },
+        "queryEvaluationBatches": {
+          "additionalProperties": false,
+          "properties": {
+            "completedBatchReuseRequired": {
+              "const": true
+            },
+            "componentBatchCount": {
+              "const": 2
+            },
+            "durableVectorStageRequired": {
+              "const": true
+            },
+            "exact30LogicalQueryCount": {
+              "const": 10
+            },
+            "maximumPacketTtlSeconds": {
+              "const": 7200
+            },
+            "oa112LogicalQueryCount": {
+              "const": 112
+            },
+            "singletonQueryGroupsRequired": {
+              "const": true
+            }
+          },
+          "required": [
+            "componentBatchCount",
+            "completedBatchReuseRequired",
+            "durableVectorStageRequired",
+            "exact30LogicalQueryCount",
+            "maximumPacketTtlSeconds",
+            "oa112LogicalQueryCount",
+            "singletonQueryGroupsRequired"
+          ],
+          "type": "object"
+        },
+        "queryUnitFallbackAllowed": {
+          "const": false
+        },
+        "retryCount": {
+          "const": 0
+        },
+        "runtimeEnvironmentVariable": {
+          "const": "VOYAGE_API_KEY"
+        }
+      },
+      "required": [
+        "activationMode",
+        "activationEvidenceRequired",
+        "batchApiAllowed",
+        "bgePublicExecution",
+        "dimension",
+        "documentBatchLimits",
+        "filesApiAllowed",
+        "fullBundleScope",
+        "generationFallback",
+        "modelId",
+        "officialTokenizer",
+        "ownerPrivateSentinel",
+        "outboundCallsAllowed",
+        "orderedPrechunkedDocumentGroupsRequired",
+        "partialProfileMixAllowed",
+        "queryEvaluationBatches",
+        "queryUnitFallbackAllowed",
+        "retryCount",
+        "runtimeEnvironmentVariable"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "contractId",
+    "activeEmbeddingProfile",
+    "decisionAuthority",
+    "generationAuthority",
+    "openAiCallsAllowed",
+    "retrieval",
+    "runtimeState",
+    "schemaVersion",
+    "vertex",
+    "voyage"
+  ],
+  "title": "s4-rag-v2-pre-s5-policy-v1",
+  "type": "object"
+}

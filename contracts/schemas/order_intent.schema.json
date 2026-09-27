@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "contracts/schemas/order_intent.schema.json",
+  "title": "Order Intent",
+  "description": "Order candidate payload evaluated by Decision API before any mock or live order submission.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["symbol", "side", "orderType", "quantity", "estimatedPrice", "estimatedAmount", "timeframe", "strategyId"],
+  "properties": {
+    "symbol": {
+      "type": "string",
+      "pattern": "^[0-9A-Z._:-]{1,20}$"
+    },
+    "side": {
+      "type": "string",
+      "enum": ["BUY", "SELL"]
+    },
+    "orderType": {
+      "type": "string",
+      "enum": ["MARKET", "LIMIT"],
+      "description": "P0 결정: API 5.1 예시는 MARKET이며 LIMIT 주문 후보도 같은 estimatedPrice 계약을 사용한다."
+    },
+    "quantity": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854775807
+    },
+    "estimatedPrice": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854775807,
+      "description": "현물 v1 MARKET/LIMIT 주문 평가 payload의 유일한 canonical 원화 가격 필드다."
+    },
+    "estimatedAmount": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9223372036854775807,
+      "description": "quantity * estimatedPrice의 overflow 없는 exact 원화 정수 결과여야 한다."
+    },
+    "timeframe": {
+      "type": "string",
+      "enum": ["1d", "60m"]
+    },
+    "strategyId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 120
+    }
+  }
+}

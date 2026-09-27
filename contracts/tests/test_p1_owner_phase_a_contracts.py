@@ -1,0 +1,333 @@
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import unittest
+
+from jsonschema import Draft202012Validator, FormatChecker
+
+from contracts.generate_p1_owner_phase_a_contracts import (
+    ARTIFACT_NAMES,
+    ARTIFACT_SCHEMA_IDS,
+    CURRENT_ARTIFACT_SCHEMA_IDS,
+    FEATURE_ORDER,
+    FROZEN_SHA256,
+    RELEASE_V3_HARD_GATES,
+    ROOT,
+    SCHEMA_IDS,
+    SCHEMA_PATHS,
+    _fixtures,
+    _release_manifest_schema_v3,
+    build_outputs,
+    build_schemas,
+    generate,
+    validate_semantics,
+)
+from contracts.generate_principle_contracts import ContractValidationError
+
+
+class P1OwnerPhaseAContractTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.schemas = build_schemas()
+        cls.fixtures = _fixtures()
+
+    def test_generator_is_deterministic_complete_and_checked_in(self) -> None:
+        first = build_outputs()
+        second = build_outputs()
+        self.assertEqual(first, second)
+        self.assertEqual(tuple(self.schemas), SCHEMA_IDS)
+        generate(check=True)
+
+    def test_all_positive_and_unknown_field_negative_fixtures_are_closed(self) -> None:
+        for schema_id in SCHEMA_IDS:
+            with self.subTest(schema_id=schema_id):
+                validator = Draft202012Validator(
+                    self.schemas[schema_id], format_checker=FormatChecker()
+                )
+                self.assertEqual(
+                    [], list(validator.iter_errors(self.fixtures[schema_id]))
+                )
+                invalid = copy.deepcopy(self.fixtures[schema_id])
+                invalid["unexpected"] = True
+                self.assertNotEqual([], list(validator.iter_errors(invalid)))
+
+    def test_universe_catalog_locks_exact31_and_yfinance_tickers(self) -> None:
+        """봉인 input pack 계약을 지우면서 exact-31 잠금을 유니버스 카탈로그로 옮겼다.
+
+        수집이 yfinance 런타임으로 바뀌어 입력을 사전 봉인하지 않으므로, 계약으로 남길 것은
+        "무엇을 수집하는가"(종목 집합)뿐이다. 티커 접미사도 함께 고정해 KOSDAQ(.KQ) 분기가
+        조용히 끼어들지 않게 한다.
+        """
+        payload = json.loads(
+            (ROOT / "contracts/catalogs/p1-return-universe.v1.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        symbols = payload["symbols"]
+        self.assertEqual("p1-return-universe.v1", payload["contractId"])
+        self.assertEqual(31, payload["symbolCount"])
+        self.assertEqual(31, len(symbols))
+        self.assertEqual(31, len({item["symbol"] for item in symbols}))
+        self.assertEqual(
+            1, sum(1 for item in symbols if item["symbol"] == "132030")
+        )
+        self.assertEqual(
+            1, sum(1 for item in symbols if item["isFixedMember"])
+        )
+        self.assertEqual(list(range(1, 32)), [item["rank"] for item in symbols])
+        for item in symbols:
+            with self.subTest(symbol=item["symbol"]):
+                self.assertRegex(item["symbol"], r"^[0-9]{6}$")
+                self.assertEqual("KOSPI", item["market"])
+                self.assertEqual(f"{item['symbol']}.KS", item["yfinanceTicker"])
+
+    def test_manifest_binds_exact_ten_ordered_files_and_synthetic_truth(self) -> None:
+        payload = self.fixtures["p1-return-engine-artifact-manifest.v2"]
+        self.assertEqual(
+            list(ARTIFACT_NAMES), [item["path"] for item in payload["artifacts"]]
+        )
+        self.assertEqual(
+            [SCHEMA_PATHS[item] for item in ARTIFACT_SCHEMA_IDS],
+            [item["semanticSchema"] for item in payload["artifacts"]],
+        )
+        self.assertFalse(payload["performanceClaimAllowed"])
+        self.assertEqual("NONE", payload["orderAuthority"])
+
+        synthetic = copy.deepcopy(payload)
+        synthetic["evidenceMode"] = "SYNTHETIC_GOLDEN"
+        synthetic["realTeamB"] = True
+        synthetic["modelQuality"] = "NOT_EVALUATED_SYNTHETIC"
+        with self.assertRaises(ContractValidationError):
+            validate_semantics("p1-return-engine-artifact-manifest.v2", synthetic)
+
+        current = self.fixtures["p1-return-engine-artifact-manifest.v3"]
+        self.assertEqual(
+            [SCHEMA_PATHS[item] for item in CURRENT_ARTIFACT_SCHEMA_IDS],
+            [item["semanticSchema"] for item in current["artifacts"]],
+        )
+        for schema_id in CURRENT_ARTIFACT_SCHEMA_IDS[3:5]:
+            self.assertNotIn("confidence", self.fixtures[schema_id]["semantic"]["rowSchema"])
+
+    def test_vertex_veto_is_a_closed_union_without_order_fields(self) -> None:
+        schema = self.schemas["vertex-news-veto.v1"]
+        validator = Draft202012Validator(schema, format_checker=FormatChecker())
+        available = self.fixtures["vertex-news-veto.v1"]
+        self.assertEqual([], list(validator.iter_errors(available)))
+        for forbidden in (
+            "side",
+            "quantity",
+            "price",
+            "orderType",
+            "userId",
+            "accountId",
+        ):
+            invalid = copy.deepcopy(available)
+            invalid[forbidden] = "forbidden"
+            self.assertNotEqual([], list(validator.iter_errors(invalid)), forbidden)
+
+        abstain = {
+            "status": "ABSTAIN",
+            "reason": "NO_GROUNDING",
+            "inputSha256": "a" * 64,
+            "modelId": "gemini-3.5-flash",
+            "promptVersion": "vertex-news-veto-v1",
+            "orderAuthority": "NONE",
+        }
+        self.assertEqual([], list(validator.iter_errors(abstain)))
+
+    def test_automation_and_journal_contracts_are_owner_safe_and_bounded(self) -> None:
+        control = self.fixtures["automation-control.v1"]
+        invalid = copy.deepcopy(control)
+        invalid["controlState"] = "HALTED"
+        invalid["projectionState"] = "RUNNING"
+        with self.assertRaises(ContractValidationError):
+            validate_semantics("automation-control.v1", invalid)
+
+        position = self.fixtures["automation-position.v1"]
+        self.assertEqual(1, position["quantity"])
+        self.assertTrue(position["botOwned"])
+        self.assertFalse(position["shortAllowed"])
+
+        journal = self.schemas["journal.v1"]
+        self.assertEqual(8192, journal["properties"]["content"]["maxLength"])
+        self.assertFalse(journal["additionalProperties"])
+
+    def test_additive_openapi_locks_eight_routes_and_v1_surface_stays_exact_56(
+        self,
+    ) -> None:
+        additive = json.loads(
+            (
+                ROOT / "contracts/openapi/p1-automation-journal.v1.openapi.json"
+            ).read_text(encoding="utf-8")
+        )
+        methods = {
+            (method.upper(), path)
+            for path, path_item in additive["paths"].items()
+            for method in path_item
+            if method != "parameters"
+        }
+        self.assertEqual(
+            {
+                ("GET", "/api/v1/automation/status"),
+                ("POST", "/api/v1/automation/arm"),
+                ("POST", "/api/v1/automation/disarm"),
+                ("GET", "/api/v1/automation/runs"),
+                ("POST", "/api/v1/journals"),
+                ("GET", "/api/v1/journals"),
+                ("PATCH", "/api/v1/journals/{journalId}"),
+                ("DELETE", "/api/v1/journals/{journalId}"),
+            },
+            methods,
+        )
+        root = json.loads(
+            (ROOT / "contracts/openapi/openapi.json").read_text(encoding="utf-8")
+        )
+        from contracts.generate_owner_ridge_contracts import project_previous
+
+        root = project_previous(root)
+        root_operations = {
+            (path, method)
+            for path, path_item in root["paths"].items()
+            for method in path_item
+            if method != "parameters"
+        }
+        self.assertEqual(76, len(root_operations))
+        self.assertIn(("/api/v3/signals/{symbol}", "get"), root_operations)
+        root_operations.remove(("/api/v3/signals/{symbol}", "get"))
+        self.assertEqual(75, len(root_operations))
+        v3_additive = json.loads(
+            (ROOT / "contracts/openapi/p1-automation-v3.v1.openapi.json").read_text(encoding="utf-8")
+        )
+        v3_operations = {
+            (path, method)
+            for path, path_item in v3_additive["paths"].items()
+            for method in path_item
+            if method != "parameters"
+        }
+        self.assertEqual(6, len(v3_operations))
+        self.assertTrue(v3_operations <= root_operations)
+        root_operations -= v3_operations
+        self.assertEqual(69, len(root_operations))
+        # Strong LLM 설정 표면 하나도 이 검사의 대상이 아니다. 가장 새 층부터 덜어 낸다.
+        strong_llm_additive = json.loads(
+            (ROOT / "contracts/openapi/p1-strong-llm-settings.v1.openapi.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        strong_llm_operations = {
+            (path, method)
+            for path, path_item in strong_llm_additive["paths"].items()
+            for method in path_item
+            if method != "parameters"
+        }
+        self.assertEqual(1, len(strong_llm_operations))
+        self.assertTrue(strong_llm_operations <= root_operations)
+        root_operations -= strong_llm_operations
+        self.assertEqual(68, len(root_operations))
+        # RAG v2 공개 표면 일곱 개는 이 검사의 대상이 아니다. 먼저 덜어 내고 exact-61을 본다.
+        rag_v2_additive = json.loads(
+            (ROOT / "contracts/openapi/p1-rag-v2-public.v1.openapi.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        rag_v2_operations = {
+            (path, method)
+            for path, path_item in rag_v2_additive["paths"].items()
+            for method in path_item
+            if method != "parameters"
+        }
+        self.assertEqual(7, len(rag_v2_operations))
+        self.assertTrue(rag_v2_operations <= root_operations)
+        root_operations -= rag_v2_operations
+        self.assertEqual(61, len(root_operations))
+
+        v2_additive = json.loads(
+            (
+                ROOT / "contracts/openapi/p1-automation-v2.v1.openapi.json"
+            ).read_text(encoding="utf-8")
+        )
+        v2_operations = {
+            (path, method)
+            for path, path_item in v2_additive["paths"].items()
+            for method in path_item
+            if method != "parameters"
+        }
+        self.assertEqual(5, len(v2_operations))
+        self.assertTrue(v2_operations <= root_operations)
+        self.assertEqual(56, len(root_operations - v2_operations))
+        self.assertFalse(
+            {path for path, _ in root_operations - v2_operations}
+            & {path for path, _ in v2_operations}
+        )
+
+    def test_release_v3_requires_exact_sixteen_gates_and_keeps_live_closed(
+        self,
+    ) -> None:
+        catalog = json.loads(
+            (
+                ROOT / "contracts/catalogs/p1-full-app-release-contract.v3.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(list(RELEASE_V3_HARD_GATES), catalog["hardGates"])
+        self.assertEqual(16, len(catalog["hardGates"]))
+        self.assertEqual(45, catalog["teamARequiredOperationCount"])
+        self.assertEqual(76, catalog["openApiOperationCount"])
+        self.assertEqual(0, catalog["kisLiveOrderCalls"])
+        self.assertEqual(0, catalog["gdeltCalls"])
+
+        schema = _release_manifest_schema_v3()
+        validator = Draft202012Validator(schema)
+        candidate = {
+            "contractId": "p1-full-app-release-manifest.v3",
+            "stage": "CANDIDATE",
+            "releaseVersion": "1.0.0",
+            "commitSha": "a" * 40,
+            "treeSha": "b" * 40,
+            "hardGates": {gate: "NOT_RUN" for gate in RELEASE_V3_HARD_GATES},
+            "teamBManifestSha256": "a" * 64,
+            "teamAImageDigest": f"sha256:{'b' * 64}",
+            "providerReceipt": {
+                "vertexGroundedCalls": 0,
+                "kisTokenCalls": 0,
+                "kisDailyCalls": 0,
+                "ecosCalls": 0,
+                "kisQuoteCalls": 0,
+                "kisBrokerageCalls": 0,
+                "orderSubmitCalls": 0,
+                "cancelCalls": 0,
+                "retries": 0,
+            },
+            "lightgbm": "RESEARCH_ONLY_NO_SIGNAL_OR_ORDER_AUTHORITY",
+            "kisLiveOrderCalls": 0,
+            "gdeltCalls": 0,
+            "released": False,
+        }
+        self.assertEqual([], list(validator.iter_errors(candidate)))
+        final = copy.deepcopy(candidate)
+        final["stage"] = "FINAL"
+        final["released"] = True
+        final["hardGates"] = {gate: "PASS" for gate in RELEASE_V3_HARD_GATES}
+        self.assertEqual([], list(validator.iter_errors(final)))
+        final["hardGates"]["THREE_XKRX_SESSION_SOAK"] = "BLOCKED"
+        self.assertNotEqual([], list(validator.iter_errors(final)))
+
+    def test_historical_contracts_license_and_news_summary_are_byte_stable(
+        self,
+    ) -> None:
+        for relative, expected in FROZEN_SHA256.items():
+            with self.subTest(relative=relative):
+                self.assertEqual(
+                    expected,
+                    hashlib.sha256((ROOT / relative).read_bytes()).hexdigest(),
+                )
+        self.assertFalse(
+            (
+                ROOT / "contracts/schemas/return-engine-news-feature.v1.schema.json"
+            ).exists()
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

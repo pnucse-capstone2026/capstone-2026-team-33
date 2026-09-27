@@ -1,0 +1,1730 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd -P)
+STATE_DIR=${P1_STATE_DIR:-$SCRIPT_DIR/.state-app}
+SECRETS_DIR=$STATE_DIR/secrets
+RUNTIME_ENV=$STATE_DIR/runtime.env
+ACTIVE_MODE=$STATE_DIR/active-mode.env
+COMPOSE_FILE=$SCRIPT_DIR/compose.yml
+# 시연용 스택. 이미지도 compose 정의도 상태 디렉터리도 그대로 쓰고 compose 프로젝트
+# 이름만 가른다. 이름이 다르면 이름 있는 볼륨이 통째로 갈리므로 DB 가 물리적으로
+# 분리된다 - 두 묶음의 차이는 시연용 DB 가 있느냐 없느냐 그것뿐이고 코드는 언제나
+# 같은 파일 하나다.
+#
+# 상태 디렉터리와 호스트 포트를 함께 쓰는 것은 **한 번에 하나만 띄운다**는 전제 위에
+# 서 있다. 그 전제 덕에 시연 스택도 같은 KIS 자격증명과 인증을 그대로 물려받아
+# 추가 설정 없이 실제로 거래한다. 둘을 동시에 띄우면 포트가 부딪히고, 설령 포트를
+# 옮기더라도 같은 모의계좌에 두 스택이 무장해 초당 1건 슬롯을 뺏고 같은 종목에
+# 주문을 두 번 낸다.
+DEMO_STACK=${P1_DEMO_STACK:-false}
+DEMO_COMPOSE_FILE=$SCRIPT_DIR/compose.demo.yml
+if [[ $DEMO_STACK == true ]]; then
+  PROJECT_NAME=${P1_PROJECT_NAME:-capstone-p1-demo}
+else
+  PROJECT_NAME=${P1_PROJECT_NAME:-capstone-p1}
+fi
+P1CTL=$SCRIPT_DIR/p1ctl
+RELEASE_GUARD=$SCRIPT_DIR/release_guard.py
+MOCK_CERTIFICATION_GUARD=$SCRIPT_DIR/mock_certification_guard.py
+# Use the WSL CLI so exported runtime flags reach Compose; allow an explicit operator override.
+DOCKER_BIN=${P1_DOCKER_BIN:-/usr/bin/docker}
+[[ -x $DOCKER_BIN ]] || DOCKER_BIN=$(command -v docker 2>/dev/null || true)
+
+die() { printf 'CAPSTONE_ERROR=%s\n' "$1" >&2; exit 1; }
+require_command() { command -v "$1" >/dev/null 2>&1 || die "MISSING_COMMAND_$1"; }
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./capstone up [--models] [--mock]
+  ./capstone status|logs|smoke|down|doctor
+  ./capstone demo create
+  ./capstone credential rotate <user|admin> /absolute/password-file
+  ./capstone mock <configure|doctor|certify|readiness|gate-author|start|stop|resume> [--symbol 005930] [--quantity 1]
+  ./capstone artifact <validate|import> <bundle-directory> --manifest-sha256 <sha256>
+  ./capstone market-data inventory
+  ./capstone market-data refresh
+  ./capstone market-data universe refresh --as-of YYYY-MM-DD --output-root /absolute/new-root
+  ./capstone market-data bootstrap <plan|run|validate|stage> ...
+  ./capstone test after-hours-replay --manifest-sha256 <sha256>
+  ./capstone team-a acceptance
+
+Default `up` starts five persistent containers. `--mock` adds the daily
+market-data collector. `GDELT_WORLD_NEWS_ENABLED=true` adds the bounded minute
+news collector independently. `--models` adds the official BGE-M3 and
+llama.cpp PaddleOCR-VL runtimes. Brokerage is provider-free unless the owner
+explicitly selects `--mock` after certification.
+EOF
+}
+
+compose() {
+  [[ -n $DOCKER_BIN ]] || die MISSING_COMMAND_docker
+  enable_rag_by_default
+  enable_strong_llm_by_default
+  select_social_login_profile
+  export P1_OPERATOR_UID=${P1_OPERATOR_UID:-$(id -u)}
+  export P1_KIS_MOCK_RUNTIME_DIR=${P1_KIS_MOCK_RUNTIME_DIR:-$STATE_DIR/mock}
+  local args=("$DOCKER_BIN" compose --project-name "$PROJECT_NAME")
+  if [[ -e $REPO_ROOT/.env ]]; then
+    [[ -f $REPO_ROOT/.env && ! -L $REPO_ROOT/.env && $(stat -c '%a' "$REPO_ROOT/.env") == 600 ]] || die root_env_boundary
+    args+=(--env-file "$REPO_ROOT/.env")
+  fi
+  if [[ -f $RUNTIME_ENV && ! -L $RUNTIME_ENV ]]; then
+    args+=(--env-file "$RUNTIME_ENV")
+  else
+    export P1_SECRET_GID=${P1_SECRET_GID:-$(id -g)}
+    export P1_SECRETS_DIR=${P1_SECRETS_DIR:-$SECRETS_DIR}
+    export P1_SPRING_IMAGE=${P1_SPRING_IMAGE:-capstone-decision-platform:p1-local}
+    export P1_PYTHON_IMAGE=${P1_PYTHON_IMAGE:-capstone-decision-platform:p1-local}
+  fi
+  args+=(-f "$COMPOSE_FILE")
+  if [[ $DEMO_STACK == true ]]; then args+=(-f "$DEMO_COMPOSE_FILE"); fi
+  # 서버 배포는 오버레이 하나만 더 얹는다(compose.server.yml). 레포 밖 파일은 받지 않는다.
+  if [[ -n ${P1_COMPOSE_OVERLAY:-} ]]; then
+    local overlay
+    overlay=$(realpath -e -- "$P1_COMPOSE_OVERLAY") || die compose_overlay_missing
+    [[ $overlay == "$SCRIPT_DIR"/compose.*.yml && ! -L $P1_COMPOSE_OVERLAY ]] || die compose_overlay_boundary
+    args+=(-f "$overlay")
+  fi
+  "${args[@]}" "$@"
+}
+
+# 실사용 스택의 DB 볼륨을 시연 스택으로 통째로 복제한다.
+#
+# 빈 볼륨에서 시작한 스택은 한 번의 up 으로 완성되지 않는다. 시세 바가 없으면 신호를
+# 재생할 수 없고, 재생이 없으면 포지션이 없고, 포지션이 없으면 채울 기록도 없다. 실사용
+# DB 는 그 축적을 이미 가지고 있으므로 그것을 그대로 옮겨 놓고 시연 기록만 얹는다 -
+# "실사용과 같은데 시연 기록만 더 있는 것"이라는 정의에도 이쪽이 맞는다.
+#
+# 파일 단위 복사라 두 스택이 모두 내려가 있어야 한다. 켜진 채로 복사하면 쓰는 중인
+# 페이지를 베껴 깨진 데이터 디렉터리가 된다.
+demo_create() {
+  state_ready || die NOT_INITIALIZED
+  # Desktop에서 직접 시작할 컨테이너만 만든다. 기존 데모 데이터는 교체하지 않는다.
+  local demo_project=capstone-p1-demo
+  [[ -z $("$DOCKER_BIN" ps --filter "label=com.docker.compose.project=$demo_project" -q) ]] \
+    || die DEMO_CREATE_REQUIRES_STOPPED_STACK
+  PROJECT_NAME=$demo_project
+  DEMO_STACK=true
+  compose --profile automation up --no-start --no-build --no-deps --pull never \
+    postgres redis actor-authority decision-platform experience-dashboard market-data-daily
+  printf 'CAPSTONE_DEMO_CREATED=PASS\nCAPSTONE_DEMO_STARTED=FALSE\nCAPSTONE_VOLUMES_PRESERVED=TRUE\n'
+}
+
+demo_clone() {
+  [[ $DEMO_STACK == true ]] || die DEMO_CLONE_REQUIRES_DEMO_STACK
+  [[ -n $DOCKER_BIN ]] || die MISSING_COMMAND_docker
+  local running
+  running=$("$DOCKER_BIN" ps --format '{{.Names}}' | grep -c '^capstone-p1' || true)
+  ((running == 0)) || die DEMO_CLONE_REQUIRES_ALL_STACKS_DOWN
+  local source=capstone-p1_p1-postgres-current target=capstone-p1-demo_p1-postgres-current
+  "$DOCKER_BIN" volume inspect "$source" >/dev/null 2>&1 || die DEMO_CLONE_SOURCE_VOLUME_MISSING
+  "$DOCKER_BIN" volume rm -f "$target" >/dev/null 2>&1 || true
+  "$DOCKER_BIN" volume create "$target" >/dev/null
+  "$DOCKER_BIN" run --rm -v "$source":/from:ro -v "$target":/to     --entrypoint sh alpine:3 -c 'cd /from && tar cf - . | (cd /to && tar xf -)' >/dev/null
+  printf 'CAPSTONE_DEMO_CLONE=PASS
+'
+}
+
+# 시연용 기록을 채우거나 되돌린다. 실사용 스택에서는 아무 일도 하지 않는다.
+demo_history() {
+  local action=${1:-seed} output
+  # 실사용 스택에서는 아무것도 하지 않고 출력도 남기지 않는다. 기동 출력은 계약이라
+  # 줄 하나가 늘어나는 것도 변경이다.
+  [[ $DEMO_STACK == true ]] || return 0
+  output=$(P1_DEMO_HISTORY_COMMAND=$action \
+    compose --profile demo run --rm --no-deps demo-history-seed 2>&1 \
+    | grep -E '^P1_DEMO_HISTORY=' | tail -1) || true  # 캡처한 표식을 지우지 않는다. 사유가 사라진다
+  printf '%s\n' "${output:-P1_DEMO_HISTORY=UNAVAILABLE}"
+}
+
+# Google·Kakao 로그인은 선택 구성이다. 루트 .env 의 제공자 값을 spring.env 로 옮기고,
+# 두 제공자와 공개 HTTPS 주소가 모두 있을 때만 social-login 프로필을 켠다.
+SOCIAL_LOGIN_KEYS='GOOGLE_OIDC_CLIENT_ID|GOOGLE_OIDC_CLIENT_SECRET|GOOGLE_OIDC_ADMIN_SUBJECT_SHA256|KAKAO_OAUTH_CLIENT_ID|KAKAO_OAUTH_CLIENT_SECRET'
+
+sync_social_login_state() {
+  local wanted='' current
+  if [[ -f $REPO_ROOT/.env && ! -L $REPO_ROOT/.env ]]; then
+    wanted=$(grep -E "^(${SOCIAL_LOGIN_KEYS})=." "$REPO_ROOT/.env" || true)
+  fi
+  current=$(grep -E "^(${SOCIAL_LOGIN_KEYS})=" "$SECRETS_DIR/spring.env" || true)
+  [[ $wanted != "$current" ]] || return 0
+  {
+    grep -Ev "^(${SOCIAL_LOGIN_KEYS})=" "$SECRETS_DIR/spring.env" || true
+    [[ -z $wanted ]] || printf '%s\n' "$wanted"
+  } | write_state secrets/spring.env 0640
+}
+
+select_social_login_profile() {
+  [[ -z ${SPRING_PROFILES_ACTIVE:-} && -f $REPO_ROOT/.env && -f $SECRETS_DIR/spring.env ]] || return 0
+  local origin key
+  origin=$(sed -n 's/^MARS_PUBLIC_ORIGIN=//p' "$REPO_ROOT/.env" | tail -1)
+  [[ $origin == https://* ]] || return 0
+  for key in GOOGLE_OIDC_CLIENT_ID GOOGLE_OIDC_CLIENT_SECRET KAKAO_OAUTH_CLIENT_ID KAKAO_OAUTH_CLIENT_SECRET; do
+    grep -qE "^${key}=." "$SECRETS_DIR/spring.env" || return 0
+  done
+  export SPRING_PROFILES_ACTIVE=social-login
+}
+
+write_state() {
+  local relative=$1 mode=$2
+  python3 "$RELEASE_GUARD" state-write "$STATE_DIR" "$relative" "$mode"
+}
+
+append_state() {
+  local relative=$1 mode=$2
+  python3 "$RELEASE_GUARD" state-append "$STATE_DIR" "$relative" "$mode"
+}
+
+state_ready() {
+  [[ -f $RUNTIME_ENV && ! -L $RUNTIME_ENV && -d $SECRETS_DIR && ! -L $SECRETS_DIR ]]
+}
+
+build_core_images() {
+  "$DOCKER_BIN" build -f "$SCRIPT_DIR/docker/decision-platform.Dockerfile" \
+    -t capstone-decision-platform:p1-local "$REPO_ROOT"
+  "$DOCKER_BIN" build -f "$SCRIPT_DIR/docker/postgres-pgvector.Dockerfile" \
+    -t capstone-postgres-pgvector:p1-local "$REPO_ROOT"
+  # 공식 redis 에 비밀 로더만 얹는다. 이것이 없으면 이미지만 가진 사람은 redis 를 못 띄운다.
+  "$DOCKER_BIN" build -f "$SCRIPT_DIR/docker/redis.Dockerfile" \
+    -t capstone-redis:p1-local "$REPO_ROOT"
+}
+
+build_team_images() {
+  compose --profile preview build experience-dashboard return-engine-preview-prepare
+}
+
+initialize_state() {
+  if ! state_ready; then
+    P1_STATE_DIR=$STATE_DIR \
+      P1_PROJECT_NAME=$PROJECT_NAME \
+      P1_SPRING_IMAGE=capstone-decision-platform:p1-local \
+      P1_PYTHON_IMAGE=capstone-decision-platform:p1-local \
+      "$P1CTL" init
+  fi
+  upgrade_state
+  P1_STATE_DIR=$STATE_DIR P1_PROJECT_NAME=$PROJECT_NAME "$P1CTL" verify >/dev/null
+}
+
+upgrade_state() {
+  sync_social_login_state
+  # 5/7 container layout 이전에 생성된 state를 지우거나 key를 회전하지 않는다.
+  # 새 brokerage channel에 필요한 서로 독립적인 값만 atomic하게 보강한다.
+  if ! grep -q '^BROKERAGE_GRPC_SHARED_SECRET=' "$SECRETS_DIR/spring.env"; then
+    printf 'BROKERAGE_GRPC_SHARED_SECRET=%s\n' "$(openssl rand -hex 32)" \
+      | append_state secrets/spring.env 0640
+  fi
+  # 자동운용 런타임이 RiskEngine 관측 표에 잔고·위험지표를 남기려면 좁은 writer 두 개가
+  # 필요하다. 이 배선이 없던 동안에는 사람이 매일 손으로 적재해야 했고 그러지 않으면 판정이
+  # 입력 부재로 HOLD 됐다. 기존 state 를 지우지 않고 없는 파일만 만든다 - 비밀 회전은 없다.
+  if [[ ! -e $SECRETS_DIR/automation-observation.env ]]; then
+    local portfolio_writer_password risk_writer_password
+    portfolio_writer_password=$(sed -n 's/^POSTGRES_PORTFOLIO_WRITER_PASSWORD=//p' "$SECRETS_DIR/postgres.env")
+    risk_writer_password=$(sed -n 's/^POSTGRES_RISK_WRITER_PASSWORD=//p' "$SECRETS_DIR/postgres.env")
+    if [[ -n $portfolio_writer_password && -n $risk_writer_password ]]; then
+      printf 'DECISION_PORTFOLIO_WRITER_DATABASE_DSN=postgresql://decision_portfolio_writer:%s@postgres:5432/capstone_p1?sslmode=disable
+DECISION_RISK_WRITER_DATABASE_DSN=postgresql://decision_risk_writer:%s@postgres:5432/capstone_p1?sslmode=disable
+'         "$portfolio_writer_password" "$risk_writer_password"         | append_state secrets/automation-observation.env 0640
+    fi
+  fi
+  if [[ ! -e $SECRETS_DIR/return-inference.env ]]; then
+    local return_inference_secret
+    return_inference_secret=$(sed -n 's/^RETURN_INFERENCE_GRPC_SHARED_SECRET=//p' "$SECRETS_DIR/spring.env")
+    [[ $return_inference_secret =~ ^[0-9a-f]{64}$ ]] \
+      || return_inference_secret=$(openssl rand -hex 32)
+    printf 'RETURN_INFERENCE_GRPC_SHARED_SECRET=%s\n' "$return_inference_secret" \
+      | write_state secrets/return-inference.env 0640
+    unset return_inference_secret
+  fi
+  if [[ ! -e $SECRETS_DIR/kis-mock.env ]]; then
+    printf '%s\n' \
+      'KIS_MOCK_CONFIGURED=false' \
+      'KIS_MOCK_APP_KEY=DISABLED00' \
+      'KIS_MOCK_APP_SECRET=DISABLED00' \
+      'KIS_MOCK_ACCOUNT_NO=00000000-00' \
+      'KIS_MOCK_BOUND_ACCOUNT_ID=acct_00000000000000000000000000000000' \
+      "KIS_MOCK_ORDER_REFERENCE_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '\n')" \
+      'KIS_BROKERAGE_TOKEN_P_PHYSICAL_CAP=1' \
+      'KIS_BROKERAGE_PHYSICAL_CAP=32' \
+      | write_state secrets/kis-mock.env 0640
+  fi
+  local reference_key
+  reference_key=$(sed -n 's/^KIS_MOCK_ORDER_REFERENCE_KEY=//p' "$SECRETS_DIR/kis-mock.env")
+  if [[ ! $reference_key =~ ^[A-Za-z0-9_-]{43}=$ ]]; then
+    # 과거 생성물은 base64 padding을 지워 44자 Fernet key 조건을 만족하지 못한다. credential은
+    # 건드리지 않고 이 key만 재발급한다. 아직 참조 중인 주문이 없을 때만 안전하다.
+    sed "s|^KIS_MOCK_ORDER_REFERENCE_KEY=.*|KIS_MOCK_ORDER_REFERENCE_KEY=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '\n')|" \
+      "$SECRETS_DIR/kis-mock.env" | write_state secrets/kis-mock.env 0640
+  fi
+  unset reference_key
+  if [[ ! -e $SECRETS_DIR/artifact-import.env ]]; then
+    local worker_password
+    worker_password=$(sed -n 's/^POSTGRES_WORKER_PASSWORD=//p' "$SECRETS_DIR/spring.env")
+    [[ $worker_password =~ ^[0-9a-f]{64}$ ]] || die ARTIFACT_IMPORT_WORKER_SECRET_MISSING
+    printf 'P1_ARTIFACT_IMPORT_DATABASE_DSN=postgresql://decision_worker:%s@postgres:5432/capstone_p1?sslmode=disable\n' "$worker_password" \
+      | write_state secrets/artifact-import.env 0640
+    unset worker_password
+  fi
+  if [[ ! -e $SECRETS_DIR/team-a-acceptance.env ]]; then
+    local postgres_password
+    postgres_password=$(sed -n 's/^POSTGRES_PASSWORD=//p' "$SECRETS_DIR/postgres.env")
+    [[ $postgres_password =~ ^[0-9a-f]{64}$ ]] || die TEAM_A_ACCEPTANCE_DATABASE_SECRET_MISSING
+    printf 'P1_TEAM_A_ACCEPTANCE_DATABASE_DSN=postgresql://postgres:%s@postgres:5432/capstone_p1?sslmode=disable\n' "$postgres_password" \
+      | write_state secrets/team-a-acceptance.env 0640
+    unset postgres_password
+  fi
+  local automation_runtime_password
+  automation_runtime_password=$(sed -n 's/^POSTGRES_AUTOMATION_RUNTIME_PASSWORD=//p' "$SECRETS_DIR/postgres.env")
+  if [[ ! $automation_runtime_password =~ ^[0-9a-f]{64}$ ]]; then
+    automation_runtime_password=$(openssl rand -hex 32)
+    printf 'POSTGRES_AUTOMATION_RUNTIME_PASSWORD=%s\n' "$automation_runtime_password" \
+      | append_state secrets/postgres.env 0640
+  fi
+  if ! grep -q '^POSTGRES_AUTOMATION_RUNTIME_PASSWORD=' "$SECRETS_DIR/role-bootstrap.env"; then
+    printf 'POSTGRES_AUTOMATION_RUNTIME_PASSWORD=%s\n' "$automation_runtime_password" \
+      | append_state secrets/role-bootstrap.env 0640
+  fi
+  if [[ ! -e $SECRETS_DIR/automation-runtime.env ]]; then
+    printf 'P1_AUTOMATION_DATABASE_DSN=postgresql://decision_automation_runtime:%s@postgres:5432/capstone_p1?sslmode=disable\nAUTOMATION_RUNTIME_SHARED_SECRET=%s\nP1_AUTOMATION_OWNER_USER_ID=usr_demo_user\n' \
+      "$automation_runtime_password" "$(openssl rand -hex 32)" \
+      | write_state secrets/automation-runtime.env 0640
+  fi
+  if [[ ! -e $SECRETS_DIR/market-data.env ]]; then
+    local market_writer_password
+    market_writer_password=$(sed -n 's/^POSTGRES_MARKET_WRITER_PASSWORD=//p' "$SECRETS_DIR/postgres.env")
+    [[ $market_writer_password =~ ^[0-9a-f]{64}$ ]] || die MARKET_DATA_WRITER_SECRET_MISSING
+    printf 'MARKET_DATA_WRITER_DSN=postgresql://decision_market_writer:%s@postgres:5432/capstone_p1?sslmode=disable\n' \
+      "$market_writer_password" | write_state secrets/market-data.env 0640
+    unset market_writer_password
+  fi
+  # 시장데이터 collector에는 API key/secret과 Redis token cache만 전달한다. 계좌번호·주문 key를
+  # 포함한 kis-mock.env 전체를 마운트하지 않는다.
+  {
+    grep -E '^(KIS_MOCK_CONFIGURED|KIS_MOCK_APP_KEY|KIS_MOCK_APP_SECRET)=' "$SECRETS_DIR/kis-mock.env"
+    grep -E '^REDIS_PASSWORD=' "$SECRETS_DIR/redis.env"
+    if [[ -f $REPO_ROOT/.env && ! -L $REPO_ROOT/.env ]]; then
+      grep -E '^(KIS_LIVE_APP_KEY|KIS_LIVE_APP_SECRET|KRX_OPENAPI_AUTH_KEY)=' "$REPO_ROOT/.env" || true
+    fi
+  } | write_state secrets/market-data-provider.env 0640
+  if [[ ! -e $SECRETS_DIR/after-hours-replay.env ]]; then
+    local replay_reader_password
+    replay_reader_password=$(sed -n 's/^POSTGRES_REPLAY_PASSWORD=//p' "$SECRETS_DIR/postgres.env")
+    [[ $replay_reader_password =~ ^[0-9a-f]{64}$ ]] || die AFTER_HOURS_REPLAY_SECRET_MISSING
+    printf 'P1_AFTER_HOURS_REPLAY_DATABASE_DSN=postgresql://decision_replay:%s@postgres:5432/capstone_p1?sslmode=disable\nP1_AFTER_HOURS_REPLAY_ISOLATED=true\n' \
+      "$replay_reader_password" | write_state secrets/after-hours-replay.env 0640
+    unset replay_reader_password
+  fi
+  if ! grep -q '^P1_AUTOMATION_OWNER_USER_ID=' "$SECRETS_DIR/automation-runtime.env"; then
+    printf 'P1_AUTOMATION_OWNER_USER_ID=usr_demo_user\n' \
+      | append_state secrets/automation-runtime.env 0640
+  fi
+  if [[ ! -e $SECRETS_DIR/rag-v2.env ]]; then
+    # RAG v2 질의 경로는 두 역할을 나눠 쓴다. Spring이 decision_app으로 인가하고 Python writer가
+    # decision_rag_writer로 사용량을 예약한다. 그래서 여기 DSN은 rag writer 역할이어야 한다.
+    # VOYAGE_API_KEY는 생성하지 않는다. KIS credential과 같은 취급으로 운영자가 직접 넣는다.
+    local rag_writer_password rag_query_password
+    rag_writer_password=$(sed -n 's/^POSTGRES_RAG_WRITER_PASSWORD=//p' "$SECRETS_DIR/postgres.env")
+    rag_query_password=$(sed -n 's/^POSTGRES_RAG_QUERY_PASSWORD=//p' "$SECRETS_DIR/postgres.env")
+    [[ $rag_writer_password =~ ^[0-9a-f]{64}$ ]] || die RAG_V2_QUERY_WRITER_SECRET_MISSING
+    [[ $rag_query_password =~ ^[0-9a-f]{64}$ ]] || die RAG_V2_QUERY_READER_SECRET_MISSING
+    printf 'RAG_V2_QUERY_DATABASE_DSN=postgresql://decision_rag_query:%s@postgres:5432/capstone_p1?sslmode=disable\nRAG_V2_VOYAGE_QUERY_WRITER_DSN=postgresql://decision_rag_writer:%s@postgres:5432/capstone_p1?sslmode=disable\nRAG_V2_GRPC_SHARED_SECRET=%s\n' \
+      "$rag_query_password" "$rag_writer_password" "$(openssl rand -hex 32)" \
+      | write_state secrets/rag-v2.env 0640
+    unset rag_writer_password rag_query_password
+  fi
+  # 이미 만들어진 상태에도 Strong LLM 공유 비밀을 덧붙인다. 없던 배포가 그대로 켜지면
+  # 부팅에서 닫히고, 그 실패 원인이 "파일 하나가 빠졌다"가 되어 읽기 어려워진다.
+  if ! grep -q '^STRONG_LLM_GRPC_SHARED_SECRET=' "$SECRETS_DIR/rag-v2.env"; then
+    printf 'STRONG_LLM_GRPC_SHARED_SECRET=%s\n' "$(openssl rand -hex 32)" \
+      | append_state secrets/rag-v2.env 0640
+  fi
+  if [[ ! -e $SECRETS_DIR/automation-gate-author.env ]]; then
+    local replay_authorizer_password
+    replay_authorizer_password=$(sed -n 's/^POSTGRES_REPLAY_AUTHORIZER_PASSWORD=//p' "$SECRETS_DIR/postgres.env")
+    [[ $replay_authorizer_password =~ ^[0-9a-f]{64}$ ]] || die AUTOMATION_GATE_AUTHOR_SECRET_MISSING
+    printf 'P1_AUTOMATION_GATE_AUTHOR_DSN=postgresql://decision_replay_authorizer:%s@postgres:5432/capstone_p1?sslmode=disable\n' \
+      "$replay_authorizer_password" | write_state secrets/automation-gate-author.env 0640
+    unset replay_authorizer_password
+  fi
+  # 오프라인 캘린더 seeding 은 나중에 붙은 기능이다. 이미 만들어진 상태에도 DSN 을 채워
+  # 재init 없이 켜지게 한다. decision_collector 는 role bootstrap 이 이미 만든 role 이다.
+  if [[ ! -e $SECRETS_DIR/calendar-offline-seed.env ]]; then
+    local collector_password
+    collector_password=$(sed -n 's/^POSTGRES_COLLECTOR_PASSWORD=//p' "$SECRETS_DIR/postgres.env")
+    [[ $collector_password =~ ^[0-9a-f]{64}$ ]] || die CALENDAR_OFFLINE_SEED_SECRET_MISSING
+    printf 'P1_CALENDAR_OFFLINE_SEED_DSN=postgresql://decision_collector:%s@postgres:5432/capstone_p1?sslmode=disable\n' \
+      "$collector_password" | write_state secrets/calendar-offline-seed.env 0640
+    unset collector_password
+  fi
+  # 공시 근거 수집기도 나중에 붙었다. decision_collector 는 role bootstrap 이 이미 만든
+  # role 이고, OpenDART 인증정보는 리포 .env 에서만 온다. 시장데이터 provider 블록과 같은
+  # 이유로 매 init 마다 다시 쓴다 - .env 의 key 를 나중에 채워도 켜지게 하려면 그래야 한다.
+  local disclosure_collector_password
+  disclosure_collector_password=$(sed -n 's/^POSTGRES_COLLECTOR_PASSWORD=//p' "$SECRETS_DIR/postgres.env")
+  [[ $disclosure_collector_password =~ ^[0-9a-f]{64}$ ]] || die DISCLOSURE_COLLECTOR_SECRET_MISSING
+  {
+    printf 'P1_DISCLOSURE_COLLECTOR_DSN=postgresql://decision_collector:%s@postgres:5432/capstone_p1?sslmode=disable\n' \
+      "$disclosure_collector_password"
+    if [[ -f $REPO_ROOT/.env && ! -L $REPO_ROOT/.env ]]; then
+      grep -E '^OPENDART_API_KEY=' "$REPO_ROOT/.env" || true
+    fi
+  } | write_state secrets/disclosure-collector.env 0640
+  unset disclosure_collector_password
+  # 자동운용 런타임은 공시 투영을 읽어 거부권 근거를 만든다. decision_disclosure_reader 는
+  # 그 투영에만 SELECT 를 갖는 read-only role 이고, 없으면 근거가 0개가 되어 거부권이
+  # 조용히 ABSTAIN 한다. 이미 만들어진 상태에도 채운다.
+  if ! grep -q '^DECISION_DISCLOSURE_READER_DATABASE_DSN=' "$SECRETS_DIR/automation-runtime.env"; then
+    local disclosure_reader_password
+    disclosure_reader_password=$(sed -n 's/^POSTGRES_DISCLOSURE_READER_PASSWORD=//p' "$SECRETS_DIR/postgres.env")
+    if [[ $disclosure_reader_password =~ ^[0-9a-f]{64}$ ]]; then
+      printf 'DECISION_DISCLOSURE_READER_DATABASE_DSN=postgresql://decision_disclosure_reader:%s@postgres:5432/capstone_p1?sslmode=disable\n' \
+        "$disclosure_reader_password" | append_state secrets/automation-runtime.env 0640
+    fi
+    unset disclosure_reader_password
+  fi
+  # 출처 registry 등록도 나중에 붙었다. rag-v2.env 에 이미 있는 writer 자격증명을 그대로
+  # 재사용하고 새 role 이나 새 비밀을 만들지 않는다.
+  if [[ ! -e $SECRETS_DIR/rag-source-register.env ]]; then
+    local rag_writer_dsn
+    rag_writer_dsn=$(sed -n 's/^RAG_V2_VOYAGE_QUERY_WRITER_DSN=//p' "$SECRETS_DIR/rag-v2.env")
+    [[ -n $rag_writer_dsn ]] || die RAG_SOURCE_REGISTER_SECRET_MISSING
+    printf 'RAG_SOURCE_WRITER_DATABASE_DSN=%s\nRAG_SOURCE_REGISTER_TARGET=local\n' \
+      "$rag_writer_dsn" | write_state secrets/rag-source-register.env 0640
+    unset rag_writer_dsn
+  fi
+  unset automation_runtime_password
+  install -d -m 0700 "$STATE_DIR/artifacts"
+  install -d -m 0700 "$STATE_DIR/mock"
+  if ! grep -q '^P1_OPERATOR_UID=' "$RUNTIME_ENV"; then
+    printf 'P1_OPERATOR_UID=%s\n' "$(id -u)" | append_state runtime.env 0600
+  fi
+  if ! grep -q '^P1_KIS_MOCK_RUNTIME_DIR=' "$RUNTIME_ENV"; then
+    printf 'P1_KIS_MOCK_RUNTIME_DIR=%s\n' "$STATE_DIR/mock" | append_state runtime.env 0600
+  fi
+  # RAG v2 로컬 루트는 비어 있어도 된다. 마운트만 항상 성립하게 두고, 실제 leaf가 없으면
+  # RAG v2를 켰을 때 entrypoint가 닫는다. 운영자가 다른 경로를 쓰려면 이 값을 바꾼다.
+  install -d -m 0700 "$STATE_DIR/rag-v2-root"
+  if ! grep -q '^P1_RAG_RUNTIME_DIR=' "$RUNTIME_ENV"; then
+    printf 'P1_RAG_RUNTIME_DIR=%s\n' "$STATE_DIR/rag-v2-root" | append_state runtime.env 0600
+  fi
+  local approval_files=0 approval_file
+  for approval_file in kis-mock-approval-private.pem kis-mock-approval-public.pem kis-mock-approval-trust-policy.json p1-provider-claim.dsn; do
+    [[ ! -e $SECRETS_DIR/$approval_file ]] || approval_files=$((approval_files + 1))
+  done
+  [[ $approval_files == 0 || $approval_files == 4 ]] || die KIS_MOCK_APPROVAL_STATE_PARTIAL
+  if [[ $approval_files == 0 ]]; then
+    local approval_tmp public_digest replay_password
+    approval_tmp=$(mktemp -d)
+    openssl genpkey -algorithm ED25519 -out "$approval_tmp/private.pem" >/dev/null 2>&1
+    openssl pkey -in "$approval_tmp/private.pem" -pubout -out "$approval_tmp/public.pem" >/dev/null 2>&1
+    # 서명용 개인키는 owner-only 0600만 허용된다. compose secret은 원본 mode를 그대로
+    # 마운트하므로 0640으로 만들면 packet reader가 bounded owner-only 검사에서 거부한다.
+    write_state secrets/kis-mock-approval-private.pem 0600 < "$approval_tmp/private.pem"
+    write_state secrets/kis-mock-approval-public.pem 0640 < "$approval_tmp/public.pem"
+    public_digest=$(sha256sum "$approval_tmp/public.pem" | awk '{print $1}')
+    printf '{"contractId":"p1-approval-trust-root.v1","issuerKeyId":"CAPSTONE.KISMOCK.V1","publicKeyPath":"/run/secrets/kis_mock_approval_public","publicKeySha256":"%s"}' "$public_digest" \
+      | write_state secrets/kis-mock-approval-trust-policy.json 0640
+    replay_password=$(sed -n 's/^POSTGRES_REPLAY_PASSWORD=//p' "$SECRETS_DIR/postgres.env")
+    [[ -n $replay_password ]] || die KIS_MOCK_APPROVAL_REPLAY_SECRET_MISSING
+    printf 'postgresql://decision_replay:%s@postgres:5432/capstone_p1?sslmode=disable' "$replay_password" \
+      | write_state secrets/p1-provider-claim.dsn 0600
+    unset replay_password
+    rm -rf -- "$approval_tmp"
+  fi
+}
+
+run_initializers() {
+  export P1_ARTIFACT_ARCHIVE_DIR=$STATE_DIR/artifacts
+  compose up -d --wait postgres redis
+  compose run --rm --no-deps role-bootstrap
+  compose run --rm --no-deps migrate
+  compose run --rm --no-deps seed-import
+  compose run --rm --no-deps identity-bootstrap
+  compose --profile owner run --rm --no-deps team-b-seed-import
+  compose --profile preview run --rm --no-deps dashboard-preview-seed
+  compose --profile preview run --rm --no-deps return-engine-preview-prepare
+}
+
+save_active_mode() {
+  local models=$1 mock=$2 automation=$3
+  printf 'MODELS=%s\nMOCK=%s\nAUTOMATION=%s\n' "$models" "$mock" "$automation" \
+    | write_state active-mode.env 0600
+}
+
+load_active_mode() {
+  MODELS=0
+  MOCK=0
+  AUTOMATION=0
+  if [[ -f $ACTIVE_MODE && ! -L $ACTIVE_MODE ]]; then
+    while IFS='=' read -r key value; do
+      [[ $value == 0 || $value == 1 ]] || die ACTIVE_MODE_INVALID
+      case $key in
+        MODELS) MODELS=$value ;;
+        MOCK) MOCK=$value ;;
+        AUTOMATION) AUTOMATION=$value ;;
+        *) die ACTIVE_MODE_INVALID ;;
+      esac
+    done < "$ACTIVE_MODE"
+  fi
+}
+
+remove_old_preview_containers() {
+  "$DOCKER_BIN" compose --project-name capstone-p1-preview -f "$COMPOSE_FILE" \
+    --profile preview --profile models --profile automation down --remove-orphans >/dev/null 2>&1 || true
+}
+
+stop_old_preview_containers() {
+  local ids=()
+  mapfile -t ids < <("$DOCKER_BIN" ps --quiet --filter label=com.docker.compose.project=capstone-p1-preview)
+  if ((${#ids[@]})); then
+    "$DOCKER_BIN" stop "${ids[@]}" >/dev/null
+  fi
+}
+
+# Bind provider activation to the exact source tree used by this runtime.
+bind_vertex_code_state() {
+  # 네 값이 모두 주어졌으면 그대로 쓴다. 레포를 받지 않고 이미지와 .env 만 가진 서버에는
+  # git 이력이 있을 이유가 없고, 그때 바인딩을 못 만들면 Vertex 가 꺼져 Agent 가 죽는다.
+  # 바인딩의 목적은 "이 런타임이 어떤 소스에서 왔는지 고정"이므로 릴리스에서는 운영자가
+  # 이미지와 함께 받은 값을 넣는 것이 같은 뜻이다.
+  if [[ -n ${P1_RAG_V2_VERTEX_HEAD_COMMIT:-} && -n ${P1_RAG_V2_VERTEX_TREE_DIGEST:-} &&
+        -n ${P1_RAG_V2_VERTEX_CI_DIGEST:-} && -n ${P1_RAG_V2_VERTEX_SECURITY_DIGEST:-} ]]; then
+    export P1_RAG_V2_VERTEX_HEAD_COMMIT P1_RAG_V2_VERTEX_TREE_DIGEST
+    export P1_RAG_V2_VERTEX_CI_DIGEST P1_RAG_V2_VERTEX_SECURITY_DIGEST
+    return 0
+  fi
+  command -v git >/dev/null 2>&1 || return 1
+  local head tree
+  head=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null) || return 1
+  tree=$(git -C "$REPO_ROOT" rev-parse 'HEAD^{tree}' 2>/dev/null) || return 1
+  export P1_RAG_V2_VERTEX_HEAD_COMMIT=${P1_RAG_V2_VERTEX_HEAD_COMMIT:-$head}
+  export P1_RAG_V2_VERTEX_TREE_DIGEST=${P1_RAG_V2_VERTEX_TREE_DIGEST:-$(printf '%s' "$tree" | sha256sum | cut -d' ' -f1)}
+  export P1_RAG_V2_VERTEX_CI_DIGEST=${P1_RAG_V2_VERTEX_CI_DIGEST:-$(sha256sum "$REPO_ROOT/.github/workflows/contracts-ci.yml" | cut -d' ' -f1)}
+  export P1_RAG_V2_VERTEX_SECURITY_DIGEST=${P1_RAG_V2_VERTEX_SECURITY_DIGEST:-$(sha256sum "$SCRIPT_DIR/docker/secret-entrypoint.sh" | cut -d' ' -f1)}
+}
+
+enable_rag_by_default() {
+  [[ -z ${P1_RAG_DEFAULT_DECIDED:-} ]] || return 0
+  export P1_RAG_DEFAULT_DECIDED=1
+  # Read only the runtime root; importing the full env would leak unrelated settings.
+  local root=${P1_RAG_RUNTIME_DIR:-}
+  [[ -n $root ]] || root=$(sed -n 's/^P1_RAG_RUNTIME_DIR=//p' "$RUNTIME_ENV" 2>/dev/null || true)
+  # Compose resolves this path relative to deploy/p1.
+  [[ $root != /* ]] && root=$SCRIPT_DIR/$root
+  local missing=()
+  [[ -n ${P1_RAG_V2_ENABLED:-} ]] && return 0
+  [[ -n $root && -d $root ]] || missing+=(runtime-root)
+  # 컨테이너가 control/ 을 0700 nonroot 로 다시 만들면 호스트 운영자는 안을 못 본다.
+  # 그때 아래 파일 검사가 "없음"으로 읽혀 RAG 가 조용히 꺼졌고, Agent 가 통째로 죽었다.
+  # 읽을 수 없는 것과 없는 것은 다르다. 검색 권한만 돌려주고 계속한다 - 파일 자체의
+  # 권한은 건드리지 않으므로 내용은 여전히 컨테이너만 읽는다.
+  if [[ -d $root/control && ! -x $root/control ]]; then
+    chmod o+rx "$root/control" 2>/dev/null ||
+      printf 'CAPSTONE_RAG_CONTROL_DIR=UNREADABLE path=%s
+' "$root/control"
+  fi
+  [[ -f $root/control/pre-s5-voyage-query-runtime.json ]] || missing+=(voyage-query-runtime)
+  [[ -f $root/artifacts/voyage-context-4/tokenizer.json ]] || missing+=(tokenizer)
+  grep -q '^VOYAGE_API_KEY=.' "$SECRETS_DIR/rag-v2.env" 2>/dev/null || missing+=(voyage-key)
+  if ((${#missing[@]})); then
+    export P1_RAG_V2_ENABLED=false
+    printf 'CAPSTONE_RAG_DEFAULT=OFF_MISSING_%s\n' "$(IFS=,; printf '%s' "${missing[*]}")"
+    return 0
+  fi
+  export P1_RAG_V2_ENABLED=true
+  # Retrieval can run without enabling external generation.
+  if [[ -z ${P1_RAG_V2_VERTEX_ENABLED:-} ]] && vertex_credentials_ready &&
+     [[ -f $root/control/pre-s5-vertex-auto-activation-policy.json ]] &&
+     bind_vertex_code_state; then
+    export P1_RAG_V2_VERTEX_ENABLED=true
+    export P1_RAG_V2_VERTEX_AUTO_ACTIVATION_ENABLED=${P1_RAG_V2_VERTEX_AUTO_ACTIVATION_ENABLED:-true}
+    printf 'CAPSTONE_RAG_DEFAULT=ON_WITH_GENERATION\n'
+  else
+    printf 'CAPSTONE_RAG_DEFAULT=ON_RETRIEVAL_ONLY\n'
+  fi
+}
+
+enable_strong_llm_by_default() {
+  [[ -n ${P1_STRONG_LLM_ENABLED:-} ]] && return 0
+  if vertex_credentials_ready &&
+     grep -q '^STRONG_LLM_GRPC_SHARED_SECRET=.' "$SECRETS_DIR/rag-v2.env" 2>/dev/null; then
+    export P1_STRONG_LLM_ENABLED=true
+    if [[ -z ${P1_GOOGLE_BILLING_ACCOUNT_FINGERPRINT:-} ]]; then
+      P1_GOOGLE_BILLING_ACCOUNT_FINGERPRINT=$(vertex_account_fingerprint)
+      export P1_GOOGLE_BILLING_ACCOUNT_FINGERPRINT
+    fi
+  else
+    export P1_STRONG_LLM_ENABLED=false
+  fi
+}
+
+# Read only explicitly requested keys from the single operator-edited root .env.
+# Never source the file as shell code and never print the value beyond command capture.
+root_env_value() {
+  python3 - "$REPO_ROOT/.env" "$1" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+key = sys.argv[2]
+if path.is_symlink() or not path.is_file() or stat.S_IMODE(path.stat().st_mode) != 0o600:
+    raise SystemExit(1)
+matches = []
+for line in path.read_text(encoding="utf-8").splitlines():
+    if line.partition("=")[0] == key:
+        _, separator, value = line.partition("=")
+        if not separator:
+            raise SystemExit(1)
+        matches.append(value)
+if len(matches) != 1 or not matches[0]:
+    raise SystemExit(1)
+sys.stdout.write(matches[0])
+PY
+}
+
+vertex_account_fingerprint() {
+  local encoded
+  encoded=$(root_env_value MARS_VERTEX_SERVICE_ACCOUNT_JSON_B64) || return 1
+  P1_VERTEX_CREDENTIAL_B64="$encoded" python3 - <<'PY'
+import base64
+import hashlib
+import json
+import os
+import re
+
+encoded = os.environ["P1_VERTEX_CREDENTIAL_B64"]
+try:
+    data = base64.b64decode(encoded, validate=True)
+    identity = json.loads(data)
+except (ValueError, json.JSONDecodeError):
+    raise SystemExit(1)
+project_id = identity.get("project_id") if isinstance(identity, dict) else None
+if (
+    not isinstance(identity, dict)
+    or base64.b64encode(data).decode("ascii") != encoded
+    or identity.get("type") != "service_account"
+    or not identity.get("private_key")
+    or not isinstance(project_id, str)
+    or re.fullmatch(r"[a-z][a-z0-9-]{4,62}[a-z0-9]", project_id) is None
+):
+    raise SystemExit(1)
+print(hashlib.sha256(data).hexdigest())
+PY
+}
+
+vertex_credentials_ready() {
+  local fingerprint
+  fingerprint=$(vertex_account_fingerprint) || return 1
+  [[ $fingerprint =~ ^[0-9a-f]{64}$ ]]
+}
+
+up_app() {
+  local models=0 mock=0
+  while (($#)); do
+    case $1 in
+      --models) models=1 ;;
+      --mock) mock=1 ;;
+      *) die UNEXPECTED_ARGUMENT ;;
+    esac
+    shift
+  done
+  if ((mock)); then
+    mock_certified || die KIS_MOCK_NOT_CERTIFIED
+  fi
+  # 운영자가 정하는 플래그는 상태 파일에 있고 compose 는 --env-file 로 읽는다. 그런데 이
+  # 스크립트는 셸 환경에서만 읽으므로, 값을 주지 않고 부르면 :-false 로 떨어져 수집기를
+  # 내려 버린다. 셸 값이 있으면 그것이 이기고, 없을 때만 상태 파일을 따른다.
+  if [[ -z ${GDELT_WORLD_NEWS_ENABLED:-} && -f $RUNTIME_ENV && ! -L $RUNTIME_ENV ]]; then
+    GDELT_WORLD_NEWS_ENABLED=$(sed -n 's/^GDELT_WORLD_NEWS_ENABLED=//p' "$RUNTIME_ENV")
+  fi
+  export P1_KIS_MOCK_ONLINE_ENABLED=$([[ $mock == 1 ]] && printf true || printf false)
+  export P1_KIS_OFFLINE=$([[ $mock == 1 ]] && printf 0 || printf 1)
+  # Runtime availability and order authorization remain separate gates.
+  export P1_AUTOMATION_RUNTIME_ENABLED=$([[ $mock == 1 ]] && printf true || printf false)
+  require_command openssl
+  require_command python3
+  [[ -n $DOCKER_BIN ]] || die MISSING_COMMAND_docker
+  "$DOCKER_BIN" compose version >/dev/null 2>&1 || die DOCKER_COMPOSE_UNAVAILABLE
+  build_core_images
+  initialize_state
+  build_team_images
+  compose --profile preview --profile models config --quiet
+  run_initializers
+  if ((models)); then
+    compose --profile models pull bge-m3 paddleocr-vl
+    compose --profile models run --rm --no-deps paddleocr-vl-model-fetch
+    compose --profile models up -d --wait bge-m3 paddleocr-vl
+  else
+    # Preserve model volumes while removing inactive containers.
+    compose --profile models stop bge-m3 paddleocr-vl >/dev/null 2>&1 || true
+    compose --profile models rm --force bge-m3 paddleocr-vl >/dev/null 2>&1 || true
+  fi
+  # The daily collector runs only with the automation profile.
+  if ((mock)); then
+    compose --profile automation up -d --wait market-data-daily
+  else
+    compose --profile automation stop market-data-daily >/dev/null 2>&1 || true
+    compose --profile automation rm --force market-data-daily >/dev/null 2>&1 || true
+  fi
+  if [[ ${GDELT_WORLD_NEWS_ENABLED:-false} == true ]]; then
+    compose --profile automation up -d --wait world-news-minute
+  else
+    compose --profile automation stop world-news-minute >/dev/null 2>&1 || true
+    compose --profile automation rm --force world-news-minute >/dev/null 2>&1 || true
+  fi
+  # Stop the preview immediately before binding the production host ports.
+  stop_old_preview_containers
+  compose up -d --wait actor-authority decision-platform experience-dashboard
+  local calendar_seed
+  # Calendar seed failures are reported without taking down the core stack.
+  calendar_seed=$(compose --profile owner run --rm --no-deps calendar-offline-seed 2>&1 \
+    | grep -E '^P1_CALENDAR_OFFLINE_SEED=' | tail -1) || true  # 캡처한 표식을 지우지 않는다. 사유가 사라진다
+  printf '%s\n' "${calendar_seed:-P1_CALENDAR_OFFLINE_SEED=NO_OUTPUT}"
+  # An already populated calendar is a healthy state.
+  case $calendar_seed in
+    P1_CALENDAR_OFFLINE_SEED=SEEDED*) printf 'CAPSTONE_TRADING_CALENDAR=SEEDED\n' ;;
+    P1_CALENDAR_OFFLINE_SEED=NO_SESSIONS*alreadyPresent=0\ *)
+      printf 'CAPSTONE_TRADING_CALENDAR=UNAVAILABLE\n' ;;
+    P1_CALENDAR_OFFLINE_SEED=NO_SESSIONS*) printf 'CAPSTONE_TRADING_CALENDAR=PRESENT\n' ;;
+    *) printf 'CAPSTONE_TRADING_CALENDAR=UNAVAILABLE\n' ;;
+  esac
+  unset calendar_seed
+  # Source registration is reported separately from core startup.
+  local rag_sources_seed
+  rag_sources_seed=$(compose --profile owner run --rm --no-deps rag-source-register 2>&1 \
+    | grep -E '"sourceCount"' | tail -1) || true  # 캡처한 표식을 지우지 않는다. 사유가 사라진다
+  if [[ -n $rag_sources_seed ]]; then
+    printf 'CAPSTONE_RAG_SOURCE_REGISTRY=REGISTERED\n'
+  else
+    printf 'CAPSTONE_RAG_SOURCE_REGISTRY=UNAVAILABLE\n'
+  fi
+  unset rag_sources_seed
+  # 뉴스 거부권의 근거 코퍼스를 채운다. 이것이 비어 있으면 근거가 0개가 되고 거부권이
+  # 조용히 ABSTAIN 한다 - 그 상태가 2026-09-04 에 거부권을 자문으로 격하시킨 원인이다.
+  # provider 호출이 있는 유일한 up 단계이므로 결과를 표식으로 남기고 실패해도 up 을
+  # 멈추지 않는다. 근거가 없으면 자동운용은 거부권 없이 도는 것이 아니라 ABSTAIN 한다.
+  local disclosure_events
+  disclosure_events=$(compose --profile owner run --rm --no-deps disclosure-collector 2>&1 \
+    | grep -E '^P1_DISCLOSURE_EVENTS=' | tail -1) || true  # 캡처한 표식을 지우지 않는다. 사유가 사라진다
+  printf '%s\n' "${disclosure_events:-P1_DISCLOSURE_EVENTS=NO_OUTPUT}"
+  case $disclosure_events in
+    P1_DISCLOSURE_EVENTS=ADOPTED*) printf 'CAPSTONE_DISCLOSURE_CORPUS=COLLECTED\n' ;;
+    P1_DISCLOSURE_EVENTS=SKIPPED*) printf 'CAPSTONE_DISCLOSURE_CORPUS=OFFLINE\n' ;;
+    *) printf 'CAPSTONE_DISCLOSURE_CORPUS=UNAVAILABLE\n' ;;
+  esac
+  unset disclosure_events
+  # 설정 주입은 이미지 안에 있다 - 레포 없는 서버에도 이 단계가 있어야 자동운용이
+  # POLICY_NOT_CONFIGURED 로 막히지 않는다. 프로필이 없으면 건너뛴다(운영자가 화면에서 넣는다).
+  local deploy_bootstrap
+  deploy_bootstrap=$(compose --profile owner run --rm --no-deps deploy-bootstrap 2>&1 \
+    | grep -E '^P1_DEPLOY_BOOTSTRAP=' | tail -1) || true  # 캡처한 표식을 지우지 않는다. 사유가 사라진다
+  printf '%s\n' "${deploy_bootstrap:-P1_DEPLOY_BOOTSTRAP=NO_OUTPUT}"
+  unset deploy_bootstrap
+  replay_history
+  demo_history seed
+  # A failed public-price refresh is recorded as stale and never calls KIS orders.
+  local daily_refresh
+  daily_refresh=$(compose --profile owner run --rm --no-deps market-data-cli \
+    python -m app.data.market_data.yfinance_daily_cli 2>&1 \
+    | grep -E '^P1_MARKET_DATA_YF_REFRESH=' | tail -1) || true  # 캡처한 표식을 지우지 않는다. 사유가 사라진다
+  printf '%s\n' "${daily_refresh:-P1_MARKET_DATA_YF_REFRESH=NO_OUTPUT}"
+  case $daily_refresh in
+    P1_MARKET_DATA_YF_REFRESH=ADOPTED*|P1_MARKET_DATA_YF_REFRESH=UP_TO_DATE*)
+      printf 'CAPSTONE_MARKET_DATA_DAILY=FRESH\n' ;;
+    *)
+      printf 'CAPSTONE_MARKET_DATA_DAILY=STALE\n' ;;
+  esac
+  unset daily_refresh
+  local scenario_materialization
+  scenario_materialization=$(compose --profile owner run --rm --no-deps owner-scenario-materializer 2>&1 \
+    | tail -1) || true  # 캡처한 표식을 지우지 않는다. 사유가 사라진다
+  # 개수를 등식으로 보면 거래일이 하나 늘 때마다 이 게이트가 거짓이 된다. 평가 구간은
+  # 데이터에서 유도되므로(V154) 하한으로 본다 - 자라는 것은 허용하고 줄어드는 것은 막는다.
+  local scenario_sessions scenario_evaluation
+  scenario_sessions=$(printf '%s' "$scenario_materialization" \
+    | sed -n 's/.*"sessions":\([0-9]\{1,\}\).*/\1/p')
+  scenario_evaluation=$(printf '%s' "$scenario_materialization" \
+    | sed -n 's/.*"evaluationSessions":\([0-9]\{1,\}\).*/\1/p')
+  if [[ $scenario_materialization == *'"providerCalls":0'* &&
+        -n $scenario_sessions && $scenario_sessions -ge 104 &&
+        -n $scenario_evaluation && $scenario_evaluation -ge 13 ]]; then
+    printf 'CAPSTONE_OWNER_SCENARIOS=MATERIALIZED sessions=%s evaluationSessions=%s\n' \
+      "$scenario_sessions" "$scenario_evaluation"
+  else
+    printf 'CAPSTONE_OWNER_SCENARIOS=UNAVAILABLE\n'
+  fi
+  unset scenario_materialization scenario_sessions scenario_evaluation
+  # Preserve the stored automation intent across KIS Mock restarts.
+  local desired_automation=0
+  load_active_mode
+  ((mock)) && desired_automation=$AUTOMATION
+  save_active_mode "$models" "$mock" "$desired_automation"
+  # Base stack: five services; models add two and mock adds one.
+  local expected=5
+  ((models)) && expected=$((expected + 2))
+  ((mock)) && expected=$((expected + 1))
+  # world-news 수집기는 자체 플래그로 뜬다. 세지 않으면 켜진 스택에서 이 검사가 죽는다.
+  [[ ${GDELT_WORLD_NEWS_ENABLED:-false} == true ]] && expected=$((expected + 1))
+  local running
+  running=$(compose ps --status running --services | wc -l | tr -d ' ')
+  [[ $running == "$expected" ]] || die "CONTAINER_COUNT_EXPECTED_${expected}_OBSERVED_${running}"
+  remove_old_preview_containers
+  printf 'CAPSTONE_UP=PASS\nCAPSTONE_PERSISTENT_CONTAINERS=%s\n' "$running"
+  printf 'CAPSTONE_DASHBOARD_URL=http://127.0.0.1:%s\n' "${P1_DASHBOARD_PORT:-3000}"
+  printf 'CAPSTONE_API_URL=http://127.0.0.1:%s\n' "${P1_API_PORT:-18080}"
+  if ((mock)); then
+    printf 'KIS_BROKERAGE_MODE=KIS_MOCK\n'
+  else
+    printf 'KIS_BROKERAGE_MODE=PROVIDER_FREE\n'
+  fi
+  reconcile_automation_intent "$desired_automation"
+}
+
+reconcile_automation_intent() {
+  local desired=${1:-0} output status=0
+  if ((desired == 0)); then
+    printf 'CAPSTONE_AUTOMATION_RECONCILED=DISARMED_BY_INTENT\n'
+    return 0
+  fi
+  output=$(mock_start 2>&1) || status=$?
+  if ((status == 0)); then
+    printf '%s\n' "$output"
+    printf 'CAPSTONE_AUTOMATION_RECONCILED=ARMED\n'
+    reconcile_ai_judgement
+    return 0
+  fi
+  printf '%s\n' "${output:-(no output)}"
+  printf 'CAPSTONE_AUTOMATION_RECONCILED=BLOCKED\n'
+  return 0
+}
+
+# AI 후보 심사가 켜져 있는지 확인하고, 꺼져 있으면 켠다.
+#
+# 이것은 기본 정책이다 - 배포할 때마다 되살아나야 한다. 설정이 꺼진 채로 조용히 돌면
+# 화면에는 "LLM 후보 검토"가 있는데 실제 판정에는 AI 가 참여하지 않고, 그 차이가
+# judgeCallCount 를 세어 보기 전까지 드러나지 않는다.
+#
+# 실패해도 배포를 멈추지 않는다. AI 심사는 매수를 **막을 수만** 있고(veto-only) 호출
+# 실패는 ABSTAIN 으로 통과하므로, 이것이 꺼져 있다고 해서 자동매매가 위험해지지 않는다.
+# 배포를 세우는 쪽이 훨씬 나쁘다. 대신 무슨 일이 있었는지는 마커로 남긴다.
+reconcile_ai_judgement() {
+  local base enabled
+  base="http://127.0.0.1:$(sed -n 's/^P1_API_PORT=//p' "$RUNTIME_ENV")"
+  enabled=$(compose exec -T postgres psql -U postgres -d capstone_p1 -At \
+    -c "select ai_judgement_enabled from strong_llm_owner_settings where owner_user_id='usr_demo_user'" \
+    2>/dev/null | tr -d '\r') || {
+    printf 'CAPSTONE_AI_JUDGEMENT=BLOCKED reason=SETTINGS_UNREADABLE\n'
+    return 0
+  }
+  if [[ $enabled == t ]]; then
+    printf 'CAPSTONE_AI_JUDGEMENT=ENABLED\n'
+    return 0
+  fi
+  if P1_BASE_URL=$base P1_USER_PASSWORD_FILE=$SECRETS_DIR/demo-user.password python3 - <<'PY'
+import json, os, urllib.request
+
+# 한 칸만 바꾸는 것이 목적이지만 이 엔드포인트는 설정 전체를 받는다. 지금 값을 읽어 오는
+# 조회 API 가 따로 없으므로, 이 스택이 쓰는 고정값을 그대로 다시 넣는다. 사람이 설정 화면에서
+# AI 심사만 켤 때 프런트가 보내는 것과 같은 본문이다.
+base = os.environ["P1_BASE_URL"]
+password = open(os.environ["P1_USER_PASSWORD_FILE"], encoding="utf-8").read()
+login = urllib.request.Request(
+    base + "/api/v1/auth/login",
+    data=json.dumps({"username": "demo-user", "password": password}).encode(),
+    headers={"Content-Type": "application/json"},
+)
+with urllib.request.urlopen(login, timeout=5) as response:
+    token = json.load(response)["data"]["accessToken"]
+settings = urllib.request.Request(
+    base + "/api/v2/strong-llm/settings",
+    method="PUT",
+    data=json.dumps(
+        {
+            "provider": "vertex",
+            "modelId": "gemini-3.5-flash",
+            "answerLanguage": "ko",
+            "dailyGenerateCallCap": 50,
+            "aiJudgementEnabled": True,
+            "thinkingLevel": "low",
+        }
+    ).encode(),
+    headers={"Content-Type": "application/json", "Authorization": "Bearer " + token},
+)
+with urllib.request.urlopen(settings, timeout=5) as response:
+    if response.status != 200:
+        raise SystemExit(1)
+PY
+  then
+    printf 'CAPSTONE_AI_JUDGEMENT=RESTORED\n'
+  else
+    printf 'CAPSTONE_AI_JUDGEMENT=BLOCKED reason=PUT_FAILED\n'
+  fi
+  return 0
+}
+
+doctor() {
+  require_command docker
+  require_command openssl
+  require_command python3
+  "$DOCKER_BIN" compose version >/dev/null 2>&1 || die DOCKER_COMPOSE_UNAVAILABLE
+  compose --profile preview --profile models config --quiet
+  printf 'CAPSTONE_DOCTOR=PASS\n'
+}
+
+status() {
+  state_ready || die NOT_INITIALIZED
+  load_active_mode
+  compose --profile models ps
+  printf 'CAPSTONE_ACTIVE_MODELS=%s\nCAPSTONE_ACTIVE_MOCK=%s\nCAPSTONE_ACTIVE_AUTOMATION=%s\n' \
+    "$MODELS" "$MOCK" "$AUTOMATION"
+}
+
+logs() {
+  state_ready || die NOT_INITIALIZED
+  compose --profile models logs --no-color --tail 500 | sed -E \
+    -e 's/(Bearer )[A-Za-z0-9._~-]+/\1[REDACTED]/g' \
+    -e 's#(postgresql://[^:/[:space:]]+:)[^@/[:space:]]+@#\1[REDACTED]@#Ig' \
+    -e 's/(password|secret|token|account|credential|bundle|hmac|jwt|private[_-]?key|kek|dsn)([=:][^ ,}]*)/\1=[REDACTED]/Ig'
+}
+
+smoke() {
+  state_ready || die NOT_INITIALIZED
+  require_command python3
+  local base="http://127.0.0.1:$(sed -n 's/^P1_API_PORT=//p' "$RUNTIME_ENV")"
+  P1_BASE_URL=$base P1_USER_PASSWORD_FILE=$SECRETS_DIR/demo-user.password python3 - <<'PY'
+import json, os, urllib.request
+with urllib.request.urlopen(os.environ["P1_BASE_URL"] + "/actuator/health", timeout=5) as response:
+    if response.status != 200 or json.load(response).get("status") != "UP":
+        raise SystemExit("CAPSTONE_ERROR=API_HEALTH")
+password = open(os.environ["P1_USER_PASSWORD_FILE"], encoding="utf-8").read()
+request = urllib.request.Request(
+    os.environ["P1_BASE_URL"] + "/api/v1/auth/login",
+    data=json.dumps({"username": "demo-user", "password": password}).encode(),
+    headers={"Content-Type": "application/json"},
+)
+with urllib.request.urlopen(request, timeout=5) as response:
+    body = json.load(response)
+if response.status != 200 or body.get("data", {}).get("user", {}).get("userId") != "usr_demo_user":
+    raise SystemExit("CAPSTONE_ERROR=LOGIN_SMOKE")
+PY
+  compose --profile smoke run --rm --no-deps -e P1_SMOKE_MODE=DB synthetic-async-smoke
+  automation_runtime_drift
+  printf 'CAPSTONE_SMOKE=PASS\nPROVIDER_CALLS=0\n'
+}
+
+# DB 의 자동매매 의도와 실제로 도는 프로세스를 대조한다.
+#
+# 실제 사고: decision-platform 을 up_app 밖에서 재생성하니 런타임 플래그가 사라져
+# automation_runtime 프로세스가 없는데 control 은 ARMED 로 남았다. 자동매매가 켜져 있다고
+# 표시되는데 구동할 프로세스가 없는 상태이고, 예약 시각에 아무 일도 일어나지 않으면서 로그에도
+# blocker 에도 흔적이 남지 않는다.
+#
+# 플래그를 보지 않고 의도와 실제를 대조하는 것이 핵심이다 - 어느 경로로 재생성했든 잡힌다.
+automation_runtime_drift() {
+  local state
+  state=$(compose exec -T postgres psql -U postgres -d capstone_p1 -At \
+    -c "select control_state from automation_control limit 1" 2>/dev/null | tr -d '\r') || return 0
+  [[ $state == ARMED ]] || {
+    printf 'CAPSTONE_AUTOMATION_RUNTIME=NOT_REQUIRED_CONTROL_%s\n' "${state:-UNKNOWN}"
+    return 0
+  }
+  if compose exec -T decision-platform ps -o args 2>/dev/null \
+    | grep -q 'app\.p1_owner\.automation_runtime'; then
+    printf 'CAPSTONE_AUTOMATION_RUNTIME=RUNNING\n'
+    return 0
+  fi
+  printf 'CAPSTONE_AUTOMATION_RUNTIME=MISSING_WHILE_ARMED\n' >&2
+  die AUTOMATION_RUNTIME_MISSING_WHILE_ARMED
+}
+
+team_a_acceptance() {
+  state_ready || die NOT_INITIALIZED
+  require_command npm
+  upgrade_state
+  load_active_mode
+  [[ $MOCK == 0 ]] || die TEAM_A_ACCEPTANCE_REQUIRES_PROVIDER_FREE_MODE
+  compose ps --status running --services | grep -qx postgres || die TEAM_A_ACCEPTANCE_POSTGRES_NOT_RUNNING
+  compose ps --status running --services | grep -qx decision-platform || die TEAM_A_ACCEPTANCE_API_NOT_RUNNING
+  compose ps --status running --services | grep -qx experience-dashboard || die TEAM_A_ACCEPTANCE_DASHBOARD_NOT_RUNNING
+  local fixed_clock
+  fixed_clock=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  export P1_TEAM_A_ACCEPTANCE_ENABLED=true
+  export P1_TEAM_A_ACCEPTANCE_FIXED_CLOCK=$fixed_clock
+  local result=0 restore_result=0 runtime_restore_result=0
+  if ! compose up -d --force-recreate --no-deps --wait decision-platform; then
+    result=1
+  fi
+  if [[ $result == 0 ]] && ! compose --profile preview run --rm --no-deps dashboard-preview-seed; then
+    result=1
+  fi
+  if [[ $result == 0 ]] && ! compose --profile acceptance run --rm --no-deps team-a-acceptance-seed; then
+    result=1
+  fi
+  if [[ $result == 0 ]] && ! P1_DASHBOARD_URL="http://127.0.0.1:${P1_DASHBOARD_PORT:-3000}" \
+    P1_USER_PASSWORD_FILE="$SECRETS_DIR/demo-user.password" \
+    P1_ADMIN_PASSWORD_FILE="$SECRETS_DIR/demo-admin.password" \
+    npm --prefix "$REPO_ROOT/workspaces/experience-dashboard" run test:e2e:owner-acceptance; then
+    result=$?
+    [[ $result != 0 ]] || result=1
+  fi
+  if ! compose --profile acceptance run --rm --no-deps team-a-acceptance-seed \
+    python -m app.p1_owner.team_a_acceptance_seed restore; then
+    restore_result=$?
+    [[ $restore_result != 0 ]] || restore_result=1
+  fi
+  unset P1_TEAM_A_ACCEPTANCE_ENABLED P1_TEAM_A_ACCEPTANCE_FIXED_CLOCK fixed_clock
+  if ! compose up -d --force-recreate --no-deps --wait decision-platform; then
+    runtime_restore_result=1
+  fi
+  [[ $result == 0 && $restore_result == 0 && $runtime_restore_result == 0 ]] || die TEAM_A_ACCEPTANCE_FAILED
+  printf 'OWNER_TEAM_A_BACKEND_PREREQUISITES=PASS\n'
+  printf 'OWNER_POST_TEAM_A_BACKEND_CODE_REQUIRED=0\n'
+  # 검증이 쓰는 catalog 에서 읽는다. 상수로 두면 catalog 가 늘어날 때 영수증만 옛 수를
+  # 찍고, 그 수가 곧 사람이 증거로 인용하는 값이 된다.
+  local acceptance_catalog acceptance_count
+  acceptance_catalog="$REPO_ROOT/contracts/catalogs/p1-team-a-acceptance.v5.json"
+  acceptance_count=$(python3 -c 'import json,sys
+print(json.load(open(sys.argv[1]))["acceptanceOperationCount"])' "$acceptance_catalog")
+  printf 'TEAM_A_ACCEPTANCE_OPERATION_COUNT=%s\n' "$acceptance_count"
+  printf 'PLAYWRIGHT_SKIP=0\nFRONTEND_FAKE_PRODUCTION_RESPONSE=0\nPROVIDER_CALLS=0\n'
+}
+
+down() {
+  state_ready || die NOT_INITIALIZED
+  # automation 프로파일까지 넘긴다. `up --mock` 이 띄우는 market-data-daily 가 이 프로파일에
+  # 있어서, 빠뜨리면 컨테이너가 남고 다음 네트워크 제거가 "Resource is still in use" 로
+  # 실패한다. 스택을 갈아 끼울 때마다 손으로 치우게 되던 자리다.
+  compose --profile preview --profile models --profile automation down --remove-orphans
+  printf 'CAPSTONE_DOWN=PASS\nCAPSTONE_VOLUMES_PRESERVED=TRUE\n'
+}
+
+# Compute signals in the application container and persist them through the isolated seed role.
+replay_history() {
+  local start=${P1_HISTORY_REPLAY_START:-2026-08-18}
+  local end=${P1_HISTORY_REPLAY_END:-}
+  if [[ -z $end ]]; then
+    end=$(date -d 'yesterday' +%F 2>/dev/null || date +%F)
+  fi
+  # The non-root seed container requires group-readable replay input.
+  install -d -m 0750 -g "${P1_SECRET_GID:-$(id -g)}" "$STATE_DIR/replay" 2>/dev/null \
+    || install -d -m 0750 "$STATE_DIR/replay"
+  local signals=$STATE_DIR/replay/signals.json
+  # compose exec bypasses the entrypoint, so load only the required runtime secrets.
+  if ! compose exec -T decision-platform sh -c \
+      'set -a; . /run/secrets/automation_runtime_env; . /run/secrets/return_inference_env; set +a;
+       exec python -m app.p1_owner.history_replay_signals --start "$0" --end "$1" --out -' \
+      "$start" "$end" > "$signals" 2>/dev/null; then
+    rm -f "$signals"
+    printf 'CAPSTONE_HISTORY_REPLAY=SIGNALS_UNAVAILABLE\n'
+    return 0
+  fi
+  chmod 0640 "$signals"
+  local seeded
+  seeded=$(compose --profile owner run --rm --no-deps history-replay-seed 2>&1 \
+    | grep -E '^P1_HISTORY_REPLAY=' | tail -1) || true  # 캡처한 표식을 지우지 않는다. 사유가 사라진다
+  if [[ -n $seeded ]]; then
+    printf '%s\n' "$seeded"
+    printf 'CAPSTONE_HISTORY_REPLAY=SEEDED\n'
+  else
+    printf 'CAPSTONE_HISTORY_REPLAY=UNAVAILABLE\n'
+  fi
+}
+
+mock_configure() {
+  state_ready || die RUN_CAPSTONE_UP_FIRST
+  install -d -m 0700 "$STATE_DIR/mock"
+  local app_key app_secret account_no
+  read -r -s -p 'KIS 모의투자 App Key: ' app_key; printf '\n'
+  read -r -s -p 'KIS 모의투자 App Secret: ' app_secret; printf '\n'
+  read -r -s -p 'KIS 모의투자 계좌번호(하이픈 제외): ' account_no; printf '\n'
+  [[ $app_key =~ ^[^[:space:]]{8,256}$ && $app_secret =~ ^[^[:space:]]{8,512}$ && $account_no =~ ^[0-9]{10}$ ]] \
+    || die KIS_MOCK_CREDENTIAL_FORMAT
+  account_no="${account_no:0:8}-${account_no:8:2}"
+  local bound_account reference_key
+  # 바인딩 계좌 id 는 자동운용이 쓰는 계좌와 같아야 한다. 무작위로 만들면 그 id 가 DB 어디에도
+  # 없어 두 경계가 서로 다른 계좌를 요구하는 교착이 된다 - Spring 의 getOwnedBuyable 은
+  # findOwnedBalance 로 자기 저장소에 있는 계좌를 찾고(없으면 OrderNotFound), python 게이트웨이는
+  # KIS_MOCK_BOUND_ACCOUNT_ID 에 묶인 계좌만 받는다(아니면 PERMISSION_DENIED). 실측으로 그
+  # 교착 때문에 ORDER_SIZING 이 매번 닫혔고, KIS_MOCK 자동매매가 한 번도 주문에 도달하지 못했다.
+  #
+  # 이 id 는 KIS 자격증명이 아니다. app key/secret/계좌번호와 무관한 식별자이므로 여기서
+  # 운용 계좌에 맞춰도 자격증명 재발급이 필요하지 않다.
+  bound_account=$(compose exec -T postgres psql -U postgres -d capstone_p1 -At \
+    -c 'select account_id from automation_control limit 1' 2>/dev/null | tr -d '[:space:]')
+  if [[ ! $bound_account =~ ^acct_[0-9a-f]{32}$ ]]; then
+    die KIS_MOCK_BOUND_ACCOUNT_REQUIRES_AUTOMATION_CONTROL
+  fi
+  reference_key=$(openssl rand -base64 32 | tr '+/' '-_' | tr -d '\n')
+  printf 'KIS_MOCK_CONFIGURED=true\nKIS_MOCK_APP_KEY=%s\nKIS_MOCK_APP_SECRET=%s\nKIS_MOCK_ACCOUNT_NO=%s\nKIS_MOCK_BOUND_ACCOUNT_ID=%s\nKIS_MOCK_ORDER_REFERENCE_KEY=%s\nKIS_BROKERAGE_TOKEN_P_PHYSICAL_CAP=1\nKIS_BROKERAGE_PHYSICAL_CAP=32\n' \
+    "$app_key" "$app_secret" "$account_no" "$bound_account" "$reference_key" \
+    | write_state secrets/kis-mock.env 0640
+  unset app_key app_secret account_no reference_key
+  printf 'KIS_MOCK_CONFIGURE=PASS\nKIS_MOCK_BOUND_ACCOUNT_ID=%s\n' "$bound_account"
+}
+
+mock_doctor() {
+  state_ready || return 1
+  local file=$SECRETS_DIR/kis-mock.env
+  [[ -f $file && ! -L $file && $(stat -c '%a' "$file") == 640 ]] || return 1
+  if ! python3 - "$file" 2>/dev/null <<'PY'
+import pathlib, re, sys
+values={}
+for line in pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines():
+    if not line or line.startswith("#") or "=" not in line:
+        continue
+    key, value=line.split("=", 1)
+    if key in values:
+        raise SystemExit(1)
+    values[key]=value
+required={"KIS_MOCK_CONFIGURED","KIS_MOCK_APP_KEY","KIS_MOCK_APP_SECRET","KIS_MOCK_ACCOUNT_NO","KIS_MOCK_BOUND_ACCOUNT_ID","KIS_MOCK_ORDER_REFERENCE_KEY","KIS_BROKERAGE_TOKEN_P_PHYSICAL_CAP","KIS_BROKERAGE_PHYSICAL_CAP"}
+assert set(values) == required
+assert values["KIS_MOCK_CONFIGURED"] == "true"
+assert 8 <= len(values["KIS_MOCK_APP_KEY"]) <= 256
+assert 8 <= len(values["KIS_MOCK_APP_SECRET"]) <= 512
+assert re.fullmatch(r"[0-9]{8}-[0-9]{2}", values["KIS_MOCK_ACCOUNT_NO"])
+assert re.fullmatch(r"acct_[0-9a-f]{32}", values["KIS_MOCK_BOUND_ACCOUNT_ID"])
+assert re.fullmatch(r"[A-Za-z0-9_-]{43}=", values["KIS_MOCK_ORDER_REFERENCE_KEY"])
+assert values["KIS_BROKERAGE_TOKEN_P_PHYSICAL_CAP"] == "1"
+assert values["KIS_BROKERAGE_PHYSICAL_CAP"] == "32"
+PY
+  then
+    return 1
+  fi
+  printf 'KIS_MOCK_CONFIGURATION_DOCTOR=PASS\nKIS_LIVE_BROKERAGE=DISABLED\n'
+}
+
+mock_certified() {
+  mock_doctor >/dev/null || return 1
+  local request=$STATE_DIR/mock/certification-request.json
+  local receipt=$STATE_DIR/mock/certification.json
+  if ! python3 "$MOCK_CERTIFICATION_GUARD" \
+    --repository-root "$REPO_ROOT" --request "$request" --receipt "$receipt"; then
+    return 1
+  fi
+  printf 'KIS_MOCK_DOCTOR=PASS\nKIS_LIVE_BROKERAGE=DISABLED\n'
+}
+
+mock_certify() {
+  local symbol= quantity=
+  while (($#)); do
+    case $1 in
+      --symbol) symbol=${2:-}; shift ;;
+      --quantity) quantity=${2:-}; shift ;;
+      *) die UNEXPECTED_ARGUMENT ;;
+    esac
+    shift
+  done
+  [[ $symbol == 005930 && $quantity == 1 ]] || die KIS_MOCK_CERTIFICATION_SCOPE
+  state_ready || die NOT_INITIALIZED
+  # XKRX 휴장일과 09:10~15:00 수동 실행창을 credential/transport 생성보다 먼저 닫는다.
+  compose run --rm --no-deps --entrypoint python decision-platform \
+    -m app.brokerage.kis_mock_certification_gate || return $?
+  mock_doctor >/dev/null || die KIS_MOCK_NOT_CONFIGURED
+  # 인증을 CI에 묶던 네 조건(clean worktree·브랜치 접두사·HEAD==origin·PR 초록)은
+  # 제거했다. 남은 것은 거래시간 창, --symbol/--quantity scope, 물리 호출 캡이다.
+  # 영수증은 그대로 만들어지고 자동운용 arm의 열쇠 역할도 그대로지만, 이 인증이
+  # 검증된 코드에서 나왔다는 주장은 더 이상 하지 않는다. 영수증이 말하는 것은
+  # 그 시각 KIS 모의 원장에서 왕복이 실제로 일어났다는 사실뿐이다.
+  require_command gh
+  local branch head pr_json
+  branch=$(git -C "$REPO_ROOT" symbolic-ref --quiet --short HEAD) \
+    || die KIS_MOCK_CERTIFICATION_DETACHED_HEAD
+  head=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || printf '%040d' 0)
+  # PR 의 검사 6종을 보던 자리를 로컬 게이트 영수증으로 바꾼다. gh 와 살아 있는 PR 이
+  # 없으면 인증을 못 받던 제약을 없애면서 "검사가 초록이었다"는 보장은 유지한다.
+  gate_receipt=${P1_GATE_RECEIPT_FILE:-$STATE_DIR/gates/gate-receipt.json}
+  [[ -f $gate_receipt ]] || die KIS_MOCK_CERTIFICATION_GATE_RECEIPT_MISSING
+  certified_image=$(python3 "$SCRIPT_DIR/gate_receipt_image.py" "$gate_receipt") \n    || die KIS_MOCK_CERTIFICATION_GATE_RECEIPT_INVALID
+  rm -f -- "$STATE_DIR/mock/certification-request.json" \
+    "$STATE_DIR/mock/execution-approval.json" "$STATE_DIR/mock/certification.json"
+  # approval latch reader는 owner-only 파일만 받는데 kis-mock.env는 decision-platform과
+  # 공유하느라 group-readable이어야 한다. API credential은 빼고 latch 두 값만 별도 파일로 준다.
+  grep -E '^(KIS_MOCK_BOUND_ACCOUNT_ID|KIS_MOCK_ORDER_REFERENCE_KEY)=' "$SECRETS_DIR/kis-mock.env" \
+    | write_state mock/approval-latch.env 0600
+  P1_BRANCH=$branch P1_HEAD=$head P1_IMAGE_DIGEST=$certified_image python3 - <<'PY' \
+    | write_state mock/certification-request.json 0600
+import hashlib, json, os
+required={
+  "Contract schema validation",
+  "Spring OpenAPI drift",
+  "Kotlin ktlint and build",
+  "Python quality gates",
+  "Repo hygiene",
+  "P1 full-app security gates",
+}
+security_evidence={
+  "deepScan":"NOT_RUN_USER_SCOPED_OUT",
+  "headSha":os.environ["P1_HEAD"],
+  "requiredChecks":sorted(required),
+  "status":"NOT_VERIFIED",
+}
+security_digest=hashlib.sha256(
+  json.dumps(security_evidence, sort_keys=True, separators=(",", ":")).encode()
+).hexdigest()
+request={
+  "branch":os.environ["P1_BRANCH"],
+  "commitSha":os.environ["P1_HEAD"],
+  # 인증은 소스가 아니라 실제로 도는 이미지에 묶는다. 게이트 영수증의 값을 쓴다.
+  "imageDigest":os.environ["P1_IMAGE_DIGEST"],
+  # PR 번호는 gh 를 걷어내며 의미를 잃었다. 계약이 1 이상 정수를 요구해 1 로 둔다.
+  "pullRequest":1,
+  "quantity":1,
+  "requiredChecks":sorted(required),
+  "securityEvidenceDigest":security_digest,
+  "symbol":"005930",
+}
+# certification CLI는 canonical_json_bytes와 byte 단위로 비교한다. canonical form은 끝에
+# 개행을 포함하므로 여기서도 개행을 남긴다.
+print(json.dumps(request, sort_keys=True, separators=(",", ":")))
+PY
+  compose up -d --wait postgres redis
+  compose --profile owner run --rm --no-deps kis-mock-certification-runner \
+    python -m app.brokerage.kis_mock_certification_cli author
+  compose --profile owner run --rm --no-deps kis-mock-certification-runner
+  mock_certified >/dev/null || die KIS_MOCK_CERTIFICATION_RECEIPT_INVALID
+  author_automation_gate >/dev/null 2>&1 || true
+  printf 'KIS_MOCK_CERTIFICATION=PASS\nKIS_LIVE_BROKERAGE=DISABLED\n'
+}
+
+author_automation_gate() {
+  local receipt=$STATE_DIR/mock/certification.json
+  local certification_sha certification_session head tree
+  mock_certified >/dev/null || return 1
+  certification_sha=$(sha256sum "$receipt" | awk '{print $1}')
+  certification_session=$(python3 - "$receipt" <<'PY'
+import json, pathlib, sys
+from datetime import datetime
+from zoneinfo import ZoneInfo
+value=json.loads(pathlib.Path(sys.argv[1]).read_bytes())
+timestamp=datetime.fromisoformat(value["timestamp"].removesuffix("Z")+"+00:00")
+print(timestamp.astimezone(ZoneInfo("Asia/Seoul")).date().isoformat())
+PY
+)
+  # 릴리스 서버에는 git 이력이 있을 이유가 없다. 결속 값이 이미 주어졌으면 그대로 쓰고,
+  # 없을 때만 git 으로 계산한다. bind_vertex_code_state 와 같은 모양이다.
+  if [[ -n ${P1_RELEASE_BINDING_SHA256:-} && -n ${P1_SOURCE_BINDING_SHA256:-} ]]; then
+    head=""; tree=""
+  else
+    head=$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null) || return 1
+    tree=$(git -C "$REPO_ROOT" rev-parse 'HEAD^{tree}' 2>/dev/null) || return 1
+  fi
+  export P1_CERTIFICATION_RECEIPT_SHA256=$certification_sha
+  export P1_CERTIFICATION_SESSION_DATE=$certification_session
+  if [[ -z ${P1_RELEASE_BINDING_SHA256:-} ]]; then
+    P1_RELEASE_BINDING_SHA256=$(printf 'p1-release-binding/v1\0%s' "$head" | sha256sum | awk '{print $1}')
+  fi
+  if [[ -z ${P1_SOURCE_BINDING_SHA256:-} ]]; then
+    P1_SOURCE_BINDING_SHA256=$(printf 'p1-source-binding/v1\0%s' "$tree" | sha256sum | awk '{print $1}')
+  fi
+  export P1_RELEASE_BINDING_SHA256 P1_SOURCE_BINDING_SHA256
+  compose --profile owner run --rm --no-deps automation-gate-author
+  unset certification_sha certification_session head tree P1_CERTIFICATION_RECEIPT_SHA256 \
+    P1_CERTIFICATION_SESSION_DATE P1_RELEASE_BINDING_SHA256 P1_SOURCE_BINDING_SHA256
+}
+
+mock_readiness() {
+  state_ready || die NOT_INITIALIZED
+  upgrade_state
+  compose ps --status running --services | grep -qx postgres || die MOCK_READINESS_POSTGRES_NOT_RUNNING
+  local certification_valid=false
+  if mock_certified >/dev/null 2>&1; then
+    certification_valid=true
+  fi
+  export P1_LOCAL_CERTIFICATION_VALID=$certification_valid
+  compose --profile owner run --rm --no-deps automation-runtime-cli \
+    python -m app.p1_owner.mock_automation_cli readiness
+}
+
+mock_start() {
+  state_ready || die NOT_INITIALIZED
+  upgrade_state
+  mock_certified >/dev/null || die KIS_MOCK_NOT_CERTIFIED
+  author_automation_gate || die AUTOMATION_ACTIVATION_GATE_NOT_READY
+  load_active_mode
+  compose ps --status running --services | grep -qx postgres || die MOCK_START_POSTGRES_NOT_RUNNING
+  compose ps --status running --services | grep -qx actor-authority || die MOCK_START_AUTHORITY_NOT_RUNNING
+  export P1_LOCAL_CERTIFICATION_VALID=true
+  export P1_KIS_MOCK_ONLINE_ENABLED=true
+  export P1_KIS_OFFLINE=0
+  export P1_AUTOMATION_RUNTIME_ENABLED=true
+  compose --profile owner run --rm --no-deps automation-runtime-cli \
+    python -m app.p1_owner.mock_automation_cli start
+  if ! compose up -d --force-recreate --no-deps --wait decision-platform; then
+    # 런타임 시작 실패 시 신규 주문만 즉시 중지한다.
+    compose --profile owner run --rm --no-deps automation-runtime-cli \
+      python -m app.p1_owner.mock_automation_cli stop >/dev/null 2>&1 || true
+    die MOCK_START_RUNTIME_FAILED_DISARM_ATTEMPTED
+  fi
+  save_active_mode "$MODELS" 1 1
+  printf 'KIS_MOCK_RUNTIME=ENABLED\nKIS_LIVE_BROKERAGE=DISABLED\n'
+}
+
+mock_stop() {
+  state_ready || die NOT_INITIALIZED
+  upgrade_state
+  load_active_mode
+  export P1_LOCAL_CERTIFICATION_VALID=false
+  compose --profile owner run --rm --no-deps automation-runtime-cli \
+    python -m app.p1_owner.mock_automation_cli stop
+  # 대사 프로세스는 유지하고 재기동 의도를 함께 내린다.
+  save_active_mode "$MODELS" "$MOCK" 0
+  printf 'KIS_MOCK_NEW_ORDERS=DISARMED\nOUTSTANDING_RECONCILIATION=PRESERVED\n'
+}
+
+mock_resume() {
+  state_ready || die NOT_INITIALIZED
+  mock_certified >/dev/null || die KIS_MOCK_NOT_CERTIFIED
+  load_active_mode
+  export P1_LOCAL_CERTIFICATION_VALID=true
+  compose --profile owner run --rm --no-deps automation-runtime-cli \
+    python -m app.p1_owner.mock_automation_cli resume
+  # Wake the resident loop, preserving its existing enabled mode and the original claim.
+  compose restart decision-platform
+}
+
+replace_env_value() {
+  local file=$1 key=$2 value=$3 line name
+  grep -q "^${key}=" "$file" || die CREDENTIAL_ROTATION_ENV_KEY_MISSING
+  while IFS= read -r line || [[ -n $line ]]; do
+    name=${line%%=*}
+    if [[ $name == "$key" ]]; then
+      printf '%s=%s\n' "$key" "$value"
+    else
+      printf '%s\n' "$line"
+    fi
+  done < "$file"
+}
+
+credential_rotate() (
+  local target=${1:-} password_file=${2:-} user_id bundle_name password_name bundle_key
+  local rotation_dir bundle_file rotation_env spring_image migration_password separation_key bundle
+  [[ $# == 2 ]] || die CREDENTIAL_ROTATION_ARGUMENTS
+  [[ $password_file == /* && -f $password_file && ! -L $password_file ]] \
+    || die CREDENTIAL_ROTATION_PASSWORD_FILE
+  [[ $(stat -c '%a' "$password_file") =~ ^(400|600|640)$ ]] \
+    || die CREDENTIAL_ROTATION_PASSWORD_FILE_MODE
+  case $target in
+    user)
+      user_id=usr_demo_user
+      bundle_name=demo-user.bundle
+      password_name=demo-user.password
+      bundle_key=DEMO_USER_CREDENTIAL_BUNDLE
+      ;;
+    admin)
+      user_id=usr_demo_admin
+      bundle_name=demo-admin.bundle
+      password_name=demo-admin.password
+      bundle_key=DEMO_ADMIN_CREDENTIAL_BUNDLE
+      ;;
+    *) die CREDENTIAL_ROTATION_TARGET ;;
+  esac
+  state_ready || die NOT_INITIALIZED
+  upgrade_state
+  compose ps --status running --services | grep -qx postgres || die CREDENTIAL_ROTATION_POSTGRES_NOT_RUNNING
+  python3 - "$password_file" "$target" <<'PY' || exit 1
+import sys
+from pathlib import Path
+
+raw = Path(sys.argv[1]).read_text(encoding="utf-8").rstrip("\r\n")
+folded = raw.casefold()
+blocked = {
+    "123456789012345", "1234567890123456", "qwertyuiop12345",
+    "passwordpassword", "letmeinletmein123", "welcome123456789",
+}
+fragments = ("capstone", "trading", "coach", "password", "passwd", "demo-user", "demo-admin")
+if not 15 <= len(raw) <= 64 or len(raw.encode("utf-8")) > 72:
+    raise SystemExit("CAPSTONE_ERROR=CREDENTIAL_ROTATION_PASSWORD_LENGTH")
+if folded in blocked or any(fragment in folded for fragment in fragments):
+    raise SystemExit("CAPSTONE_ERROR=CREDENTIAL_ROTATION_PASSWORD_BLOCKLIST")
+PY
+
+  rotation_dir=$(mktemp -d "$STATE_DIR/credential-rotation.XXXXXX")
+  trap 'rm -rf -- "$rotation_dir"' EXIT
+  bundle_file=$rotation_dir/new.bundle
+  rotation_env=$rotation_dir/rotation.env
+  spring_image=$(sed -n 's/^P1_SPRING_IMAGE=//p' "$RUNTIME_ENV")
+  [[ -n $spring_image ]] || die CREDENTIAL_ROTATION_IMAGE_MISSING
+
+  "$DOCKER_BIN" run --rm --network none --read-only --cap-drop ALL \
+    --security-opt no-new-privileges --user "$(id -u):$(id -g)" \
+    --tmpfs /tmp:rw,noexec,nosuid,size=16m \
+    --mount "type=bind,src=$password_file,dst=/input/password,readonly" \
+    --mount "type=bind,src=$SECRETS_DIR/demo-credential-separation.key,dst=/input/separation-key,readonly" \
+    --mount "type=bind,src=$rotation_dir,dst=/output" \
+    --entrypoint java \
+    -e "DEMO_CREDENTIAL_USER_ID=$user_id" \
+    -e DEMO_CREDENTIAL_PASSWORD_FILE=/input/password \
+    -e DEMO_CREDENTIAL_SEPARATION_KEY_FILE=/input/separation-key \
+    -e DEMO_CREDENTIAL_BUNDLE_OUTPUT=/output/new.bundle \
+    "$spring_image" -Dloader.main=com.capstone.decision.infrastructure.security.DemoCredentialBundleAuthor \
+    -cp /app/app.jar org.springframework.boot.loader.launch.PropertiesLauncher >/dev/null
+
+  migration_password=$(sed -n 's/^POSTGRES_MIGRATION_PASSWORD=//p' "$SECRETS_DIR/migration.env")
+  separation_key=$(sed -n 's/^DEMO_CREDENTIAL_SEPARATION_KEY=//p' "$SECRETS_DIR/migration.env")
+  bundle=$(<"$bundle_file")
+  [[ -n $migration_password && -n $separation_key && -n $bundle ]] \
+    || die CREDENTIAL_ROTATION_INPUT_MISSING
+  printf '%s\n' \
+    'POSTGRES_HOST=127.0.0.1' \
+    'POSTGRES_PORT=5432' \
+    'POSTGRES_DB=capstone_p1' \
+    "POSTGRES_MIGRATION_PASSWORD=$migration_password" \
+    "DEMO_CREDENTIAL_USER_ID=$user_id" \
+    'DEMO_CREDENTIAL_ROTATION_ACTOR=operator-cli' \
+    "DEMO_CREDENTIAL_BUNDLE=$bundle" \
+    "DEMO_CREDENTIAL_SEPARATION_KEY=$separation_key" > "$rotation_env"
+  chmod 0600 "$rotation_env"
+
+  "$DOCKER_BIN" run --rm --network "container:${PROJECT_NAME}-postgres-1" --read-only \
+    --cap-drop ALL --security-opt no-new-privileges --env-file "$rotation_env" \
+    --entrypoint java "$spring_image" \
+    -Dloader.main=com.capstone.decision.infrastructure.security.DemoCredentialRotation \
+    -cp /app/app.jar org.springframework.boot.loader.launch.PropertiesLauncher >/dev/null
+
+  printf '%s' "$bundle" | write_state "secrets/$bundle_name" 0640
+  replace_env_value "$SECRETS_DIR/migration.env" "$bundle_key" "$bundle" \
+    | write_state secrets/migration.env 0640
+  replace_env_value "$SECRETS_DIR/bootstrap.env" "$bundle_key" "$bundle" \
+    | write_state secrets/bootstrap.env 0640
+  replace_env_value "$SECRETS_DIR/spring.env" "$bundle_key" "$bundle" \
+    | write_state secrets/spring.env 0640
+  printf '%s' "$(<"$password_file")" | write_state "secrets/$password_name" 0640
+  if [[ $target == user ]]; then
+    replace_env_value "$SECRETS_DIR/automation-runtime.env" P1_AUTOMATION_OWNER_PASSWORD "$(<"$password_file")" \
+      | write_state secrets/automation-runtime.env 0640
+  fi
+  compose up -d --force-recreate --no-deps --wait decision-platform
+  printf 'CAPSTONE_CREDENTIAL_ROTATION=PASS\nTARGET=%s\nSESSIONS_INVALIDATED=YES\n' "$target"
+)
+
+artifact_import() {
+  local bundle=${1:-} manifest_sha=${2:-} bundle_parent bundle_name
+  [[ $# == 2 ]] || die ARTIFACT_IMPORT_ARGUMENTS
+  [[ $bundle == /* && $bundle != */ && -d $bundle && ! -L $bundle ]] || die ARTIFACT_IMPORT_BUNDLE_ROOT
+  [[ $manifest_sha =~ ^[0-9a-f]{64}$ ]] || die ARTIFACT_IMPORT_MANIFEST_SHA256
+  state_ready || die RUN_CAPSTONE_UP_FIRST
+  upgrade_state
+  compose ps --status running --services | grep -qx postgres || die ARTIFACT_IMPORT_POSTGRES_NOT_RUNNING
+  bundle_parent=${bundle%/*}; [[ -n $bundle_parent ]] || bundle_parent=/
+  bundle_name=${bundle##*/}
+  [[ $bundle_name != . && $bundle_name != .. ]] || die ARTIFACT_IMPORT_BUNDLE_ROOT
+  export P1_ARTIFACT_BUNDLE_PARENT=$bundle_parent
+  export P1_ARTIFACT_BUNDLE_NAME=$bundle_name
+  export P1_ARTIFACT_ARCHIVE_DIR=$STATE_DIR/artifacts
+  export P1_ARTIFACT_MANIFEST_SHA256=$manifest_sha
+  compose --profile owner run --rm --no-deps artifact-importer
+  author_automation_gate >/dev/null 2>&1 || true
+}
+
+artifact_validate() {
+  local bundle=${1:-} manifest_sha=${2:-} bundle_parent bundle_name result
+  [[ $# == 2 ]] || die ARTIFACT_VALIDATE_ARGUMENTS
+  [[ $bundle == /* && $bundle != */ && -d $bundle && ! -L $bundle ]] \
+    || die ARTIFACT_VALIDATE_BUNDLE_ROOT
+  [[ $manifest_sha =~ ^[0-9a-f]{64}$ ]] || die ARTIFACT_VALIDATE_MANIFEST_SHA256
+  bundle_parent=${bundle%/*}; [[ -n $bundle_parent ]] || bundle_parent=/
+  bundle_name=${bundle##*/}
+  [[ $bundle_parent != / && $bundle_parent != *','* && $bundle_parent != *$'\n'* ]] \
+    || die ARTIFACT_VALIDATE_BUNDLE_PARENT
+  [[ $bundle_name != . && $bundle_name != .. ]] || die ARTIFACT_VALIDATE_BUNDLE_ROOT
+  [[ -n $DOCKER_BIN ]] || die MISSING_COMMAND_docker
+  "$DOCKER_BIN" image inspect capstone-decision-platform:p1-local >/dev/null 2>&1 \
+    || die RUN_CAPSTONE_UP_FIRST
+  result=$("$DOCKER_BIN" run --rm --pull never --network none --read-only \
+    --cap-drop ALL --security-opt no-new-privileges:true \
+    --pids-limit 64 --memory 1g --cpus 1.0 \
+    --tmpfs /tmp:size=64m,mode=1777 \
+    --user "$(id -u):$(id -g)" \
+    --env PROVIDER_LIVE_CALLS_ENABLED=false --env KIS_OFFLINE=1 \
+    --mount "type=bind,src=$bundle_parent,dst=/owner,readonly" \
+    --entrypoint python capstone-decision-platform:p1-local \
+    -m app.p1_owner.importer \
+    --bundle-root "/owner/$bundle_name" \
+    --manifest-sha256 "$manifest_sha" \
+    --archive-parent /tmp/archive \
+    --validate-only) || die TEAM_B_ARTIFACT_VALIDATION_FAILED
+  printf '%s\nTEAM_B_LOCAL_VALIDATION=PASS\nPROVIDER_CALLS=0\n' "$result"
+}
+
+market_data_daily_refresh() {
+  state_ready || die NOT_INITIALIZED
+  upgrade_state
+  compose ps --status running --services | grep -qx postgres || die MARKET_DATA_POSTGRES_NOT_RUNNING
+  compose --profile owner run --rm --no-deps market-data-cli \
+    python -m app.data.market_data.yfinance_daily_cli
+}
+
+market_data_inventory() {
+  state_ready || die NOT_INITIALIZED
+  upgrade_state
+  compose ps --status running --services | grep -qx postgres || die MARKET_DATA_POSTGRES_NOT_RUNNING
+  compose --profile owner run --rm --no-deps market-data-cli \
+    python -m app.data.market_data.automation_bootstrap_cli inventory
+}
+
+market_data_universe_refresh() {
+  local as_of=${1:-} output_root=${2:-}
+  [[ $# == 2 ]] || die MARKET_DATA_UNIVERSE_REFRESH_ARGUMENTS
+  [[ $as_of =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die MARKET_DATA_END_SESSION
+  [[ $output_root == /* && ! -e $output_root ]] || die MARKET_DATA_OUTPUT_ROOT
+  local output_parent=${output_root%/*}; [[ -n $output_parent ]] || output_parent=/
+  [[ $output_parent != / && -d $output_parent && ! -L $output_parent ]] || die MARKET_DATA_OUTPUT_PARENT
+  state_ready || die NOT_INITIALIZED
+  upgrade_state
+  install -d -m 0700 "$output_root"
+  compose --profile owner run --rm --no-deps \
+    --user "$(id -u):$(id -g)" -e "P1_OPERATOR_UID=$(id -u)" \
+    -v "$output_root:/app/data/universe-refresh" \
+    market-data-cli python -m app.data.krx.universe_refresh_cli \
+      --online --as-of "$as_of" \
+      --data-dir /app/data/universe-refresh \
+      --report-path /app/data/universe-refresh/universe_refresh.md
+}
+
+market_data_bootstrap_plan() {
+  local manifest=${1:-} end_session=${2:-} session_count=${3:-756} parent name
+  [[ $# == 3 ]] || die MARKET_DATA_PLAN_ARGUMENTS
+  [[ $manifest == /* && -f $manifest && ! -L $manifest ]] || die MARKET_DATA_UNIVERSE_MANIFEST
+  [[ $end_session =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die MARKET_DATA_END_SESSION
+  [[ $session_count =~ ^[0-9]+$ ]] || die MARKET_DATA_SESSION_COUNT
+  parent=${manifest%/*}; [[ -n $parent ]] || parent=/
+  name=${manifest##*/}
+  compose --profile owner run --rm --no-deps \
+    --user "$(id -u):$(id -g)" -e "P1_OPERATOR_UID=$(id -u)" \
+    -v "$parent:/owner-input:ro" market-data-cli \
+    python -m app.data.market_data.automation_bootstrap_cli plan \
+      --universe-manifest "/owner-input/$name" --end-session "$end_session" \
+      --session-count "$session_count"
+}
+
+market_data_bootstrap_run() {
+  local packet=${1:-} manifest=${2:-} end_session=${3:-} session_count=${4:-756} output_root=${5:-}
+  local packet_parent packet_name manifest_parent manifest_name output_parent output_name kis_mode
+  [[ $# == 5 ]] || die MARKET_DATA_RUN_ARGUMENTS
+  [[ $packet == /* && -f $packet && ! -L $packet ]] || die MARKET_DATA_APPROVAL_PACKET
+  [[ $manifest == /* && -f $manifest && ! -L $manifest ]] || die MARKET_DATA_UNIVERSE_MANIFEST
+  [[ $end_session =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die MARKET_DATA_END_SESSION
+  [[ $session_count =~ ^[0-9]+$ ]] || die MARKET_DATA_SESSION_COUNT
+  [[ $output_root == /* && ! -e $output_root ]] || die MARKET_DATA_OUTPUT_ROOT
+  output_parent=${output_root%/*}; [[ -n $output_parent ]] || output_parent=/
+  output_name=${output_root##*/}
+  [[ $output_parent != / && -d $output_parent && ! -L $output_parent ]] || die MARKET_DATA_OUTPUT_PARENT
+  [[ $output_name != . && $output_name != .. && -n $output_name ]] || die MARKET_DATA_OUTPUT_NAME
+  packet_parent=${packet%/*}; [[ -n $packet_parent ]] || packet_parent=/
+  packet_name=${packet##*/}
+  manifest_parent=${manifest%/*}; [[ -n $manifest_parent ]] || manifest_parent=/
+  manifest_name=${manifest##*/}
+  kis_mode=$(python3 - "$packet" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+value = json.loads(Path(sys.argv[1]).read_bytes()).get("kisMode")
+if value not in {"mock", "live"}:
+    raise SystemExit(1)
+print(value)
+PY
+  ) || die MARKET_DATA_PACKET_MODE
+  compose --profile owner run --rm --no-deps \
+    --user "$(id -u):$(id -g)" -e "P1_OPERATOR_UID=$(id -u)" \
+    -e P1_AUTOMATION_MARKET_BOOTSTRAP_ENABLED=true \
+    -e "P1_AUTOMATION_MARKET_BOOTSTRAP_KIS_MODE=$kis_mode" \
+    -v "$packet_parent:/approval:ro" \
+    -v "$manifest_parent:/owner-input:ro" \
+    -v "$output_parent:/owner-output" \
+    market-data-cli python -m app.data.market_data.automation_bootstrap_cli run \
+      --approval-packet "/approval/$packet_name" \
+      --universe-manifest "/owner-input/$manifest_name" \
+      --end-session "$end_session" \
+      --session-count "$session_count" \
+      --output-root "/owner-output/$output_name"
+}
+
+market_data_bootstrap_archive() {
+  local action=$1 archive=${2:-} expected=${3:-} parent name
+  [[ $# == 3 ]] || die MARKET_DATA_ARCHIVE_ARGUMENTS
+  [[ $archive == /* && -d $archive && ! -L $archive ]] || die MARKET_DATA_ARCHIVE_ROOT
+  [[ $expected =~ ^[0-9a-f]{64}$ ]] || die MARKET_DATA_MANIFEST_SHA256
+  parent=${archive%/*}; [[ -n $parent ]] || parent=/
+  name=${archive##*/}
+  if [[ $action == stage ]]; then
+    state_ready || die NOT_INITIALIZED
+    upgrade_state
+    compose ps --status running --services | grep -qx postgres || die MARKET_DATA_POSTGRES_NOT_RUNNING
+  fi
+  compose --profile owner run --rm --no-deps \
+    --user "$(id -u):$(id -g)" -e "P1_OPERATOR_UID=$(id -u)" \
+    -v "$parent:/owner-input:ro" market-data-cli \
+    python -m app.data.market_data.automation_bootstrap_cli "$action" \
+      --archive-root "/owner-input/$name" --expected-manifest-sha256 "$expected"
+}
+
+after_hours_replay() {
+  local manifest_sha=${1:-}
+  [[ $manifest_sha =~ ^[0-9a-f]{64}$ ]] || die AFTER_HOURS_REPLAY_MANIFEST_SHA256
+  if [[ $PROJECT_NAME != capstone-p1-after-hours-replay ]]; then
+    [[ $PROJECT_NAME == capstone-p1 && ${P1_AFTER_HOURS_REPLAY_READONLY_CURRENT:-false} == true ]] \
+      || die AFTER_HOURS_REPLAY_PROJECT_ISOLATION
+  fi
+  state_ready || die NOT_INITIALIZED
+  upgrade_state
+  compose ps --status running --services | grep -qx postgres || die AFTER_HOURS_REPLAY_POSTGRES_NOT_RUNNING
+  export P1_AFTER_HOURS_OUTPUT_ROOT=$STATE_DIR/artifacts/after-hours-replay
+  export P1_AFTER_HOURS_OBSERVED_ANCHOR_ROOT=$REPO_ROOT/artifacts/decision-platform/live-rehearsal
+  export P1_AFTER_HOURS_OBSERVED_ANCHOR_MANIFEST=$REPO_ROOT/contracts/catalogs/p1-after-hours-observed-anchors.v1.json
+  install -d -m 0700 "$P1_AFTER_HOURS_OUTPUT_ROOT"
+  compose --profile owner run --rm --no-deps \
+    --user "$(id -u):$(id -g)" -e "P1_OPERATOR_UID=$(id -u)" \
+    -e P1_AFTER_HOURS_HISTORICAL_REPLAY_E2E=1 \
+    -e PYTHONPATH=/app:/app/workspaces/decision-platform/python-services \
+    -v "$REPO_ROOT/workspaces/decision-platform/python-services/tests:/app/workspaces/decision-platform/python-services/tests:ro" \
+    after-hours-replay \
+    python -m tests.e2e.after_hours_historical_replay_e2e \
+      --manifest-sha256 "$manifest_sha" \
+      --out /replay-output/after-hours-historical-replay-e2e.json \
+      --replay-output-root /replay-output \
+      --observed-anchor-root /observed-anchors \
+      --observed-anchor-manifest /observed-anchor-manifest.json
+}
+
+command=${1:-}
+[[ -n $command ]] || { usage >&2; exit 1; }
+shift
+case $command in
+  up) up_app "$@" ;;
+  doctor) [[ $# == 0 ]] || die UNEXPECTED_ARGUMENT; doctor ;;
+  status) [[ $# == 0 ]] || die UNEXPECTED_ARGUMENT; status ;;
+  logs) [[ $# == 0 ]] || die UNEXPECTED_ARGUMENT; logs ;;
+  smoke) [[ $# == 0 ]] || die UNEXPECTED_ARGUMENT; smoke ;;
+  down) [[ $# == 0 ]] || die UNEXPECTED_ARGUMENT; down ;;
+  demo)
+    subcommand=${1:-}; [[ -n $subcommand ]] || die DEMO_COMMAND_REQUIRED; shift
+    [[ $# == 0 ]] || die UNEXPECTED_ARGUMENT
+    case $subcommand in
+      create) demo_create ;;
+      clone) demo_clone ;;
+      seed|purge) demo_history "$subcommand" ;;
+      *) die UNKNOWN_DEMO_COMMAND ;;
+    esac
+    ;;
+  mock)
+    subcommand=${1:-}; [[ -n $subcommand ]] || die MOCK_COMMAND_REQUIRED; shift
+    case $subcommand in
+      configure) [[ $# == 0 ]] || die UNEXPECTED_ARGUMENT; mock_configure ;;
+      doctor) [[ $# == 0 ]] || die UNEXPECTED_ARGUMENT; mock_doctor || die KIS_MOCK_NOT_READY ;;
+      certify) mock_certify "$@" ;;
+      readiness) [[ $# == 0 ]] || die UNEXPECTED_ARGUMENT; mock_readiness ;;
+      gate-author) [[ $# == 0 ]] || die UNEXPECTED_ARGUMENT; author_automation_gate ;;
+      start) [[ $# == 0 ]] || die UNEXPECTED_ARGUMENT; mock_start ;;
+      resume) [[ $# == 0 ]] || die UNEXPECTED_ARGUMENT; mock_resume ;;
+      stop) [[ $# == 0 ]] || die UNEXPECTED_ARGUMENT; mock_stop ;;
+      *) die UNKNOWN_MOCK_COMMAND ;;
+    esac
+    ;;
+  credential)
+    subcommand=${1:-}; [[ -n $subcommand ]] || die CREDENTIAL_COMMAND_REQUIRED; shift
+    case $subcommand in
+      rotate) credential_rotate "$@" ;;
+      *) die UNKNOWN_CREDENTIAL_COMMAND ;;
+    esac
+    ;;
+  artifact)
+    subcommand=${1:-}; [[ -n $subcommand ]] || die ARTIFACT_COMMAND_REQUIRED; shift
+    case $subcommand in
+      validate|import)
+        bundle=${1:-}; shift || true
+        [[ ${1:-} == --manifest-sha256 ]] || die ARTIFACT_MANIFEST_ARGUMENT_REQUIRED
+        shift
+        [[ $# == 1 ]] || die ARTIFACT_ARGUMENTS
+        if [[ $subcommand == validate ]]; then
+          artifact_validate "$bundle" "${1:-}"
+        else
+          artifact_import "$bundle" "${1:-}"
+        fi
+        ;;
+      *) die UNKNOWN_ARTIFACT_COMMAND ;;
+    esac
+    ;;
+  market-data)
+    subcommand=${1:-}; [[ -n $subcommand ]] || die MARKET_DATA_COMMAND_REQUIRED; shift
+    case $subcommand in
+      inventory) [[ $# == 0 ]] || die UNEXPECTED_ARGUMENT; market_data_inventory ;;
+      refresh) [[ $# == 0 ]] || die UNEXPECTED_ARGUMENT; market_data_daily_refresh ;;
+      universe)
+        action=${1:-}; [[ $action == refresh ]] || die MARKET_DATA_UNIVERSE_ACTION_REQUIRED; shift
+        [[ ${1:-} == --as-of ]] || die MARKET_DATA_END_ARGUMENT_REQUIRED
+        shift; as_of=${1:-}; shift || true
+        [[ ${1:-} == --output-root ]] || die MARKET_DATA_OUTPUT_ARGUMENT_REQUIRED
+        shift; [[ $# == 1 ]] || die MARKET_DATA_UNIVERSE_REFRESH_ARGUMENTS
+        market_data_universe_refresh "$as_of" "${1:-}"
+        ;;
+      bootstrap)
+        action=${1:-}; [[ -n $action ]] || die MARKET_DATA_BOOTSTRAP_ACTION_REQUIRED; shift
+        case $action in
+          plan)
+            [[ ${1:-} == --universe-manifest ]] || die MARKET_DATA_UNIVERSE_ARGUMENT_REQUIRED
+            shift; manifest=${1:-}; shift || true
+            [[ ${1:-} == --end-session ]] || die MARKET_DATA_END_ARGUMENT_REQUIRED
+            shift; end_session=${1:-}; shift || true
+            session_count=756
+            if [[ ${1:-} == --session-count ]]; then
+              shift; session_count=${1:-}; shift || true
+            fi
+            [[ $# == 0 ]] || die MARKET_DATA_PLAN_ARGUMENTS
+            market_data_bootstrap_plan "$manifest" "$end_session" "$session_count"
+            ;;
+          run)
+            [[ ${1:-} == --packet ]] || die MARKET_DATA_PACKET_ARGUMENT_REQUIRED
+            shift; packet=${1:-}; shift || true
+            [[ ${1:-} == --universe-manifest ]] || die MARKET_DATA_UNIVERSE_ARGUMENT_REQUIRED
+            shift; manifest=${1:-}; shift || true
+            [[ ${1:-} == --end-session ]] || die MARKET_DATA_END_ARGUMENT_REQUIRED
+            shift; end_session=${1:-}; shift || true
+            session_count=756
+            if [[ ${1:-} == --session-count ]]; then
+              shift; session_count=${1:-}; shift || true
+            fi
+            [[ ${1:-} == --output-root ]] || die MARKET_DATA_OUTPUT_ARGUMENT_REQUIRED
+            shift; [[ $# == 1 ]] || die MARKET_DATA_RUN_ARGUMENTS
+            market_data_bootstrap_run "$packet" "$manifest" "$end_session" "$session_count" "${1:-}"
+            ;;
+          validate|stage)
+            archive=${1:-}; shift || true
+            [[ ${1:-} == --manifest-sha256 ]] || die MARKET_DATA_MANIFEST_ARGUMENT_REQUIRED
+            shift; [[ $# == 1 ]] || die MARKET_DATA_ARCHIVE_ARGUMENTS
+            market_data_bootstrap_archive "$action" "$archive" "${1:-}"
+            ;;
+          *) die UNKNOWN_MARKET_DATA_BOOTSTRAP_ACTION ;;
+        esac
+        ;;
+      *) die UNKNOWN_MARKET_DATA_COMMAND ;;
+    esac
+    ;;
+  team-a)
+    subcommand=${1:-}; [[ -n $subcommand ]] || die TEAM_A_COMMAND_REQUIRED; shift
+    case $subcommand in
+      acceptance) [[ $# == 0 ]] || die UNEXPECTED_ARGUMENT; team_a_acceptance ;;
+      *) die UNKNOWN_TEAM_A_COMMAND ;;
+    esac
+    ;;
+  test)
+    subcommand=${1:-}; [[ -n $subcommand ]] || die TEST_COMMAND_REQUIRED; shift
+    case $subcommand in
+      after-hours-replay)
+        [[ ${1:-} == --manifest-sha256 ]] || die AFTER_HOURS_REPLAY_MANIFEST_ARGUMENT_REQUIRED
+        shift; [[ $# == 1 ]] || die AFTER_HOURS_REPLAY_ARGUMENTS
+        after_hours_replay "${1:-}"
+        ;;
+      *) die UNKNOWN_TEST_COMMAND ;;
+    esac
+    ;;
+  preview|start) up_app "$@" ;;
+  stop) [[ $# == 0 ]] || die UNEXPECTED_ARGUMENT; down ;;
+  -h|--help|help) usage ;;
+  *) usage >&2; die UNKNOWN_COMMAND ;;
+esac

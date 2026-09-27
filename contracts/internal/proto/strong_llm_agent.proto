@@ -1,0 +1,159 @@
+syntax = "proto3";
+
+package capstone.decision.internal.s49;
+
+option java_multiple_files = true;
+option java_package = "com.capstone.decision.contract.internal.s49";
+option java_outer_classname = "StrongLlmAgentContract";
+
+// Strong LLM provider process는 이 loopback bidi stream 밖의 DB·owner capability를 갖지 않는다.
+service StrongLlmAgentService {
+  rpc Generate(stream HostEvent) returns (stream AgentEvent);
+}
+
+message EvidenceItem {
+  int32 ordinal = 1;
+  string citation_id = 2;
+  string chunk_revision_id = 3;
+  string canonical_text = 4;
+  string canonical_text_sha256 = 5;
+  bool owner_private = 6;
+}
+
+// Return Engine이 고른 후보 하나. 계좌·잔고·보유량은 여기에 들어가지 않는다.
+message JudgementCandidate {
+  string symbol = 1;
+  double expected_return = 2;
+  reserved 3;
+  string lstm_signal = 4;
+  string baseline_signal = 5;
+}
+
+message StartRun {
+  string model_id = 1;
+  string question = 2;
+  string answer_mode = 3;
+  repeated string related_symbols = 4;
+  repeated string topics = 5;
+  repeated EvidenceItem public_evidence = 6;
+  repeated EvidenceItem owner_evidence = 7;
+  bool google_search_enabled = 8;
+  int32 max_tool_rounds = 9;
+  string current_time = 10;
+  string timezone = 11;
+  // 답변 언어를 명시값으로 넘긴다. 넘기지 않으면 모델이 질문 언어로 추측할 뿐이다.
+  string language = 12;
+  // EXPLAIN은 근거로 설명하고 JUDGE는 후보를 평가한다. 같은 프롬프트가 이 값으로 갈린다.
+  string mode = 13;
+  // JUDGE에서만 채운다. 모델은 이 집합 안에서만 답하고 새 종목을 만들지 못한다.
+  repeated JudgementCandidate candidates = 14;
+  // arm 시점에 봉인한 사용자 선택을 provider 생성까지 그대로 전달한다.
+  string thinking_level = 15;
+  // NEWS_SCREEN은 Google support만 수집하고 tool-free JUDGE는 별도 phase에서 수행한다.
+  bool grounding_discovery_only = 16;
+  // 사용자 자기 Vertex 서비스 계정(JSON 의 표준 Base64 한 줄). 비어 있으면 에이전트가 배포 비밀의 운영자
+  // 서비스 계정을 쓴다. host 가 run 마다 복호화해 넣고, 에이전트는 로그·응답에 싣지 않는다.
+  string owner_vertex_service_account_json_b64 = 17;
+}
+
+message ProviderCallPermit {
+  string planned_call_id = 1;
+}
+
+message ToolResult {
+  string tool_call_id = 1;
+  string tool_name = 2;
+  string result_json = 3;
+  bool failed = 4;
+  string failure_leaf = 5;
+}
+
+message CancelRun {
+  string reason = 1;
+}
+
+message HostEvent {
+  string run_id = 1;
+  uint64 sequence = 2;
+  string call_id = 3;
+  oneof payload {
+    StartRun start_run = 10;
+    ProviderCallPermit provider_call_permit = 11;
+    ToolResult tool_result = 12;
+    CancelRun cancel_run = 13;
+  }
+}
+
+message ProviderCallPlanned {
+  string planned_call_id = 1;
+  string phase = 2;
+  bool google_search_attached = 3;
+}
+
+message GroundingRoot {
+  string result_id = 1;
+  string title = 2;
+  string uri = 3;
+  string domain = 4;
+  int32 chunk_index = 5;
+  string citation_id = 6;
+}
+
+message GroundingSupport {
+  int32 start_index = 1;
+  int32 end_index = 2;
+  string text = 3;
+  repeated int32 chunk_indices = 4;
+}
+
+message RegisterGroundingRoots {
+  repeated string web_search_queries = 1;
+  repeated GroundingRoot roots = 2;
+  repeated GroundingSupport supports = 3;
+}
+
+message WebSearch {
+  string tool_call_id = 1;
+  string query = 2;
+}
+
+message WebRead {
+  string tool_call_id = 1;
+  string result_id = 2;
+}
+
+message Completed {
+  string answer_json = 1;
+  int32 prompt_token_count = 2;
+  int32 output_token_count = 3;
+  int32 vertex_generate_call_count = 4;
+  int32 google_grounding_query_count = 5;
+  string search_backend = 6;
+  string evidence_validation_mode = 7;
+  repeated GroundingRoot grounding_roots = 8;
+  repeated GroundingSupport grounding_supports = 9;
+  repeated string web_search_queries = 10;
+  // 실제로 답한 provider. 1차가 실패해 2차가 답한 run을 사후에 구분할 수 있어야 한다.
+  string provider_id = 11;
+}
+
+message Failed {
+  string failure_leaf = 1;
+  bool provider_attempted = 2;
+  int32 vertex_generate_call_count = 3;
+  int32 google_grounding_query_count = 4;
+}
+
+message AgentEvent {
+  string run_id = 1;
+  uint64 sequence = 2;
+  string call_id = 3;
+  oneof payload {
+    ProviderCallPlanned provider_call_planned = 10;
+    RegisterGroundingRoots register_grounding_roots = 11;
+    WebSearch web_search = 12;
+    WebRead web_read = 13;
+    Completed completed = 14;
+    Failed failed = 15;
+  }
+}

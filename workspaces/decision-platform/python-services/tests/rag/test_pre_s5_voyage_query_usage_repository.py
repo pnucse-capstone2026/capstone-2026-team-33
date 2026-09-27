@@ -1,0 +1,398 @@
+from __future__ import annotations
+
+import hashlib
+from contextlib import nullcontext
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from unittest.mock import MagicMock
+
+import psycopg
+import pytest
+
+import app.rag.pre_s5_voyage_query_usage_repository as voyage_usage_repository
+from app.rag.pre_s5_provider_control import (
+    PreS5VoyageEvaluationBatchActivation,
+    PreS5VoyageQueryActivation,
+)
+from app.rag.pre_s5_voyage_query_usage_repository import (
+    PreS5VoyageQueryUsageRepositoryError,
+    PsycopgPreS5VoyageQueryUsageRepository,
+)
+
+
+def test_voyage_query_usage_lease_claims_exact_packet_once_without_persisting_query_or_scope_text(
+    isolated_postgres_cluster: dict[str, str],
+) -> None:
+    activation = _activation()
+    repository = PsycopgPreS5VoyageQueryUsageRepository(
+        database_dsn=isolated_postgres_cluster["rag_writer_dsn"]
+    )
+
+    lease = repository.reserve(activation=activation)
+    lease.claim_attempt(now=datetime.now(UTC))
+    lease.commit(expected_input_tokens=3, total_tokens=7, actual_cost_microusd=7)
+
+    with pytest.raises(
+        PreS5VoyageQueryUsageRepositoryError, match="PRE_S5_VOYAGE_QUERY_LEASE_CLAIM_REJECTED"
+    ):
+        lease.claim_attempt(now=datetime.now(UTC))
+    with pytest.raises(
+        PreS5VoyageQueryUsageRepositoryError, match="PRE_S5_VOYAGE_QUERY_LEASE_RESERVATION_REJECTED"
+    ):
+        repository.reserve(activation=activation)
+
+    with psycopg.connect(isolated_postgres_cluster["admin_dsn"]) as connection:
+        reservation = connection.execute(
+            """
+            SELECT packet_sha256, nonce_sha256, query_sha256, scope_claim_sha256,
+                   rate_evidence_sha256, official_tokenizer_sha256, evaluation_component_scope, provider, operation,
+                   token_cap, byte_cap,
+                   cost_cap_microusd, input_microusd_per_token
+            FROM rag_v2_immutable_voyage_query_usage_reservations
+            """
+        ).fetchone()
+        assert reservation == (
+            activation.packet_sha256,
+            activation.nonce_sha256,
+            activation.query_sha256,
+            activation.scope_claim_sha256,
+            activation.rate_evidence_sha256,
+            activation.tokenizer_sha256,
+            "RUNTIME",
+            "VOYAGE",
+            "CONTEXTUALIZED_QUERY_EMBEDDING",
+            8_192,
+            1_048_576,
+            8_192,
+            1,
+        )
+        assert connection.execute(
+            """
+            SELECT state, expected_input_tokens, provider_total_tokens, actual_cost_microusd
+            FROM rag_v2_immutable_voyage_query_usage_outcomes
+            """
+        ).fetchone() == ("COMMITTED", 3, 7, 7)
+        columns = connection.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'rag_v2_immutable_voyage_query_usage_reservations'
+            ORDER BY column_name
+            """
+        ).fetchall()
+        assert ("question",) not in columns
+        assert ("scope_claim",) not in columns
+        assert ("nonce",) not in columns
+
+
+def test_s49_runtime_usage_measurement_failure_does_not_block_voyage_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_row = (
+        "rgr_vqu_" + "1" * 32,
+        "a" * 64,
+        "b" * 64,
+        "c" * 64,
+        datetime.now(UTC) + timedelta(minutes=2),
+        8_192,
+        4_194_304,
+        8_192,
+        1,
+    )
+    runtime_connection = MagicMock()
+    runtime_connection.__enter__.return_value = runtime_connection
+    runtime_connection.transaction.return_value = nullcontext()
+    meter_connection = MagicMock()
+    meter_connection.__enter__.return_value = meter_connection
+    meter_connection.transaction.return_value = nullcontext()
+
+    runtime_connection.execute.return_value = MagicMock(
+        fetchone=MagicMock(return_value=runtime_row)
+    )
+    meter_connection.execute.side_effect = psycopg.OperationalError("meter unavailable")
+
+    monkeypatch.setattr(
+        voyage_usage_repository.psycopg,
+        "connect",
+        MagicMock(side_effect=[runtime_connection, meter_connection]),
+    )
+    monkeypatch.setattr(
+        voyage_usage_repository, "_attest_writer_connection", lambda _connection: None
+    )
+    monkeypatch.setattr(
+        voyage_usage_repository, "_set_transaction_timeouts", lambda _connection: None
+    )
+
+    repository = PsycopgPreS5VoyageQueryUsageRepository(database_dsn="postgresql://writer")
+    activation, lease = repository.reserve_s4_9_runtime(
+        scope_claim_id="rvs_" + "d" * 32,
+        question_sha256="e" * 64,
+        tokenizer_sha256="f" * 64,
+    )
+
+    assert activation.provider == "VOYAGE"
+    assert lease.usage_event_id == "rgr_vqu_" + "1" * 32
+    meter_connection.execute.assert_called_once()
+
+
+def test_voyage_query_usage_lease_keeps_public_evaluation_component_label_without_query_content(
+    isolated_postgres_cluster: dict[str, str],
+) -> None:
+    activation = replace(_activation(), packet_sha256="d" * 64, nonce_sha256="e" * 64)
+    repository = PsycopgPreS5VoyageQueryUsageRepository(
+        database_dsn=isolated_postgres_cluster["rag_writer_dsn"]
+    )
+
+    lease = repository.reserve(activation=activation, evaluation_component_scope="OA112")
+    lease.claim_attempt(now=datetime.now(UTC))
+    lease.commit(expected_input_tokens=3, total_tokens=7, actual_cost_microusd=7)
+
+    with psycopg.connect(isolated_postgres_cluster["admin_dsn"]) as connection:
+        assert connection.execute(
+            """
+            SELECT evaluation_component_scope, query_sha256, scope_claim_sha256
+            FROM rag_v2_immutable_voyage_query_usage_reservations
+            WHERE packet_sha256 = %s
+            """,
+            (activation.packet_sha256,),
+        ).fetchone() == ("OA112", activation.query_sha256, activation.scope_claim_sha256)
+
+    with psycopg.connect(isolated_postgres_cluster["rag_writer_dsn"]) as connection:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            connection.execute("SELECT * FROM rag_v2_immutable_voyage_query_usage_reservations")
+
+
+def test_voyage_query_usage_lease_records_unknown_billing_once_after_claim(
+    isolated_postgres_cluster: dict[str, str],
+) -> None:
+    activation = replace(_activation(), packet_sha256="e" * 64, nonce_sha256="f" * 64)
+    repository = PsycopgPreS5VoyageQueryUsageRepository(
+        database_dsn=isolated_postgres_cluster["rag_writer_dsn"]
+    )
+
+    lease = repository.reserve(activation=activation)
+    lease.claim_attempt(now=datetime.now(UTC))
+    lease.mark_unknown_billing()
+
+    with pytest.raises(
+        PreS5VoyageQueryUsageRepositoryError, match="PRE_S5_VOYAGE_QUERY_LEASE_COMMIT_REJECTED"
+    ):
+        lease.commit(expected_input_tokens=3, total_tokens=7, actual_cost_microusd=7)
+    with pytest.raises(
+        PreS5VoyageQueryUsageRepositoryError, match="PRE_S5_VOYAGE_QUERY_LEASE_UNKNOWN_REJECTED"
+    ):
+        lease.mark_unknown_billing()
+
+    with psycopg.connect(isolated_postgres_cluster["admin_dsn"]) as connection:
+        assert connection.execute(
+            """
+            SELECT state, provider_total_tokens, actual_cost_microusd
+            FROM rag_v2_immutable_voyage_query_usage_outcomes
+            WHERE packet_sha256 = %s
+            """,
+            (activation.packet_sha256,),
+        ).fetchone() == ("UNKNOWN_BILLING", None, None)
+
+
+def test_voyage_evaluation_batch_uses_one_aggregate_ledger_row_per_component(
+    isolated_postgres_cluster: dict[str, str],
+) -> None:
+    activation = _evaluation_batch_activation()
+    repository = PsycopgPreS5VoyageQueryUsageRepository(
+        database_dsn=isolated_postgres_cluster["rag_writer_dsn"]
+    )
+
+    with pytest.raises(PreS5VoyageQueryUsageRepositoryError):
+        repository.reserve(activation=activation, evaluation_component_scope="OA112")
+    lease = repository.reserve(activation=activation, evaluation_component_scope="EXACT30")
+    lease.claim_attempt(now=datetime.now(UTC))
+    query_sha256s = tuple(
+        hashlib.sha256(f"question-{index}".encode()).hexdigest() for index in range(10)
+    )
+    vector = (1.0,) + (0.0,) * 1023
+    repository.stage_evaluation_batch(
+        activation=activation,
+        lease=lease,
+        vectors_by_query_sha256=dict.fromkeys(query_sha256s, vector),
+        expected_input_tokens=10,
+        total_tokens=10,
+        actual_cost_microusd=10,
+    )
+
+    resumed = repository.resume_evaluation_batch(
+        scope_claim_sha256=activation.scope_claim_sha256,
+        component_scope="EXACT30",
+        query_manifest_sha256=activation.query_manifest_sha256,
+        expected_query_sha256s=query_sha256s,
+    )
+    assert resumed is not None
+    assert set(resumed) == set(query_sha256s)
+    with pytest.raises(PreS5VoyageQueryUsageRepositoryError):
+        repository.reserve(activation=activation, evaluation_component_scope="EXACT30")
+
+    with psycopg.connect(isolated_postgres_cluster["admin_dsn"]) as connection:
+        assert connection.execute(
+            """
+            SELECT evaluation_component_scope, query_sha256, scope_claim_sha256,
+                   (SELECT count(*) FROM rag_v2_immutable_voyage_query_usage_attempts AS attempt
+                    WHERE attempt.usage_event_id = reservation.usage_event_id)
+            FROM rag_v2_immutable_voyage_query_usage_reservations AS reservation
+            WHERE reservation.packet_sha256 = %s
+            """,
+            (activation.packet_sha256,),
+        ).fetchone() == (
+            "EXACT30",
+            activation.query_manifest_sha256,
+            activation.scope_claim_sha256,
+            1,
+        )
+
+
+def test_voyage_evaluation_batch_claim_rejects_reservation_identity_drift(
+    isolated_postgres_cluster: dict[str, str],
+) -> None:
+    activation = _evaluation_batch_activation()
+    repository = PsycopgPreS5VoyageQueryUsageRepository(
+        database_dsn=isolated_postgres_cluster["rag_writer_dsn"]
+    )
+    lease = repository.reserve(activation=activation, evaluation_component_scope="EXACT30")
+
+    with psycopg.connect(isolated_postgres_cluster["rag_writer_dsn"]) as connection:
+        with pytest.raises(psycopg.Error) as mismatch:
+            connection.execute(
+                """
+                SELECT public.claim_rag_v2_immutable_voyage_evaluation_batch_attempt(
+                  %s, %s, %s, %s, %s
+                )
+                """,
+                (
+                    lease.usage_event_id,
+                    "a" * 64,
+                    "OA112",
+                    "b" * 64,
+                    "c" * 64,
+                ),
+            )
+    assert mismatch.value.sqlstate == "55000"
+
+    with psycopg.connect(isolated_postgres_cluster["admin_dsn"]) as connection:
+        assert connection.execute(
+            """
+            SELECT count(*)
+            FROM rag_v2_immutable_voyage_evaluation_batch_attempts
+            WHERE usage_event_id = %s
+            """,
+            (lease.usage_event_id,),
+        ).fetchone() == (0,)
+
+
+def test_voyage_query_usage_definer_rejects_missing_official_tokenizer_and_preflight_count(
+    isolated_postgres_cluster: dict[str, str],
+) -> None:
+    activation = _activation()
+    expires_at = datetime.now(UTC) + timedelta(minutes=3)
+    with psycopg.connect(isolated_postgres_cluster["rag_writer_dsn"]) as connection:
+        with pytest.raises(psycopg.Error) as missing_tokenizer:
+            connection.execute(
+                """
+                SELECT public.reserve_rag_v2_immutable_voyage_query_usage_with_tokenizer(
+                  %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                )
+                """,
+                (
+                    "rgr_vqu_" + "f" * 32,
+                    "f" * 64,
+                    "e" * 64,
+                    activation.query_sha256,
+                    activation.scope_claim_sha256,
+                    activation.rate_evidence_sha256,
+                    None,
+                    "RUNTIME",
+                    expires_at,
+                    activation.token_cap,
+                    activation.byte_cap,
+                    activation.cost_cap_microusd,
+                    activation.input_microusd_per_token,
+                ),
+            )
+    assert missing_tokenizer.value.sqlstate == "22023"
+
+    repository = PsycopgPreS5VoyageQueryUsageRepository(
+        database_dsn=isolated_postgres_cluster["rag_writer_dsn"]
+    )
+    lease = repository.reserve(activation=activation)
+    lease.claim_attempt(now=datetime.now(UTC))
+    with psycopg.connect(isolated_postgres_cluster["admin_dsn"]) as connection:
+        usage_event_id = connection.execute(
+            "SELECT usage_event_id FROM rag_v2_immutable_voyage_query_usage_reservations WHERE packet_sha256 = %s",
+            (activation.packet_sha256,),
+        ).fetchone()
+    assert usage_event_id is not None
+
+    with psycopg.connect(isolated_postgres_cluster["rag_writer_dsn"]) as connection:
+        with pytest.raises(psycopg.Error) as missing_preflight_count:
+            connection.execute(
+                "SELECT public.commit_rag_v2_immutable_voyage_query_usage_with_tokenizer(%s, %s, %s, %s)",
+                (usage_event_id[0], None, 1, 1),
+            )
+    assert missing_preflight_count.value.sqlstate == "22023"
+
+    with psycopg.connect(isolated_postgres_cluster["admin_dsn"]) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM rag_v2_immutable_voyage_query_usage_outcomes WHERE usage_event_id = %s",
+            (usage_event_id[0],),
+        ).fetchone() == (0,)
+
+
+def _activation() -> PreS5VoyageQueryActivation:
+    question = "public evidence question"
+    scope = "rvs_" + "a" * 32
+    return PreS5VoyageQueryActivation(
+        packet_sha256="a" * 64,
+        nonce_sha256="b" * 64,
+        query_sha256=hashlib.sha256(question.encode()).hexdigest(),
+        scope_claim_sha256=hashlib.sha256(scope.encode()).hexdigest(),
+        rate_evidence_sha256="c" * 64,
+        tokenizer_sha256="d" * 64,
+        provider="VOYAGE",
+        operation="CONTEXTUALIZED_QUERY_EMBEDDING",
+        origin="https://api.voyageai.com",
+        endpoint="/v1/contextualizedembeddings",
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        logical_call_cap=1,
+        physical_call_cap=1,
+        token_cap=8_192,
+        byte_cap=1_048_576,
+        cost_cap_microusd=8_192,
+        input_microusd_per_token=1,
+        retry_count=0,
+        raw_artifact_count=0,
+    )
+
+
+def _evaluation_batch_activation() -> PreS5VoyageEvaluationBatchActivation:
+    return PreS5VoyageEvaluationBatchActivation(
+        packet_sha256="8" * 64,
+        nonce_sha256="9" * 64,
+        component_scope="EXACT30",
+        query_manifest_sha256="7" * 64,
+        scope_claim_sha256="6" * 64,
+        expected_query_count=10,
+        expected_token_count=10,
+        rate_evidence_sha256="5" * 64,
+        tokenizer_sha256="4" * 64,
+        provider="VOYAGE",
+        operation="CONTEXTUALIZED_QUERY_EMBEDDING",
+        origin="https://api.voyageai.com",
+        endpoint="/v1/contextualizedembeddings",
+        expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        logical_call_cap=1,
+        physical_call_cap=1,
+        token_cap=100,
+        byte_cap=1_048_576,
+        cost_cap_microusd=100,
+        input_microusd_per_token=1,
+        retry_count=0,
+        raw_artifact_count=0,
+    )

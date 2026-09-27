@@ -1,0 +1,82 @@
+title = "Capstone AI Trading Coach Gitleaks configuration"
+
+[[allowlists]]
+description = "Approved public SHA-256 artifacts and superseded Core 6 fixture-only digest values"
+regexes = [
+  '''^6710678b12670bc442b99edc952c4d996ae309a7020c1fa0096dd245c2faf790$''',
+  # These six values were deterministic, non-secret SHA-256 placeholders in an unpushed
+  # Core 6 contract fixture commit. Current fixtures use zero-entropy sentinels; preserve
+  # this narrow historical allowlist so a history scan cannot mistake the old digests for keys.
+  '''^b913ab4231d917a9a28a7213fcf66257f8f8d79ea092356d506daeeaddabf36e$''',
+  '''^3651313ea6ae0ee2f1e7af839e0f2a4aa96672a9e15b412cb3d2914f4bd55977$''',
+  '''^31139997140feb5fb61c0924950da502f0f6c1a347e3cc8e764f0d8d25d1bdfb$''',
+  '''^610b231832ed334bf541e4581066f3a0644a5c2750cc62c1d37e2564c4034b26$''',
+  '''^697855056eac950ae6ff755be604015aa20b627ab75369d657921ab72f802ce7$''',
+  '''^9aef7a439b432717704b6097a29d39e7007ff73b0809392643a30a7ed4e04f3d$'''
+]
+
+[[allowlists]]
+description = "B86 copies of public V36 and V37 KIS discovery source-card digests"
+regexes = [
+  '''^4281e92a878cdf08ab9cd3d52cfd4a564fef3509e85f689f03922464380d98cc$''',
+  '''^3137be113762703bbf5632ee8bdc317c182391ed04476a12a5b7b93d481db952$'''
+]
+
+[[allowlists]]
+description = "Exact non-secret CORS header, public SHA-256, and PEM marker literals"
+regexes = [
+  '^X-Rag-V2-Vertex-Scope-Claim$',
+  '^5b6cf53650253e7338e1a8121e8e067d6a95f8d436e0663f1fdbf593e00be582$',
+  '^-----BEGIN[ ]PRIVATE[ ]KEY-----$'
+]
+
+[[allowlists]]
+description = "Historical runtime-generated PEM marker in exact Vertex validation sources"
+condition = "AND"
+targetRules = ["private-key"]
+commits = ["c70e02201c5d195708b371b5cef636d505fd9b6d"]
+paths = ["^workspaces/decision-platform/spring-api/src/(test|main)/kotlin/com/capstone/decision/infrastructure/vertex/PreS5VertexCredentialProvider(Test)?[.]kt$"]
+regexTarget = "match"
+regexes = ["-----BEGIN[ ]PRIVATE[ ]KEY-----"]
+
+[[allowlists]]
+description = "Historical P1 collector documentation phrase misclassified as a generic API key"
+condition = "AND"
+targetRules = ["generic-api-key"]
+commits = ["0c5b64823a9a30c733817a861d34bb980234fac2"]
+paths = ["^docs/decision-platform/P1_DATA_ONLY_DAILY_COLLECTOR_운영_가이드[.]md$"]
+regexTarget = "secret"
+regexes = ["^Signal/Risk/order$"]
+
+[[allowlists]]
+description = "Historical Team B handoff phrase misclassified as a generic API key"
+condition = "AND"
+targetRules = ["generic-api-key"]
+commits = ["2c604e750c3da25f5ab7184991b6a6cd480e1f1a"]
+paths = ["^docs/decision-platform/P1_TEAM_B_RETURN_ENGINE_완료_요청서[.]md$"]
+regexTarget = "secret"
+regexes = ["^OCI/SBOM/provenance/signature$"]
+
+[[allowlists]]
+# 이 두 커밋의 e2e 러너가 설정 저장 경로를 확인하려고 키 모양의 상수를 들고 있었다. 가짜지만
+# 검사기는 그것을 알 수 없고, 아는 방법도 없어야 한다. 다음 커밋에서 값을 실행할 때 만들도록
+# 고쳤으므로 지금 tree에는 없다. 이미 밀어 둔 두 커밋만 이름으로 짚어 지나가게 한다.
+#
+# 커밋·경로·규칙 셋으로 묶는다. 셋 중 하나라도 넓히면 나중에 같은 파일에 진짜 키가 들어와도
+# 지나간다.
+description = "Historical e2e probe fixtures misclassified as generic API keys"
+condition = "AND"
+targetRules = ["generic-api-key"]
+commits = [
+  "ce86ce052c2760b9616c5867daf50397dec72817",
+  "955734f7617706a9b6dd62eff99b2ae0ad4f74c8"
+]
+paths = [
+  "^workspaces/decision-platform/python-services/tests/e2e/settings_probe[.]py$",
+  "^workspaces/decision-platform/python-services/tests/e2e/ai_judgement_e2e[.]py$"
+]
+regexTarget = "secret"
+regexes = ["^sk-(probe-0123456789ABCDefgh|e2e-probe-ABCDwxyz)$"]
+
+[extend]
+useDefault = true

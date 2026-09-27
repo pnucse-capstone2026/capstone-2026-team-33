@@ -1,0 +1,104 @@
+package com.capstone.decision
+
+import com.tngtech.archunit.junit.AnalyzeClasses
+import com.tngtech.archunit.junit.ArchTest
+import com.tngtech.archunit.lang.ArchRule
+import com.tngtech.archunit.lang.syntax.ArchRuleDefinition.noClasses
+
+// domain이 생기기 전부터 infrastructure 의존 금지 규칙을 CI에 걸어 경계 회귀를 막는다.
+@AnalyzeClasses(packages = ["com.capstone.decision"])
+class ArchitectureTest {
+    companion object {
+        // allowEmptyShould로 초기 skeleton에서도 규칙을 살려두고, domain 추가 시 즉시 검사하게 한다.
+        @ArchTest
+        @JvmField
+        val domainDoesNotDependOnInfrastructure: ArchRule =
+            noClasses()
+                .that()
+                .resideInAPackage("..domain..")
+                .should()
+                .dependOnClassesThat()
+                .resideInAPackage("..infrastructure..")
+                .allowEmptyShould(true)
+
+        @ArchTest
+        @JvmField
+        val apiDoesNotDependOnInfrastructure: ArchRule =
+            noClasses()
+                .that()
+                .resideInAnyPackage("..api.principle..", "..api.risk..")
+                .should()
+                .dependOnClassesThat()
+                .resideInAPackage("..infrastructure..")
+                .allowEmptyShould(true)
+
+        @ArchTest
+        @JvmField
+        val applicationDoesNotDependOnInfrastructure: ArchRule =
+            noClasses()
+                .that()
+                .resideInAPackage("..application..")
+                .should()
+                .dependOnClassesThat()
+                .resideInAPackage("..infrastructure..")
+                .allowEmptyShould(true)
+
+        @ArchTest
+        @JvmField
+        val riskDomainDoesNotDependOnSpring: ArchRule =
+            noClasses()
+                .that()
+                .resideInAPackage("..domain.risk..")
+                .should()
+                .dependOnClassesThat()
+                .resideInAnyPackage(
+                    "org.springframework..",
+                    "java.sql..",
+                    "javax.sql..",
+                    "io.grpc..",
+                ).allowEmptyShould(true)
+
+        @ArchTest
+        @JvmField
+        val riskApplicationDoesNotDependOnSpring: ArchRule =
+            noClasses()
+                .that()
+                .resideInAPackage("..application.risk..")
+                .should()
+                .dependOnClassesThat()
+                .resideInAnyPackage("org.springframework..")
+                .allowEmptyShould(true)
+
+        @ArchTest
+        @JvmField
+        val brokerageDomainIsTransportAndPersistenceAgnostic: ArchRule =
+            noClasses()
+                .that()
+                .resideInAPackage("..domain.brokerage..")
+                .should()
+                .dependOnClassesThat()
+                .resideInAnyPackage(
+                    "org.springframework..",
+                    "java.sql..",
+                    "javax.sql..",
+                    "io.grpc..",
+                    "com.google.protobuf..",
+                ).allowEmptyShould(true)
+
+        @ArchTest
+        @JvmField
+        val brokerageApplicationDoesNotUseJdbcOrGeneratedTransport: ArchRule =
+            noClasses()
+                .that()
+                .resideInAPackage("..application.brokerage..")
+                .should()
+                .dependOnClassesThat()
+                .resideInAnyPackage(
+                    "java.sql..",
+                    "javax.sql..",
+                    "io.grpc..",
+                    "com.google.protobuf..",
+                    "..brokerage.v1..",
+                ).allowEmptyShould(true)
+    }
+}

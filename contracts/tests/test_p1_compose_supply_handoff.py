@@ -1,0 +1,517 @@
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+import yaml
+
+import contracts.verify_p1_compose_supply_handoff as verifier
+from contracts.verify_p1_compose_supply_handoff import (
+    CATALOG_PATH,
+    EXACT_TEAM_B_FILES,
+    HANDOFF_PATHS,
+    ContractError,
+    main,
+    remote_verification_commands,
+    supply_catalog,
+    verify_compose,
+    verify_handoff_docs,
+    verify_bundle,
+    verify_receipt,
+)
+
+
+class P1ComposeSupplyHandoffTest(unittest.TestCase):
+    def valid_receipt(self) -> dict[str, object]:
+        digest = "a" * 64
+        return {
+            "artifactManifestSha256": digest,
+            "contractId": "p1-team-b-oci-receipt.v1",
+            "dependencyLockSha256": digest,
+            "dockerfileSha256": digest,
+            "imageReference": f"ghcr.io/robinhood0107/capstone-team-b-return-artifact@sha256:{digest}",
+            "inputPackSha256": digest,
+            "manifestDigest": f"sha256:{digest}",
+            "outputArtifacts": [
+                {"path": path, "sha256": digest, "sizeBytes": 1}
+                for path in EXACT_TEAM_B_FILES
+            ],
+            "providerAuthority": supply_catalog()["providerAuthority"],
+            "producerCommitSha256": digest,
+            "sourceArchiveSha256": digest,
+            "subjectCommitSha": "b" * 40,
+        }
+
+    def test_checked_in_compose_supply_and_handoff_are_complete(self) -> None:
+        self.assertEqual(0, main([]))
+        verify_compose()
+        verify_handoff_docs()
+        self.assertEqual(
+            supply_catalog(), json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
+        )
+        self.assertTrue(
+            all(
+                (Path(__file__).resolve().parents[2] / path).is_file()
+                for path in HANDOFF_PATHS
+            )
+        )
+
+    def test_tls_proxy_exception_requires_exact_profile_and_ports(self) -> None:
+        original = verifier.COMPOSE_PATH.read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as temporary:
+            candidate = Path(temporary) / "compose.yml"
+            for changed in (
+                original.replace("profiles: [tls]", "profiles: [public]", 1),
+                original.replace(
+                    "${P1_TLS_HTTPS_PORT:-8443}:8443",
+                    "${P1_TLS_HTTPS_PORT:-8443}:9443",
+                    1,
+                ),
+            ):
+                candidate.write_text(changed, encoding="utf-8")
+                with (
+                    patch.object(verifier, "COMPOSE_PATH", candidate),
+                    self.assertRaises(ContractError),
+                ):
+                    verify_compose()
+
+    def test_local_team_b_validator_is_network_none_and_validate_only(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        controller = (root / "deploy/p1/full-appctl").read_text(encoding="utf-8")
+        block = controller.split("artifact_validate() {", 1)[1].split("\n}\n", 1)[0]
+        self.assertIn("--pull never", block)
+        self.assertIn("--network none", block)
+        self.assertIn("--read-only", block)
+        self.assertIn("--cap-drop ALL", block)
+        self.assertIn("--security-opt no-new-privileges:true", block)
+        self.assertIn("--validate-only", block)
+        self.assertIn("PROVIDER_LIVE_CALLS_ENABLED=false", block)
+        self.assertIn("KIS_OFFLINE=1", block)
+        self.assertIn("PROVIDER_CALLS=0", block)
+
+    def test_local_team_b_validator_rejects_unsafe_input_before_docker(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        controller = root / "deploy/p1/full-appctl"
+
+        def invoke(bundle: str, digest: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [
+                    str(controller),
+                    "artifact",
+                    "validate",
+                    bundle,
+                    "--manifest-sha256",
+                    digest,
+                ],
+                cwd=root,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+
+        relative = invoke("relative/bundle", "a" * 64)
+        self.assertEqual(1, relative.returncode)
+        self.assertIn("CAPSTONE_ERROR=ARTIFACT_VALIDATE_BUNDLE_ROOT", relative.stderr)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary)
+            target = temporary_root / "target"
+            target.mkdir()
+            link = temporary_root / "link"
+            link.symlink_to(target, target_is_directory=True)
+            symlinked = invoke(str(link), "a" * 64)
+            self.assertEqual(1, symlinked.returncode)
+            self.assertIn(
+                "CAPSTONE_ERROR=ARTIFACT_VALIDATE_BUNDLE_ROOT", symlinked.stderr
+            )
+
+            invalid_hash = invoke(str(target), "not-a-sha")
+            self.assertEqual(1, invalid_hash.returncode)
+            self.assertIn(
+                "CAPSTONE_ERROR=ARTIFACT_VALIDATE_MANIFEST_SHA256",
+                invalid_hash.stderr,
+            )
+
+            comma_parent = temporary_root / "unsafe,parent" / "bundle"
+            comma_parent.mkdir(parents=True)
+            invalid_parent = invoke(str(comma_parent), "a" * 64)
+            self.assertEqual(1, invalid_parent.returncode)
+            self.assertIn(
+                "CAPSTONE_ERROR=ARTIFACT_VALIDATE_BUNDLE_PARENT",
+                invalid_parent.stderr,
+            )
+
+    def test_receipt_requires_restricted_digest_exact10_and_all_attestations(
+        self,
+    ) -> None:
+        receipt = self.valid_receipt()
+        verify_receipt(receipt)
+        for mutation in (
+            "tag",
+            "foreign",
+            "missing",
+            "malformed-output",
+            "bool-size",
+            "zero-commit",
+            "authority",
+        ):
+            candidate = copy.deepcopy(receipt)
+            if mutation == "tag":
+                candidate["imageReference"] = (
+                    "ghcr.io/robinhood0107/capstone-team-b-return-artifact:latest"
+                )
+            elif mutation == "foreign":
+                candidate["imageReference"] = (
+                    "ghcr.io/example/foreign@sha256:" + "a" * 64
+                )
+            elif mutation == "missing":
+                candidate["outputArtifacts"] = candidate["outputArtifacts"][:-1]
+            elif mutation == "malformed-output":
+                candidate["outputArtifacts"][0] = "not-an-object"
+            elif mutation == "bool-size":
+                candidate["outputArtifacts"][0]["sizeBytes"] = True
+            elif mutation == "zero-commit":
+                candidate["subjectCommitSha"] = "0" * 40
+            else:
+                candidate["providerAuthority"]["providerCalls"] = 1
+            with self.subTest(mutation=mutation), self.assertRaises(ContractError):
+                verify_receipt(candidate)
+
+    def test_remote_commands_verify_before_digest_pull(self) -> None:
+        reference = self.valid_receipt()["imageReference"]
+        commands = remote_verification_commands(reference)
+        self.assertEqual("cosign", commands[0][0])
+        self.assertEqual("verify", commands[0][1])
+        self.assertEqual("verify-blob", commands[1][1])
+        self.assertEqual("oras", commands[-1][0])
+        self.assertEqual(6, len(commands))
+        self.assertEqual(reference, commands[-1][2])
+        with self.assertRaises(ContractError):
+            remote_verification_commands(
+                "ghcr.io/robinhood0107/capstone-team-b-return-artifact:latest"
+            )
+
+    def test_compose_rejects_duplicate_yaml_and_unsigned_receipt_verifier(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_root = Path(temporary)
+            compose = temporary_root / "compose.yml"
+            control = temporary_root / "full-appctl"
+            oci_verifier = temporary_root / "verify-team-b-oci"
+            compose.write_text(
+                (root / "deploy/p1/compose.yml").read_text(encoding="utf-8")
+                + "\nservices: {}\n",
+                encoding="utf-8",
+            )
+            control.write_text(
+                (root / "deploy/p1/full-appctl").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            oci_verifier.write_text(
+                (root / "deploy/p1/verify-team-b-oci").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(verifier, "COMPOSE_PATH", compose),
+                patch.object(verifier, "CONTROL_PATH", control),
+                patch.object(verifier, "OCI_VERIFIER_PATH", oci_verifier),
+                self.assertRaises(ContractError),
+            ):
+                verify_compose()
+
+            compose.write_text(
+                (root / "deploy/p1/compose.yml").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            oci_verifier.write_text(
+                (root / "deploy/p1/verify-team-b-oci")
+                .read_text(encoding="utf-8")
+                .replace("cosign verify-blob", "cosign inspect-blob", 1),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(verifier, "COMPOSE_PATH", compose),
+                patch.object(verifier, "CONTROL_PATH", control),
+                patch.object(verifier, "OCI_VERIFIER_PATH", oci_verifier),
+                self.assertRaises(ContractError),
+            ):
+                verify_compose()
+
+    def test_handoff_rejects_missing_sections_and_internal_paths(self) -> None:
+        for relative in verifier.HANDOFF_PATHS:
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                handoff = root / relative
+                handoff.parent.mkdir(parents=True)
+                handoff.write_text(
+                    "\n".join(verifier.HEADINGS[:-1]) + "\n", encoding="utf-8"
+                )
+                with (
+                    patch.object(verifier, "ROOT", root),
+                    patch.object(verifier, "HANDOFF_PATHS", (relative,)),
+                    self.assertRaises(ContractError),
+                ):
+                    verify_handoff_docs()
+
+            handoff.write_text(
+                "\n".join(verifier.HEADINGS)
+                + "\n"
+                + "-".join(("private", "reference"))
+                + "\n",
+                encoding="utf-8",
+            )
+            with (
+                patch.object(verifier, "ROOT", root),
+                patch.object(verifier, "HANDOFF_PATHS", (relative,)),
+                self.assertRaises(ContractError),
+            ):
+                verify_handoff_docs()
+
+    def test_pulled_bundle_requires_manifest_plus_exact10_hashes(self) -> None:
+        receipt = self.valid_receipt()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = json.loads(
+                (
+                    Path(__file__).resolve().parents[2]
+                    / "contracts/examples/p1-return-engine-artifact-manifest.v2.valid.json"
+                ).read_text(encoding="utf-8")
+            )
+            for manifest_item, receipt_item in zip(
+                manifest["artifacts"], receipt["outputArtifacts"], strict=True
+            ):
+                content = receipt_item["path"].encode()
+                (root / receipt_item["path"]).write_bytes(content)
+                receipt_item["sizeBytes"] = len(content)
+                receipt_item["sha256"] = hashlib.sha256(content).hexdigest()
+                manifest_item["sizeBytes"] = receipt_item["sizeBytes"]
+                manifest_item["sha256"] = receipt_item["sha256"]
+            payload = (
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode()
+            (root / "manifest.json").write_bytes(payload)
+            receipt["artifactManifestSha256"] = hashlib.sha256(payload).hexdigest()
+            verify_bundle(receipt, root)
+            (root / "unexpected.txt").write_text("x", encoding="utf-8")
+            with self.assertRaises(ContractError):
+                verify_bundle(receipt, root)
+            (root / "unexpected.txt").unlink()
+            manifest["producer"]["dependencyLockSha256"] = "b" * 64
+            payload = (
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode()
+            (root / "manifest.json").write_bytes(payload)
+            receipt["artifactManifestSha256"] = hashlib.sha256(payload).hexdigest()
+            with self.assertRaises(ContractError):
+                verify_bundle(receipt, root)
+
+    def test_no_real_receipt_is_checked_in(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        self.assertEqual([], list(root.glob("**/p1-team-b-oci-receipt.v1.json")))
+        with tempfile.TemporaryDirectory() as temporary:
+            receipt = Path(temporary) / "receipt.json"
+            receipt.write_text(json.dumps(self.valid_receipt()), encoding="utf-8")
+            self.assertEqual(0, main(["--receipt", str(receipt)]))
+            self.assertEqual(
+                0,
+                main(
+                    [
+                        "--receipt",
+                        str(receipt),
+                        "--expected-reference",
+                        self.valid_receipt()["imageReference"],
+                    ]
+                ),
+            )
+            self.assertEqual(
+                1,
+                main(
+                    [
+                        "--receipt",
+                        str(receipt),
+                        "--expected-reference",
+                        "ghcr.io/robinhood0107/capstone-team-b-return-artifact@sha256:"
+                        + "b" * 64,
+                    ]
+                ),
+            )
+            receipt.write_text("[]", encoding="utf-8")
+            self.assertEqual(1, main(["--receipt", str(receipt)]))
+            receipt.write_text('{"contractId":"a","contractId":"b"}', encoding="utf-8")
+            self.assertEqual(1, main(["--receipt", str(receipt)]))
+            target = Path(temporary) / "target.json"
+            target.write_text(json.dumps(self.valid_receipt()), encoding="utf-8")
+            receipt.unlink()
+            receipt.symlink_to(target)
+            self.assertEqual(1, main(["--receipt", str(receipt)]))
+
+    def test_the_shipped_stack_cannot_turn_bge_on(self) -> None:
+        """배포 경로 어디에서도 BGE 관문이 열리지 않는지 본다.
+
+        공개 코퍼스는 Voyage 하나로 통일했고, 코드 쪽 관문은 ONNX 세션을 여는 한 곳에
+        있다. 그 관문을 여는 것은 CAPSTONE_RAG_BGE_ENABLED 와 런타임 제어의 bgeEnabled
+        둘뿐이다.
+
+        코드 테스트만으로는 부족하다. 누가 compose 에 그 변수를 넣거나 구워지는 기본
+        제어를 true 로 바꾸면 코드 테스트는 전부 통과한 채 제품이 BGE 로 돈다. 배포
+        산출물 쪽에서 막는 것은 여기밖에 없다.
+        """
+
+        root = Path(__file__).resolve().parents[2]
+        compose = (root / "deploy/p1/compose.yml").read_text(encoding="utf-8")
+        self.assertNotIn(
+            "CAPSTONE_RAG_BGE_ENABLED",
+            compose,
+            "compose 가 BGE 관문을 연다. Voyage 통일 결정과 어긋난다.",
+        )
+
+        control = root / "deploy/p1/rag-runtime-default/control/pre-s5-voyage-query-runtime.json"
+        self.assertIs(
+            json.loads(control.read_text(encoding="utf-8"))["bgeEnabled"],
+            False,
+            "이미지에 구워지는 기본 런타임 제어가 BGE 를 켜 둔다.",
+        )
+
+    def test_daily_collector_keeps_the_default_container_count_at_five(self) -> None:
+        """기본은 5개, --models 가 2개, --mock 이 1개를 더한다.
+
+        "기본 장기 컨테이너 5개"는 계약 기록이다. 상주 수집기를 기본으로 올리면 그 문장이
+        거짓이 되므로 automation profile 뒤에 두고 --mock 에서만 띄운다.
+        """
+
+        root = Path(__file__).resolve().parents[2]
+        controller = (root / "deploy/p1/full-appctl").read_text(encoding="utf-8")
+
+        self.assertIn("local expected=5", controller)
+        self.assertIn("((models)) && expected=$((expected + 2))", controller)
+        self.assertIn("((mock)) && expected=$((expected + 1))", controller)
+        # 수집기는 --mock 에서만 올라오고 아니면 내려간다.
+        self.assertIn(
+            "compose --profile automation up -d --wait market-data-daily", controller
+        )
+        self.assertIn(
+            "compose --profile automation stop market-data-daily", controller
+        )
+
+    def test_daily_collector_is_least_privilege_and_reuses_the_stack(self) -> None:
+        """수집기는 writer DSN 하나만 들고, 새 이미지·secret 을 만들지 않는다."""
+
+        root = Path(__file__).resolve().parents[2]
+        compose = (root / "deploy/p1/compose.yml").read_text(encoding="utf-8")
+        block = compose.split("  market-data-daily:\n", 1)[1].split("\n\n", 1)[0]
+
+        # 기본 up 이 건드리지 않도록 profile 뒤에 있다.
+        self.assertIn("profiles: [automation]", block)
+        # 기존 이미지를 그대로 쓴다.
+        self.assertIn("${P1_PYTHON_IMAGE:-capstone-decision-platform:p1-local}", block)
+        # secret 은 정확히 하나. 여기에 KIS 앱키나 자동운용 DSN 이 붙으면 안 된다.
+        self.assertIn("secrets: [market_data_env]", block)
+        self.assertNotIn("market_data_provider_env", block)
+        self.assertNotIn("automation_runtime_env", block)
+        # postgres 와 외부 HTTPS 둘 다 필요하다.
+        self.assertIn("networks: [p1-data, p1-app]", block)
+        # 보안 앵커를 그대로 상속한다 (read_only, cap_drop ALL, no-new-privileges).
+        self.assertIn("<<: *app-security", block)
+        # 실행은 기존 CLI 다. 새 스케줄러 코드를 만들지 않았다.
+        self.assertIn("app.data.market_data.yfinance_daily_cli", block)
+        # 관측 적재의 사전 검증이 요구하는 실행 대상 표시. 아래 테스트가 규칙 전체를 본다.
+        self.assertIn('DECISION_SOURCE_WRITER_OFFLINE_TARGET: "local"', block)
+
+    def test_every_writer_attesting_service_declares_the_offline_target(self) -> None:
+        """`attest_source_writer_dsn` 을 지날 수 있는 서비스는 전부 실행 대상을 선언한다.
+
+        왜 이 테스트가 있나. 수집기에 이 값이 빠져 있었고, 그래서 시세·종목카탈로그 관측이
+        한 번도 적재되지 않았다. 값이 없으면 사전 검증이 `ValueError` 로 거부하는데 CLI 가
+        그것을 마커 한 낱말로 삼켜 `observations=FAILED_ValueError` 만 남겼다. 하류에서는
+        주문이 `violations` 없이 `PRICE_MISSING` 으로 HOLD 되는 모습으로만 보였다.
+
+        판정 기준을 무엇으로 두나. 처음에는 compose 명세에 모듈 이름이 적힌 서비스만 봤는데
+        그것이 `market-data-cli` 를 놓쳤다 - 그 서비스의 `command` 는 다른 CLI 이고 일봉
+        수집기는 `full-appctl` 이 런타임에 인자로 넘긴다. 정확한 기준은 자격이다. compose 의
+        주석이 이미 적어 뒀듯 시장데이터 writer DSN(`market_data_env`)은 두 서비스에만
+        붙으며, 그 DSN 을 든 서비스는 언제든 writer 사전 검증을 지날 수 있다.
+
+        인스턴스 하나가 아니라 부류를 닫는다 - 그 secret 을 든 서비스를 새로 추가하면
+        여기서 막힌다.
+        """
+
+        root = Path(__file__).resolve().parents[2]
+        compose = yaml.safe_load((root / "deploy/p1/compose.yml").read_text(encoding="utf-8"))
+
+        # 상주 자동운용이 `runtime_observation_publisher` 를 통해 같은 사전 검증을 부른다.
+        # supervisor 가 decision-platform 안에서 띄우므로 그 서비스도 규칙을 받는다.
+        supervisor = (root / "deploy/p1/docker/decision-platform-supervisor.py").read_text(
+            encoding="utf-8"
+        )
+        supervisor_reaches = "app.p1_owner.automation_runtime" in supervisor
+
+        missing: list[str] = []
+        examined: list[str] = []
+        for name, service in (compose.get("services") or {}).items():
+            holds_writer_dsn = "market_data_env" in (service.get("secrets") or [])
+            reaches = holds_writer_dsn or (name == "decision-platform" and supervisor_reaches)
+            if not reaches:
+                continue
+            examined.append(name)
+            if (service.get("environment") or {}).get(
+                "DECISION_SOURCE_WRITER_OFFLINE_TARGET"
+            ) != "local":
+                missing.append(name)
+
+        self.assertEqual([], missing)
+        # 규칙이 빈 집합을 훑고 초록불이 되지 않게, 걸려야 하는 서비스를 이름으로 고정한다.
+        self.assertEqual(
+            [
+                "decision-platform",
+                "market-data-cli",
+                "market-data-daily",
+                "world-news-minute",
+            ],
+            sorted(examined),
+        )
+
+    def test_daily_collector_entrypoint_profile_requires_only_the_writer_dsn(self) -> None:
+        """entrypoint whitelist 가 이 컨테이너에 writer DSN 하나만 허용한다.
+
+        market-data 프로파일을 재사용하면 secret 파일 세 개가 붙어 KIS 앱키와 자동운용 DSN 이
+        함께 들어온다. 그래서 전용 항목을 두었고, 그것이 좁게 유지되는지 본다.
+        """
+
+        root = Path(__file__).resolve().parents[2]
+        entrypoint = (root / "deploy/p1/docker/secret-entrypoint.sh").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn(
+            "market-data-daily) secret_files=/run/secrets/market_data_env ;;", entrypoint
+        )
+        self.assertIn("market-data-daily:MARKET_DATA_WRITER_DSN) return 0 ;;", entrypoint)
+        self.assertIn(
+            "market-data-daily) printf '%s\\n' 'MARKET_DATA_WRITER_DSN' ;;", entrypoint
+        )
+        self.assertIn("world-news) secret_files=/run/secrets/market_data_env ;;", entrypoint)
+        self.assertIn("world-news:MARKET_DATA_WRITER_DSN) return 0 ;;", entrypoint)
+        self.assertIn("world-news) printf '%s\\n' 'MARKET_DATA_WRITER_DSN' ;;", entrypoint)
+        # 이 프로파일에 다른 키를 허용하지 않는다.
+        for forbidden in (
+            "market-data-daily:P1_AUTOMATION_DATABASE_DSN",
+            "market-data-daily:KIS_MOCK_APP_KEY",
+            "market-data-daily:KIS_LIVE_APP_KEY",
+            "market-data-daily:AUTOMATION_RUNTIME_SHARED_SECRET",
+            "world-news:P1_AUTOMATION_DATABASE_DSN",
+            "world-news:KIS_MOCK_APP_KEY",
+            "world-news:KIS_LIVE_APP_KEY",
+            "world-news:AUTOMATION_RUNTIME_SHARED_SECRET",
+        ):
+            self.assertNotIn(forbidden, entrypoint)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,22 @@
+[Unit]
+Description=S5 autonomous tick (RETIRED research-only compatibility)
+Documentation=file://%h/projects/Capstone-AI-Trading-Coach/CONTRIBUTING.md
+# Historical unit only. Do not install or enable after the research-only transition.
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projects/Capstone-AI-Trading-Coach/workspaces/decision-platform/python-services
+# Existing installations may still reference the historical owner-private environment file.
+EnvironmentFile=%h/.config/s5-tick/tick.env
+ExecStart=%h/.local/bin/uv run --frozen s5-tick
+# Current command returns 1 before root, credentials, quota, or providers are accessed.
+SuccessExitStatus=0 1
+TimeoutStartSec=3600
+Nice=10
+# The retained command does not write the root in research-only mode.
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

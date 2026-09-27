@@ -1,0 +1,41 @@
+# S2.4 offline idempotency fixtures were generic-key false positives; current call sites use an explicit header parameter name.
+cc3e639dc50d44c17e208250da4d1f27a74b5057:workspaces/decision-platform/spring-api/src/test/kotlin/com/capstone/decision/DecisionApiIntegrationTest.kt:generic-api-key:125
+cc3e639dc50d44c17e208250da4d1f27a74b5057:workspaces/decision-platform/spring-api/src/test/kotlin/com/capstone/decision/DecisionApiIntegrationTest.kt:generic-api-key:175
+cc3e639dc50d44c17e208250da4d1f27a74b5057:workspaces/decision-platform/spring-api/src/test/kotlin/com/capstone/decision/DecisionApiIntegrationTest.kt:generic-api-key:186
+
+# S3.3 offline brokerage fixtures use explicit idempotency-key parameters and contain no provider secret.
+ba004f1ed0d04370832cc6c2facbf46db1df801c:workspaces/decision-platform/spring-api/src/test/kotlin/com/capstone/decision/BrokerageApiIntegrationTest.kt:generic-api-key:354
+ba004f1ed0d04370832cc6c2facbf46db1df801c:workspaces/decision-platform/spring-api/src/test/kotlin/com/capstone/decision/BrokerageApiIntegrationTest.kt:generic-api-key:366
+436fc2d6b1963d6f4e5244f50a373b18fe5c6d25:workspaces/decision-platform/spring-api/src/test/kotlin/com/capstone/decision/BrokerageApiIntegrationTest.kt:generic-api-key:178
+436fc2d6b1963d6f4e5244f50a373b18fe5c6d25:workspaces/decision-platform/spring-api/src/test/kotlin/com/capstone/decision/BrokerageApiIntegrationTest.kt:generic-api-key:223
+
+# S5.0 catalog와 변경 기록의 current OpenAPI SHA-256은 공개 계약 bytes의 비밀이 아닌 digest다.
+a92dee4db04f4c916622b526fe00832bd76163e0:contracts/catalogs/s5-0-signal-v2-contract.v1.json:generic-api-key:3
+5761beca894a6447f54bdcba8644f6b66b83dcb5:contracts/changes/20260801-s5-0-signal-v2-contract-lock.md:generic-api-key:47
+
+# S5 runtime transition catalog와 generator도 같은 공개 historical OpenAPI digest를 고정한다.
+9f85c294ec416329cc809005fb64b671f2530446:contracts/catalogs/s5-signal-runtime-transition.v1.json:generic-api-key:17
+9f85c294ec416329cc809005fb64b671f2530446:contracts/generate_s5_signal_runtime_contracts.py:generic-api-key:424
+
+# S4.7D local parser가 credential 형태를 반드시 격리하는지 확인하는 synthetic fixture다.
+37c0e0a3a4de28c810ef43e0eb3bc148295fb030:workspaces/decision-platform/python-services/tests/rag/test_local_document_parser.py:generic-api-key:404
+
+# S4.8 local FinBERT runner의 historical tokenizer filename과 bounded numeric cap 조합은 credential이 아니다.
+# This exact history fingerprint preserves generic 64-hex detection for every other source line.
+6622c7c0befee7288cc50c5874a803df7ea655e5:workspaces/decision-platform/python-services/app/cross_market/foreign_news_local_evaluation.py:generic-api-key:496
+
+# Unpublished Pre-S5 catalog history held public immutable-contract integrity digests; these exact scanner fingerprints do not mask arbitrary 64-hex values.
+6f9466bcd9f21ebcc3b81471ee90f5b7558c0a65:contracts/catalogs/pre-s5-rag-news-contract.v1.json:generic-api-key:78
+6f9466bcd9f21ebcc3b81471ee90f5b7558c0a65:contracts/catalogs/pre-s5-rag-news-contract.v1.json:generic-api-key:79
+6f9466bcd9f21ebcc3b81471ee90f5b7558c0a65:contracts/catalogs/pre-s5-rag-news-contract.v1.json:generic-api-key:105
+
+# S4.9 CI의 Compose substitution용 validation-dummy 값이며 실제 SearXNG secret이 아니다.
+a07a5539659487e15f5d14dedc0c1661dd48b1a0:.github/workflows/repo-hygiene.yml:generic-api-key:73
+
+# Public BGE tokenizer integrity digest from the approved Hugging Face model artifact.
+c7c1ddd2cd7374fe822bdf1ac9ad55a4a1799bd4:workspaces/decision-platform/python-services/app/rag/bge_full_generation.py:generic-api-key:37
+c7c1ddd2cd7374fe822bdf1ac9ad55a4a1799bd4:workspaces/decision-platform/python-services/app/rag/source_card_corpus.py:generic-api-key:28
+
+# B86 byte-stable copies of the public KIS discovery source-card integrity digests.
+d48e60f514cd09a76570934350c68044ff304258:workspaces/decision-platform/spring-api/src/main/resources/db/baseline/B86__p1_offline_demo_baseline.sql:generic-api-key:36642
+d48e60f514cd09a76570934350c68044ff304258:workspaces/decision-platform/spring-api/src/main/resources/db/baseline/B86__p1_offline_demo_baseline.sql:generic-api-key:36675

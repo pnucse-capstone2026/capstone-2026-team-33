@@ -1,0 +1,1106 @@
+name: capstone-p1-full-app
+
+x-app-security: &app-security
+  platform: linux/amd64
+  group_add: ["${P1_SECRET_GID}"]
+  mem_limit: 2g
+  cpus: 2.0
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  pids_limit: 256
+  restart: unless-stopped
+  tmpfs:
+    - /tmp:size=128m,mode=1777
+
+services:
+  postgres:
+    image: ${P1_POSTGRES_IMAGE:-capstone-postgres-pgvector:p1-local}
+    platform: linux/amd64
+    user: "70:70"
+    group_add: ["${P1_SECRET_GID}"]
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "postgres", "docker-entrypoint.sh"]
+    command: ["postgres", "-c", "listen_addresses=*", "-c", "log_statement=none"]
+    environment:
+      POSTGRES_DB: capstone_p1
+      POSTGRES_USER: postgres
+      PGDATA: /var/lib/postgresql/data/pgdata
+    secrets: [postgres_env]
+    volumes:
+      # Keep the historical P1 volume recoverable. The current full-app schema
+      # starts from a separately named volume so an older Flyway baseline can
+      # never be silently reused by the preview path.
+      - p1-postgres-current:/var/lib/postgresql/data
+      - ../../infra/init/01-extensions.sql:/docker-entrypoint-initdb.d/01-extensions.sql:ro
+      - ../../infra/init/02-application-roles.sh:/docker-entrypoint-initdb.d/02-application-roles.sh:ro
+      - ./docker/secret-entrypoint.sh:/usr/local/bin/p1-secret-entrypoint:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    mem_limit: 1g
+    cpus: 1.5
+    shm_size: 128m
+    tmpfs:
+      - /tmp:size=64m,mode=1777,uid=70,gid=70
+      - /var/run/postgresql:size=16m,mode=0770,uid=70,gid=70
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d capstone_p1"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    networks: [p1-data]
+
+  redis:
+    image: ${P1_REDIS_IMAGE:-capstone-redis:p1-local}
+    platform: linux/amd64
+    user: "999:1000"
+    group_add: ["${P1_SECRET_GID}"]
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "redis"]
+    secrets: [redis_env]
+    volumes:
+      - p1-redis:/data
+      - ./docker/secret-entrypoint.sh:/usr/local/bin/p1-secret-entrypoint:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 0.5
+    tmpfs:
+      - /tmp:size=16m,mode=1777,uid=999,gid=999
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          . /run/secrets/redis_env &&
+          [ "$$(REDISCLI_AUTH="$$REDIS_PASSWORD" redis-cli --no-auth-warning ping)" = PONG ]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+    networks: [p1-data]
+
+  # 이미지의 기본 트리로 RAG 런타임 루트를 채운다. 자세한 사유는 스크립트 주석에 있다.
+  rag-runtime-seed:
+    image: ${P1_PYTHON_IMAGE:-capstone-decision-platform:p1-local}
+    platform: linux/amd64
+    user: "0:0"
+    entrypoint: ["/usr/local/bin/p1-rag-runtime-seed"]
+    environment:
+      RAG_V2_VERTEX_AUTO_ACTIVATION_ENABLED: "${P1_RAG_V2_VERTEX_AUTO_ACTIVATION_ENABLED:-false}"
+      MARS_VERTEX_SERVICE_ACCOUNT_JSON_B64: "${MARS_VERTEX_SERVICE_ACCOUNT_JSON_B64:-}"
+      MARS_VERTEX_MODEL_ID: "${MARS_VERTEX_MODEL_ID:-gemini-3.5-flash}"
+      MARS_VERTEX_PROJECT_ID: "${MARS_VERTEX_PROJECT_ID:-}"
+      P1_VERTEX_OPERATOR: "${P1_VERTEX_OPERATOR:-auto-activation}"
+      P1_VERTEX_INPUT_TOKEN_CAP: "${P1_VERTEX_INPUT_TOKEN_CAP:-60512}"
+      P1_VERTEX_OUTPUT_TOKEN_CAP: "${P1_VERTEX_OUTPUT_TOKEN_CAP:-8192}"
+      P1_VERTEX_INPUT_BYTE_CAP: "${P1_VERTEX_INPUT_BYTE_CAP:-60000}"
+      P1_VERTEX_COST_CAP_MICROUSD: "${P1_VERTEX_COST_CAP_MICROUSD:-500000}"
+      # 2026-09-23 Gemini 3.5 Flash global 공개가격 $2.70/$16.20 per 1M을
+      # 마이크로달러/토큰으로 올림했다. 모델 변경 시 두 단가도 함께 검토한다.
+      P1_VERTEX_INPUT_MICROUSD_PER_TOKEN: "${P1_VERTEX_INPUT_MICROUSD_PER_TOKEN:-3}"
+      P1_VERTEX_OUTPUT_MICROUSD_PER_TOKEN: "${P1_VERTEX_OUTPUT_MICROUSD_PER_TOKEN:-17}"
+    volumes:
+      - ${P1_RAG_RUNTIME_DIR:-p1-rag-runtime}:/run/rag-runtime
+    restart: "no"
+    networks: [p1-data]
+
+  role-bootstrap:
+    image: ${P1_SPRING_IMAGE:-capstone-decision-platform:p1-local}
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "role-bootstrap"]
+    command:
+      - java
+      - -Dloader.main=com.capstone.decision.infrastructure.security.P1DatabaseRoleBootstrap
+      - -cp
+      - /app/app.jar
+      - org.springframework.boot.loader.launch.PropertiesLauncher
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: capstone_p1
+      P1_OFFLINE_DEMO: "true"
+    secrets: [role_bootstrap_env]
+    depends_on:
+      postgres: {condition: service_healthy}
+    <<: *app-security
+    restart: "no"
+    networks: [p1-data]
+
+  migrate:
+    image: ${P1_SPRING_IMAGE:-capstone-decision-platform:p1-local}
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "migration"]
+    command:
+      - java
+      - -Dloader.main=com.capstone.decision.infrastructure.security.P1FlywayMigrate
+      - -cp
+      - /app/app.jar
+      - org.springframework.boot.loader.launch.PropertiesLauncher
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: capstone_p1
+      P1_OFFLINE_DEMO: "true"
+    secrets: [migration_env]
+    depends_on:
+      role-bootstrap: {condition: service_completed_successfully}
+      rag-runtime-seed: {condition: service_completed_successfully}
+    <<: *app-security
+    restart: "no"
+    networks: [p1-data]
+
+  seed-import:
+    image: ${P1_PYTHON_IMAGE:-capstone-decision-platform:p1-local}
+    platform: linux/amd64
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "seed-import"]
+    command:
+      - python
+      - -m
+      - app.release.public_rag_seed_cli
+      - import
+      - --manifest
+      - /opt/capstone/seed/public-rag/public-rag-seed.v1.manifest.json
+    user: "65532:65532"
+    group_add: ["${P1_SECRET_GID}"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 1g
+    cpus: 1.0
+    restart: "no"
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    secrets: [seed_import_env]
+    volumes:
+      - ./seed/public-rag:/opt/capstone/seed/public-rag:ro
+      - ./docker/secret-entrypoint.sh:/usr/local/bin/p1-secret-entrypoint:ro
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    networks: [p1-data]
+
+  identity-bootstrap:
+    image: ${P1_SPRING_IMAGE:-capstone-decision-platform:p1-local}
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "bootstrap"]
+    command:
+      - java
+      - -Dloader.main=com.capstone.decision.infrastructure.security.DemoIdentityBootstrap
+      - -cp
+      - /app/app.jar
+      - org.springframework.boot.loader.launch.PropertiesLauncher
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: capstone_p1
+      P1_OFFLINE_DEMO: "true"
+    secrets: [bootstrap_env]
+    depends_on:
+      seed-import: {condition: service_completed_successfully}
+    <<: *app-security
+    restart: "no"
+    networks: [p1-data]
+
+  team-b-seed-import:
+    profiles: [owner]
+    image: ${P1_PYTHON_IMAGE:-capstone-decision-platform:p1-local}
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "artifact-import"]
+    command:
+      - python
+      - -m
+      - app.p1_owner.importer
+      - --bundle-root
+      - /opt/capstone/seed/team-b
+      - --archive-parent
+      - /archive
+      - --git-seed
+    environment:
+      P1_OPERATOR_UID: "${P1_OPERATOR_UID}"
+    user: "${P1_OPERATOR_UID}:${P1_SECRET_GID}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 1g
+    cpus: 1.0
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    secrets: [artifact_import_env]
+    volumes:
+      # safe_io 가 approved_root(=bundle_root 의 부모) 를 현재 사용자 소유로 요구한다.
+      # team-b 만 마운트하면 부모가 Docker 가 만든 root 소유 /opt/capstone 이 되어 거부된다.
+      - ./seed:/opt/capstone/seed:ro
+      - ${P1_ARTIFACT_ARCHIVE_DIR:-/nonexistent}:/archive
+      - ./docker/secret-entrypoint.sh:/usr/local/bin/p1-secret-entrypoint:ro
+    depends_on:
+      identity-bootstrap: {condition: service_completed_successfully}
+    networks: [p1-data]
+    restart: "no"
+
+  owner-scenario-materializer:
+    profiles: [owner]
+    image: ${P1_PYTHON_IMAGE:-capstone-decision-platform:p1-local}
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "artifact-import"]
+    command:
+      - python
+      - -m
+      - app.p1_owner.scenario_materializer
+      - --bundle-root
+      - /opt/capstone/seed/team-b
+    environment:
+      PROVIDER_LIVE_CALLS_ENABLED: "false"
+      P1_OPERATOR_UID: "${P1_OPERATOR_UID}"
+    user: "${P1_OPERATOR_UID}:${P1_SECRET_GID}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 1g
+    cpus: 1.0
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    secrets: [artifact_import_env]
+    volumes:
+      - ./seed:/opt/capstone/seed:ro
+      - ./docker/secret-entrypoint.sh:/usr/local/bin/p1-secret-entrypoint:ro
+    depends_on:
+      team-b-seed-import: {condition: service_completed_successfully}
+    networks: [p1-data]
+    restart: "no"
+
+  dashboard-preview-seed:
+    profiles: [preview]
+    image: ${P1_PYTHON_IMAGE:-capstone-decision-platform:p1-local}
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "demo"]
+    command:
+      - python
+      - -m
+      - app.s8_demo.preview_dashboard_seed
+      - --config
+      - /opt/capstone/shared-docs/backtest_config.yaml
+    environment:
+      PROVIDER_LIVE_CALLS_ENABLED: "false"
+      KIS_OFFLINE: "1"
+    secrets: [demo_env]
+    volumes:
+      - ../../shared-docs/backtest_config.yaml:/opt/capstone/shared-docs/backtest_config.yaml:ro
+    depends_on:
+      identity-bootstrap: {condition: service_completed_successfully}
+    <<: *app-security
+    restart: "no"
+    networks: [p1-data]
+
+  actor-authority:
+    image: ${P1_SPRING_IMAGE:-capstone-decision-platform:p1-local}
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "authority"]
+    command:
+      - java
+      - -Dloader.main=com.capstone.decision.infrastructure.security.ActorCapabilityAuthorityMain
+      - -cp
+      - /app/app.jar
+      - org.springframework.boot.loader.launch.PropertiesLauncher
+    environment:
+      ACTOR_CAPABILITY_AUTHORITY_HOST: 0.0.0.0
+      ACTOR_CAPABILITY_AUTHORITY_PORT: "18081"
+      ACTOR_IDENTITY_JDBC_URL: jdbc:postgresql://postgres:5432/capstone_p1
+      ACTOR_CAPABILITY_TLS_KEY_STORE_PATH: /run/secrets/actor_server_p12
+      ACTOR_CAPABILITY_TLS_CA_CERTIFICATE_PATH: /run/secrets/actor_tls_ca
+    secrets: [actor_capability_authority_env, actor_server_p12, actor_tls_ca]
+    depends_on:
+      postgres: {condition: service_healthy}
+    <<: *app-security
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - java
+        - -Dloader.main=com.capstone.decision.infrastructure.security.P1TcpHealthCheck
+        - -cp
+        - /app/app.jar
+        - org.springframework.boot.loader.launch.PropertiesLauncher
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    networks: [p1-data]
+
+  decision-platform:
+    image: ${P1_SPRING_IMAGE:-capstone-decision-platform:p1-local}
+    build:
+      context: ../..
+      dockerfile: deploy/p1/docker/decision-platform.Dockerfile
+    environment:
+      # attest_source_writer_dsn 이 요구하는 실행 대상 표시다. 이 스택은 로컬 배포이므로
+      # local 이 정직한 값이고, 이 값이 없으면 관측 적재가 사전 검증에서 거부된다.
+      DECISION_SOURCE_WRITER_OFFLINE_TARGET: "local"
+      SERVER_ADDRESS: 0.0.0.0
+      SERVER_PORT: "8080"
+      # PublicSurfaceGate rejects a public mode unless the matching Spring profile is active.
+      SPRING_PROFILES_ACTIVE: "${SPRING_PROFILES_ACTIVE:-}"
+      MARS_PUBLIC_SURFACE_MODE: "${MARS_PUBLIC_SURFACE_MODE:-LOCAL}"
+      # social-login 프로필에서만 읽는다. 제공자 client secret 은 spring_env 로만 들어온다.
+      MARS_PUBLIC_ORIGIN: "${MARS_PUBLIC_ORIGIN:-}"
+      GOOGLE_OIDC_REDIRECT_URI: "${MARS_PUBLIC_ORIGIN:-}/api/v1/auth/oidc/callback/google"
+      KAKAO_OAUTH_REDIRECT_URI: "${MARS_PUBLIC_ORIGIN:-}/api/v1/auth/oidc/callback/kakao"
+      SPRING_FLYWAY_ENABLED: "false"
+      ACTOR_CAPABILITY_TRANSPORT: http
+      ACTOR_CAPABILITY_AUTHORITY_URL: https://actor-authority:18081/internal/actor-capabilities/issue
+      ACTOR_CAPABILITY_TLS_KEY_STORE_PATH: /run/secrets/actor_client_p12
+      ACTOR_CAPABILITY_TLS_CA_CERTIFICATE_PATH: /run/secrets/actor_tls_ca
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: capstone_p1
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      ASYNC_ADAPTER: db
+      ASYNC_POLLING_ENABLED: "true"
+      ASYNC_WORKER_ENABLED: "true"
+      ASYNC_WORKER_GRPC_BIND_ADDRESS: 127.0.0.1:50056
+      ASYNC_WORKER_GRPC_TARGET: 127.0.0.1:50056
+      RETURN_INFERENCE_GRPC_BIND_ADDRESS: 127.0.0.1:50057
+      RETURN_INFERENCE_GRPC_TARGET: 127.0.0.1:50057
+      RETURN_INFERENCE_BUNDLE_ROOT: /opt/capstone/seed/team-b
+      RETURN_INFERENCE_ALLOW_SYNTHETIC: "false"
+      RAG_ANSWERER: FIXTURE_ONLY
+      RAG_GRPC_ENABLED: "false"
+      # RAG v2 실검색은 opt-in이다. 켜려면 운영자가 rag-v2.env에 VOYAGE_API_KEY를 넣고
+      # 로컬 루트에 control/secrets/tokenizer를 갖춰야 한다. 하나라도 없으면 기동에서 닫힌다.
+      RAG_V2_GRPC_ENABLED: "${P1_RAG_V2_ENABLED:-false}"
+      RAG_V2_GRPC_TARGET: 127.0.0.1:50054
+      RAG_V2_GRPC_BIND_ADDRESS: 127.0.0.1:50054
+      RAG_V2_GRPC_ENABLE_REFLECTION: "false"
+      S4_9_RUNTIME_VOYAGE_QUERY_ENABLED: "${P1_RAG_V2_ENABLED:-false}"
+      # 공식 Voyage context-4 tokenizer의 해시다. V98의 official_tokenizer_sha256과 같은 값이고,
+      # 로컬 루트의 tokenizer.json이 이 해시가 아니면 기동에서 닫힌다.
+      S4_9_VOYAGE_TOKENIZER_SHA256: "${P1_RAG_V2_TOKENIZER_SHA256:-c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539}"
+      P1_RAG_RUNTIME_DIR_MOUNT: /run/rag-runtime
+      # 활성화 저술자가 control 디렉터리의 부모가 이 루트와 같기를 요구한다.
+      CAPSTONE_RAG_LOCAL_ROOT: /run/rag-runtime
+      RAG_V2_VERTEX_AUTO_ACTIVATION_POLICY_FILE: /run/rag-runtime/control/pre-s5-vertex-auto-activation-policy.json
+      # Vertex 생성형 답변. 요청마다 5분짜리 활성화 패킷이 있어야 열리므로 기본은 off다.
+      RAG_V2_VERTEX_ENABLED: "${P1_RAG_V2_VERTEX_ENABLED:-false}"
+      VERTEX_MODEL_ID: "${MARS_VERTEX_MODEL_ID:-gemini-3.5-flash}"
+      MARS_VERTEX_SERVICE_ACCOUNT_JSON_B64: "${MARS_VERTEX_SERVICE_ACCOUNT_JSON_B64:-}"
+      # Spring and the loopback Python Agent must enforce the same generation cap.
+      RAG_LLM_MAX_OUTPUT_TOKENS: "${RAG_LLM_MAX_OUTPUT_TOKENS:-4096}"
+      # RAG activation and the trade-AI reservation use the same operator rate assumptions.
+      P1_VERTEX_INPUT_MICROUSD_PER_TOKEN: "${P1_VERTEX_INPUT_MICROUSD_PER_TOKEN:-3}"
+      P1_VERTEX_OUTPUT_MICROUSD_PER_TOKEN: "${P1_VERTEX_OUTPUT_MICROUSD_PER_TOKEN:-17}"
+      P1_VERTEX_GROUNDING_MICROUSD_PER_QUERY: "${P1_VERTEX_GROUNDING_MICROUSD_PER_QUERY:-14000}"
+      RAG_V2_VERTEX_HEAD_COMMIT: "${P1_RAG_V2_VERTEX_HEAD_COMMIT:-}"
+      RAG_V2_VERTEX_TREE_DIGEST: "${P1_RAG_V2_VERTEX_TREE_DIGEST:-}"
+      RAG_V2_VERTEX_CI_DIGEST: "${P1_RAG_V2_VERTEX_CI_DIGEST:-}"
+      RAG_V2_VERTEX_SECURITY_DIGEST: "${P1_RAG_V2_VERTEX_SECURITY_DIGEST:-}"
+      # 자동 저술을 켜면 활성화 패킷을 사람이 아니라 배포 정책이 만든다. 정책 파일은 RAG
+      # 런타임 루트의 control/pre-s5-vertex-auto-activation-policy.json이며 entrypoint가
+      # 소유자 전용 사본으로 옮기고 경로를 내보낸다. 켜 두고 정책이 없으면 부팅에서 닫힌다.
+      RAG_V2_VERTEX_AUTO_ACTIVATION_ENABLED: "${P1_RAG_V2_VERTEX_AUTO_ACTIVATION_ENABLED:-false}"
+      RAG_WEB_ENABLED: "false"
+      # Strong LLM 판단. 켜면 supervisor가 loopback gRPC 프로세스를 함께 띄우고,
+      # rag-v2.env의 STRONG_LLM_GRPC_SHARED_SECRET이 없으면 부팅에서 닫힌다.
+      S4_9_STRONG_LLM_ENABLED: "${P1_STRONG_LLM_ENABLED:-false}"
+      RAG_WEB_GOOGLE_BILLING_ACCOUNT_FINGERPRINT: "${P1_GOOGLE_BILLING_ACCOUNT_FINGERPRINT:-}"
+      STRONG_LLM_GRPC_BIND_ADDRESS: 127.0.0.1:50055
+      STRONG_LLM_GRPC_TARGET: 127.0.0.1:50055
+      # 1차 provider와 그것이 실패했을 때의 2차. 2차가 비면 1차만 쓴다.
+      STRONG_LLM_PROVIDER: "${P1_STRONG_LLM_PROVIDER:-vertex}"
+      STRONG_LLM_FALLBACK_PROVIDER: "${P1_STRONG_LLM_FALLBACK_PROVIDER:-}"
+      S4_9_MCP_ENABLED: "false"
+      P1_OFFLINE_DEMO: "true"
+      P1_TEAM_A_ACCEPTANCE_ENABLED: "${P1_TEAM_A_ACCEPTANCE_ENABLED:-false}"
+      P1_TEAM_A_ACCEPTANCE_FIXED_CLOCK: "${P1_TEAM_A_ACCEPTANCE_FIXED_CLOCK:-}"
+      APP_P1_RETURN_ARTIFACT_SYNTHETIC_TEST_PROFILE: "${P1_ARTIFACT_SYNTHETIC_TEST_PROFILE:-false}"
+      # 이 배포가 대조한 KRX 호가표를 명시한다. 값이 없으면 LIMIT 주문은 계속 닫힌다.
+      # `TickSizePolicy.tickSize`가 구현한 표가 2023-12 현금성 주식·ETP 개정표다.
+      BROKERAGE_TICK_TABLE_VERIFICATION: "${P1_BROKERAGE_TICK_TABLE_VERIFICATION:-KRX_CASH_EQUITY_202312_ETP_UPDATE}"
+      BROKERAGE_GRPC_ENABLED: "${P1_KIS_MOCK_ONLINE_ENABLED:-false}"
+      BROKERAGE_GRPC_TARGET: 127.0.0.1:50052
+      PYTHON_BROKERAGE_GRPC_BIND_ADDRESS: 127.0.0.1:50052
+      FINANCIAL_ENGINEERING_GRPC_ENABLED: "false"
+      KIS_MODE: mock
+      PROVIDER_LIVE_CALLS_ENABLED: "false"
+      KIS_OFFLINE: "${P1_KIS_OFFLINE:-1}"
+      KIS_MOCK_BROKERAGE_ONLINE_ENABLED: "${P1_KIS_MOCK_ONLINE_ENABLED:-false}"
+      P1_AUTOMATION_RUNTIME_ENABLED: "${P1_AUTOMATION_RUNTIME_ENABLED:-false}"
+      # 30일이 지나 더 쓰이지 않는 세계 뉴스 버전을 지운다. 살아 있는 인용 핀이 있는
+      # 버전은 남고, 지운 뒤에도 톰스톤에 출처 해시가 남는다.
+      WORLD_NEWS_RETENTION_ENABLED: "${WORLD_NEWS_RETENTION_ENABLED:-false}"
+      P1_AUTOMATION_EVIDENCE_FIXTURE_ENABLED: "false"
+      DEBUG: "${P1_SPRING_DEBUG:-false}"
+    secrets: [spring_env, python_env, kis_mock_env, return_inference_env, automation_runtime_env, automation_observation_env, rag_v2_env, rag_history_kek, actor_client_p12, actor_tls_ca]
+    volumes:
+      # 읽기 전용이다. entrypoint가 컨테이너 tmpfs로 복사해 소유권과 mode를 맞춘다.
+      # 기본값은 `./capstone doctor`를 up 이전에 돌릴 때만 쓰인다. up은 runtime.env에 실제
+      # 경로를 항상 기록하므로(full-appctl:235-236) 런타임 동작은 바뀌지 않는다.
+      # 기본값이 없으면 신규 clone이 START_HERE 순서(doctor → up)에서 compose 검증에 막힌다.
+      # 활성화 저술자가 control 아래에 패킷을 기록한다. 읽기 전용이면 생성이 닫힌다.
+      # 값을 주지 않으면 이름 있는 볼륨을 쓴다. 레포 없이 이미지와 .env 만 받은 서버는
+      # 호스트에 둘 트리가 없다. 볼륨이면 rag-runtime-seed 가 채울 수 있다.
+      - ${P1_RAG_RUNTIME_DIR:-p1-rag-runtime}:/run/rag-runtime
+      # safe_io 가 approved_root(=bundle_root 의 부모) 를 현재 사용자 소유로 요구한다.
+      # team-b 만 마운트하면 부모가 Docker 가 만든 root 소유 /opt/capstone 이 되어 거부된다.
+      - ./seed:/opt/capstone/seed:ro
+    ports:
+      - "127.0.0.1:${P1_API_PORT:-18080}:8080"
+    depends_on:
+      actor-authority: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+      # 시드 적재와 겹치면 Hibernate 스키마 검증이 락 대기로 죽는다.
+      seed-import: {condition: service_completed_successfully}
+    <<: *app-security
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - /app/decision-platform-health.py
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+    networks: [p1-data, p1-app, p1-model]
+
+  synthetic-async-smoke:
+    profiles: [smoke]
+    image: ${P1_PYTHON_IMAGE:-capstone-decision-platform:p1-local}
+    pull_policy: missing
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "demo"]
+    command: ["python", "-m", "app.s8_demo.container_async_smoke"]
+    environment:
+      P1_SMOKE_MODE: DB
+      PROVIDER_LIVE_CALLS_ENABLED: "false"
+      KIS_OFFLINE: "1"
+    secrets: [demo_env]
+    networks: [p1-data]
+    <<: *app-security
+    restart: "no"
+
+  artifact-importer:
+    profiles: [owner]
+    image: ${P1_PYTHON_IMAGE:-capstone-decision-platform:p1-local}
+    pull_policy: missing
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "artifact-import"]
+    command:
+      - python
+      - -m
+      - app.p1_owner.importer
+      - --bundle-root
+      - /owner/${P1_ARTIFACT_BUNDLE_NAME:-disabled}
+      - --manifest-sha256
+      - ${P1_ARTIFACT_MANIFEST_SHA256:-disabled}
+      - --archive-parent
+      - /archive
+    environment:
+      P1_OPERATOR_UID: "${P1_OPERATOR_UID}"
+    user: "${P1_OPERATOR_UID}:${P1_SECRET_GID}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 1g
+    cpus: 1.0
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    secrets: [artifact_import_env]
+    volumes:
+      - ${P1_ARTIFACT_BUNDLE_PARENT:-/nonexistent}:/owner:ro
+      - ${P1_ARTIFACT_ARCHIVE_DIR:-/nonexistent}:/archive
+      - ./docker/secret-entrypoint.sh:/usr/local/bin/p1-secret-entrypoint:ro
+    depends_on:
+      postgres: {condition: service_healthy}
+    networks: [p1-data]
+    restart: "no"
+
+  kis-mock-certification-runner:
+    profiles: [owner]
+    image: ${P1_SPRING_IMAGE:-capstone-decision-platform:p1-local}
+    platform: linux/amd64
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "certification"]
+    command: ["python", "-m", "app.brokerage.kis_mock_certification_cli", "run"]
+    environment:
+      P1_OPERATOR_UID: "${P1_OPERATOR_UID}"
+      KIS_MODE: mock
+      KIS_OFFLINE: "0"
+      KIS_RETRY_ATTEMPTS: "1"
+      KIS_REQUEST_INTERVAL_MILLISECONDS: "1000"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      # compose secret은 원본 mode를 그대로 마운트하므로 group-readable인 kis_mock_env로는
+      # owner-only latch 조건을 만족할 수 없다. certify가 0600으로 써 두는 latch만 읽는다.
+      KIS_MOCK_APPROVAL_ENV_FILE: /certification/approval-latch.env
+    secrets:
+      - spring_env
+      - python_env
+      - kis_mock_env
+      - kis_mock_approval_private
+      - kis_mock_approval_public
+      - kis_mock_approval_trust_policy
+      # provider claim reader는 /run/secrets/p1-provider-claim-dsn 경로만 읽는다. 기본
+      # 마운트 이름은 언더바라 어긋난다. mode는 non-swarm compose에서 무시되므로
+      # group/other 비트 제거는 state 파일 자체를 0600으로 만들어 해결한다.
+      - source: p1_provider_claim_dsn
+        target: p1-provider-claim-dsn
+    volumes:
+      - ${P1_KIS_MOCK_RUNTIME_DIR:-./.state-app/mock}:/certification
+    user: "${P1_OPERATOR_UID}:${P1_SECRET_GID}"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 1g
+    cpus: 1.0
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    restart: "no"
+    # p1-data는 internal이라 egress가 없다. 인증 runner는 실제 KIS 모의 origin으로 나가야 하므로
+    # redis 접근용 p1-data와 함께 egress가 있는 p1-app에도 붙는다.
+    networks: [p1-data, p1-app]
+
+  automation-runtime-cli:
+    profiles: [owner]
+    image: ${P1_PYTHON_IMAGE:-capstone-decision-platform:p1-local}
+    platform: linux/amd64
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "automation-cli"]
+    command: ["python", "-m", "app.p1_owner.mock_automation_cli", "readiness"]
+    environment:
+      P1_LOCAL_CERTIFICATION_VALID: "${P1_LOCAL_CERTIFICATION_VALID:-false}"
+      KIS_MOCK_BROKERAGE_ONLINE_ENABLED: "true"
+      KIS_MODE: mock
+      KIS_OFFLINE: "0"
+      KIS_RETRY_ATTEMPTS: "1"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    secrets: [automation_runtime_env, kis_mock_env, redis_env]
+    depends_on:
+      postgres: {condition: service_healthy}
+    <<: *app-security
+    restart: "no"
+    networks: [p1-data, p1-app]
+
+  # XKRX 패키지 달력으로 canonical trading session 을 적재한다. provider 호출 0.
+  # arm 은 다음 XKRX 세션 행을 요구하는데(V109:92) fixture 2 행뿐이라 최초 arm 이 막힌다.
+  calendar-offline-seed:
+    profiles: [owner]
+    image: ${P1_PYTHON_IMAGE:-capstone-decision-platform:p1-local}
+    platform: linux/amd64
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "calendar-offline-seed"]
+    command: ["python", "-m", "app.data.calendar.offline_seed_cli"]
+    environment:
+      P1_CALENDAR_OFFLINE_SEED_YEARS: "${P1_CALENDAR_OFFLINE_SEED_YEARS:-}"
+    secrets: [calendar_offline_seed_env]
+    depends_on:
+      postgres: {condition: service_healthy}
+    <<: *app-security
+    restart: "no"
+    networks: [p1-data]
+
+  # 대시보드의 "이 시스템이 참고하는 자료" 패널이 rag_sources 를 읽는데 등록 CLI 가 어디에도
+  # 배선돼 있지 않아 0 행이었고 패널이 비어 있었다. seed 는 코드에 커밋돼 있으므로 provider
+  # 호출 0 이고, ON CONFLICT DO NOTHING 이라 몇 번 돌려도 같은 상태다.
+  rag-source-register:
+    profiles: [owner]
+    image: ${P1_PYTHON_IMAGE:-capstone-decision-platform:p1-local}
+    platform: linux/amd64
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "rag-source-register"]
+    command: ["python", "-m", "app.rag.register_sources_cli", "--register-db", "--json"]
+    secrets: [rag_source_register_env]
+    depends_on:
+      postgres: {condition: service_healthy}
+    <<: *app-security
+    restart: "no"
+    networks: [p1-data]
+
+  # 과거 영업일 재생 2단계. 1단계(신호 계산)는 decision-platform 안에서 돌고 그 JSON 을
+  # 여기서 superuser 로 이력 표에 적재한다. 두 자원이 서로 다른 경계에 있어 나눴다 -
+  # 추론 서버는 decision-platform 안에서만 닿고, 이력 표는 RLS FORCE 라 superuser 만 쓴다.
+  history-replay-seed:
+    profiles: [owner]
+    image: ${P1_PYTHON_IMAGE:-capstone-decision-platform:p1-local}
+    platform: linux/amd64
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "team-a-acceptance"]
+    command: ["sh", "-c", "P1_HISTORY_REPLAY_DATABASE_DSN=$$P1_TEAM_A_ACCEPTANCE_DATABASE_DSN python -m app.p1_owner.history_replay_seed /opt/capstone/replay/signals.json"]
+    environment:
+      P1_OFFLINE_DEMO: "true"
+    secrets: [team_a_acceptance_env]
+    volumes:
+      - ${P1_STATE_DIR:-./.state-app}/replay:/opt/capstone/replay:ro
+    depends_on:
+      postgres: {condition: service_healthy}
+    <<: *app-security
+    restart: "no"
+    networks: [p1-data]
+
+  automation-gate-author:
+    profiles: [owner]
+    image: ${P1_PYTHON_IMAGE:-capstone-decision-platform:p1-local}
+    platform: linux/amd64
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "automation-gate-author"]
+    command: ["python", "-m", "app.p1_owner.automation_gate_author"]
+    environment:
+      P1_AUTOMATION_OWNER_USER_ID: "${P1_AUTOMATION_OWNER_USER_ID:-usr_demo_user}"
+      P1_CERTIFICATION_RECEIPT_SHA256: "${P1_CERTIFICATION_RECEIPT_SHA256:-disabled}"
+      P1_CERTIFICATION_SESSION_DATE: "${P1_CERTIFICATION_SESSION_DATE:-1970-01-01}"
+      P1_RELEASE_BINDING_SHA256: "${P1_RELEASE_BINDING_SHA256:-disabled}"
+      P1_SOURCE_BINDING_SHA256: "${P1_SOURCE_BINDING_SHA256:-disabled}"
+    secrets: [automation_gate_author_env]
+    depends_on:
+      postgres: {condition: service_healthy}
+    <<: *app-security
+    restart: "no"
+    networks: [p1-data]
+
+  deploy-bootstrap:
+    profiles: [owner]
+    image: ${P1_PYTHON_IMAGE:-capstone-decision-platform:p1-local}
+    platform: linux/amd64
+    entrypoint: ["/usr/local/bin/p1-deploy-bootstrap"]
+    environment:
+      P1_DEPLOY_PROFILE: /run/deploy/deploy-profile.json
+      P1_BOOTSTRAP_BASE_URL: "http://decision-platform:8080"
+      P1_BOOTSTRAP_USERNAME: "${P1_BOOTSTRAP_USERNAME:-demo-user}"
+      P1_USER_PASSWORD_FILE: /run/secrets/demo_user_password
+    secrets: [demo_user_password]
+    volumes:
+      - ${P1_DEPLOY_PROFILE_DIR:-./.state-app/deploy}:/run/deploy:ro
+    <<: *app-security
+    restart: "no"
+    networks: [p1-app]
+
+  market-data-cli:
+    profiles: [owner]
+    image: ${P1_PYTHON_IMAGE:-capstone-decision-platform:p1-local}
+    platform: linux/amd64
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "market-data"]
+    command: ["python", "-m", "app.data.market_data.automation_bootstrap_cli", "inventory"]
+    environment:
+      # attest_source_writer_dsn 이 요구하는 실행 대상 표시다. 이 스택은 로컬 배포이므로
+      # local 이 정직한 값이고, 이 값이 없으면 관측 적재가 사전 검증에서 거부된다.
+      # 이 서비스는 `up` 이 일회성으로 일봉 수집기를 부르는 자리이기도 하다.
+      DECISION_SOURCE_WRITER_OFFLINE_TARGET: "local"
+      P1_AUTOMATION_MARKET_BOOTSTRAP_ENABLED: "false"
+      P1_AUTOMATION_MARKET_BOOTSTRAP_KIS_MODE: "mock"
+      P1_DATA_ONLY_COLLECTOR_ENABLED: "false"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+    secrets: [market_data_env, market_data_provider_env, automation_runtime_env]
+    depends_on:
+      postgres: {condition: service_healthy}
+    <<: *app-security
+    restart: "no"
+    networks: [p1-data, p1-app]
+
+  # 자동매매 모드에서만 뜨는 일일 시장데이터 수집기.
+  #
+  # 왜 별도 컨테이너인가. 시장데이터 writer DSN 은 이 서비스와 market-data-cli 에만 붙는다.
+  # 거래하는 앱 컨테이너가 가격 원장을 위조할 수 없어야 하기 때문이다 - V76 체인 트리거와
+  # writer role 단정이 그 분리를 강제한다. 그래서 수집을 앱 쪽으로 옮기지 않았다.
+  #
+  # 왜 profile 인가. "기본 장기 컨테이너 5개"는 계약 기록이다
+  # (contracts/changes/20260826-p1-compose-functional-modules.md). plain `up` 은 그대로
+  # 5개이고, 최신성이 실제로 문제가 되는 --mock 에서만 이것이 붙는다.
+  #
+  # 왜 셸 루프인가. 새 스케줄러 코드를 만들지 않기 위해서다. 최신이면 providerCalls=0 이라
+  # 한 시간 간격의 비용이 DB 질의 하나뿐이고, CLI 가 오늘을 제외하므로 장중에 미확정 일봉을
+  # 적재할 수 없다. 실패해도 루프는 계속 돈다 - 하루 못 채운 것이 루프를 멈출 이유는 아니다.
+  market-data-daily:
+    profiles: [automation]
+    image: ${P1_PYTHON_IMAGE:-capstone-decision-platform:p1-local}
+    platform: linux/amd64
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "market-data-daily"]
+    environment:
+      # attest_source_writer_dsn 이 요구하는 실행 대상 표시다. 이 스택은 로컬 배포이므로
+      # local 이 정직한 값이고, 이 값이 없으면 관측 적재가 사전 검증에서 거부된다.
+      #
+      # 이 서비스에만 빠져 있었다. 결과로 수집기가 남기려던 시세·종목카탈로그 관측이 한 번도
+      # 적재되지 않았고(`observations=FAILED_ValueError`), RiskEngine 이 가격을 읽지 못해
+      # 주문이 `violations` 없이 `PRICE_MISSING` 으로 HOLD 됐다. 그 관측을 남기는 것이
+      # `_publish_observations` 의 존재 이유이므로 값이 없으면 이 서비스의 절반이 죽는다.
+      DECISION_SOURCE_WRITER_OFFLINE_TARGET: "local"
+    command:
+      - "sh"
+      - "-c"
+      - "while :; do python -m app.data.market_data.yfinance_daily_cli || true; sleep 3600; done"
+    secrets: [market_data_env]
+    depends_on:
+      postgres: {condition: service_healthy}
+    <<: *app-security
+    networks: [p1-data, p1-app]
+
+  # GDELT v3 GQG/GEMG은 최신 두 파일을 우선하고 남은 두 슬롯으로 30일 gap을 복구한다.
+  # 완료 cursor를 자르기 전에 건너뛰고 dataset별 실패/예산을 분리한다. redirect 2회는 최초
+  # request를 포함해 target당 최대 3 sends, cycle 최대 4 files/12 sends다. raw/해제 상한은
+  # 파일당 8MiB/32MiB이고 retry는 0이다. 실제 외부 활성화는 별도 실행원장의 누적 byte/cost
+  # 상한을 확정한 뒤에만 GDELT_WORLD_NEWS_ENABLED=true로 연다.
+  world-news-minute:
+    profiles: [automation]
+    image: ${P1_PYTHON_IMAGE:-capstone-decision-platform:p1-local}
+    platform: linux/amd64
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "world-news"]
+    command:
+      - "python"
+      - "-m"
+      - "app.data.news.gdelt_collector_cli"
+      - "--loop"
+      # GQG/GEMG 는 15분 heartbeat 다. 1분마다 최근 2분만 보면 공백 구간을 건너지 못해
+      # 매번 404 로 끝난다. 주기를 heartbeat 에 맞추고 한 cycle 이 그 창을 덮게 한다.
+      - "--interval-seconds"
+      - "900"
+      # 30 일(720h) 전수 백필은 목표 코퍼스가 1,270 만 행이다 - 화면은 최근 20 건만
+      # 쓰고, 정상 상태 규모는 어차피 보존기간 x 일 유입으로 정해진다. 백필은 장애로
+      # 비어 버린 구간을 메우는 용도만 남긴다. 24h 면 2026-09-14 처럼 하루를 통째로
+      # 놓친 정지에서도 복구된다.
+      - "--lookback-hours"
+      - "24"
+      # 한 cycle 이 훑는 후보 수. 유예가 지난 미게시 분은 DB 가 걸러 주므로 같은 예산으로
+      # 실행이 거듭될수록 더 오래된 구간까지 나아간다.
+      - "--max-files"
+      - "40"
+      - "--physical-cap"
+      - "40"
+    environment:
+      GDELT_WORLD_NEWS_ENABLED: "${GDELT_WORLD_NEWS_ENABLED:-false}"
+      DECISION_SOURCE_WRITER_OFFLINE_TARGET: "local"
+    secrets: [market_data_env]
+    depends_on:
+      postgres: {condition: service_healthy}
+    <<: *app-security
+    networks: [p1-data, p1-app]
+
+  # 뉴스 거부권의 근거 코퍼스를 채운다.
+  #
+  # 왜 별도 컨테이너인가. 자동운용 런 안의 provider 상한은 V100 이 0~16 으로 못박고 있어
+  # 근거를 세션 중에 가져올 수 없다. 그리고 이 컨테이너만 OpenDART 인증정보를 든다 -
+  # 오프라인 캘린더 seeding 컨테이너에 그 값을 주지 않으려고 프로필을 나눴다.
+  #
+  # 왜 quota 상한이 여기 있나. `OpenDARTQuotaSettings` 가 네 값을 필수로 요구하고 코드
+  # 기본값을 두지 않는다. 비밀이 아니므로 리뷰되는 자리인 여기에 둔다. 예약은 lower-only
+  # 이므로(LEAST) 나중에 더 낮은 값을 주면 그것이 이긴다.
+  #
+  # 예산 근거: 종목당 endpoint 16개 x 29종목 = 464 호출이 한 바퀴다. 하루 2000 이면 네 바퀴가
+  # 되고, 어떤 계정 등급에서도 안전한 아래쪽이다. 계정 상한을 실제로 확인하면 limit 을 그
+  # 값으로 낮춘다.
+  disclosure-collector:
+    profiles: [owner]
+    image: ${P1_PYTHON_IMAGE:-capstone-decision-platform:p1-local}
+    platform: linux/amd64
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "disclosure-collector"]
+    command: ["python", "-m", "app.data.opendart.disclosure_event_collector_cli"]
+    environment:
+      OPENDART_OFFLINE: "false"
+      OPENDART_DAILY_CALL_LIMIT: "${OPENDART_DAILY_CALL_LIMIT:-20000}"
+      OPENDART_DAILY_CALL_BUDGET: "${OPENDART_DAILY_CALL_BUDGET:-2000}"
+      OPENDART_MAX_CALLS_PER_RUN: "${OPENDART_MAX_CALLS_PER_RUN:-600}"
+      OPENDART_MAX_SYMBOLS_PER_RUN: "${OPENDART_MAX_SYMBOLS_PER_RUN:-31}"
+    secrets: [disclosure_collector_env]
+    depends_on:
+      postgres: {condition: service_healthy}
+    <<: *app-security
+    restart: "no"
+    networks: [p1-data, p1-app]
+
+  after-hours-replay:
+    profiles: [owner]
+    image: ${P1_PYTHON_IMAGE:-capstone-decision-platform:p1-local}
+    platform: linux/amd64
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "after-hours-replay"]
+    command: ["python", "-m", "app.p1_owner.after_hours_replay_cli", "--help"]
+    secrets: [after_hours_replay_env]
+    volumes:
+      - ${P1_AFTER_HOURS_OUTPUT_ROOT:-/nonexistent}:/replay-output
+      - ${P1_AFTER_HOURS_OBSERVED_ANCHOR_ROOT:-/nonexistent}:/observed-anchors:ro
+      - ${P1_AFTER_HOURS_OBSERVED_ANCHOR_MANIFEST:-/nonexistent}:/observed-anchor-manifest.json:ro
+    depends_on:
+      postgres: {condition: service_healthy}
+    <<: *app-security
+    restart: "no"
+    networks: [p1-data]
+
+  team-a-acceptance-seed:
+    profiles: [acceptance]
+    image: ${P1_PYTHON_IMAGE:-capstone-decision-platform:p1-local}
+    platform: linux/amd64
+    entrypoint: ["/usr/local/bin/p1-secret-entrypoint", "team-a-acceptance"]
+    command: ["python", "-m", "app.p1_owner.team_a_acceptance_seed", "seed"]
+    environment:
+      # attest_source_writer_dsn 이 요구하는 실행 대상 표시다. 이 스택은 로컬 배포이므로
+      # local 이 정직한 값이고, 이 값이 없으면 관측 적재가 사전 검증에서 거부된다.
+      DECISION_SOURCE_WRITER_OFFLINE_TARGET: "local"
+      P1_OFFLINE_DEMO: "true"
+      P1_TEAM_A_ACCEPTANCE_FIXED_CLOCK: "${P1_TEAM_A_ACCEPTANCE_FIXED_CLOCK:-}"
+    secrets: [team_a_acceptance_env]
+    depends_on:
+      postgres: {condition: service_healthy}
+    <<: *app-security
+    restart: "no"
+    networks: [p1-data]
+
+  bge-m3:
+    profiles: [models]
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9@sha256:c26a226262ad4ff3330fb30b76653c1bb65da2fcf413b92284545a010e0a8a48
+    platform: linux/amd64
+    pull_policy: missing
+    command:
+      - --model-id
+      - BAAI/bge-m3
+      - --revision
+      - 5617a9f61b028005a4858fdac845db406aefb181
+      - --port
+      - "80"
+      - --max-client-batch-size
+      - "64"
+      - --max-batch-tokens
+      - "8192"
+    volumes:
+      - p1-bge-model-cache:/data
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    mem_limit: 10g
+    cpus: 4.0
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:80/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+    restart: unless-stopped
+    networks: [p1-model, p1-model-fetch]
+
+  paddleocr-vl-model-fetch:
+    profiles: [models]
+    image: ghcr.io/ggml-org/llama.cpp:server-b10524@sha256:d88f41f7675f8b30d7213a917f72a48f05d0549af4d1be7e712ebb130a235415
+    platform: linux/amd64
+    pull_policy: missing
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        fetch() {
+          url=$$1
+          destination=$$2
+          expected=$$3
+          if [ -f "$$destination" ]; then
+            printf '%s  %s\n' "$$expected" "$$destination" | sha256sum -c -
+            return
+          fi
+          partial=$${destination}.part
+          curl --fail --location --retry 0 --continue-at - --output "$$partial" "$$url"
+          printf '%s  %s\n' "$$expected" "$$partial" | sha256sum -c -
+          mv "$$partial" "$$destination"
+        }
+        fetch \
+          'https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6-GGUF/resolve/511b09642bb324401f15f97cc23bc67e8f0a291d/PaddleOCR-VL-1.6-GGUF.gguf?download=true' \
+          /models/PaddleOCR-VL-1.6-GGUF.gguf \
+          f3ae46ec885050acf4b3d31944431e1fd90d50664fb09126af4a3c050ba14ee8
+        fetch \
+          'https://huggingface.co/PaddlePaddle/PaddleOCR-VL-1.6-GGUF/resolve/511b09642bb324401f15f97cc23bc67e8f0a291d/PaddleOCR-VL-1.6-GGUF-mmproj.gguf?download=true' \
+          /models/PaddleOCR-VL-1.6-GGUF-mmproj.gguf \
+          204d757d7610d9b3faab10d506d69e5b244e32bf765e2bab2d0167e65e0a058a
+    volumes:
+      - p1-paddleocr-model-cache:/models
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: 1.0
+    tmpfs:
+      - /tmp:size=32m,mode=1777
+    restart: "no"
+    networks: [p1-model-fetch]
+
+  paddleocr-vl:
+    profiles: [models]
+    image: ghcr.io/ggml-org/llama.cpp:server-b10524@sha256:d88f41f7675f8b30d7213a917f72a48f05d0549af4d1be7e712ebb130a235415
+    platform: linux/amd64
+    pull_policy: missing
+    environment:
+      LLAMA_CACHE: /models
+    command:
+      - --model
+      - /models/PaddleOCR-VL-1.6-GGUF.gguf
+      - --mmproj
+      - /models/PaddleOCR-VL-1.6-GGUF-mmproj.gguf
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --ctx-size
+      - "8192"
+      - --parallel
+      - "1"
+      - --metrics
+      - --temp
+      - "0"
+    volumes:
+      - p1-paddleocr-model-cache:/models
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 256
+    mem_limit: 6g
+    cpus: 4.0
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+    restart: unless-stopped
+    networks: [p1-model]
+
+  return-engine-preview-prepare:
+    profiles: [preview]
+    image: ${P1_RETURN_PREVIEW_IMAGE:-capstone-return-engine-received-preview:p1-local}
+    build:
+      context: ../../workspaces/return-engine
+      dockerfile: Dockerfile
+    command: ["python", "-m", "preview_cli", "prepare"]
+    user: "65532:65532"
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 3g
+    cpus: 2.0
+    tmpfs:
+      - /tmp:size=128m,mode=1777
+    volumes:
+      - p1-return-preview:/output
+    restart: "no"
+
+  experience-dashboard:
+    image: ${P1_DASHBOARD_IMAGE:-capstone-experience-dashboard:p1-local}
+    build:
+      context: ../../workspaces/experience-dashboard
+      dockerfile: Dockerfile
+      args: {}
+    environment:
+      NODE_ENV: production
+      NEXT_PUBLIC_API_MODE: live
+      DECISION_PLATFORM_INTERNAL_URL: http://decision-platform:8080
+      TEAM_B_PREVIEW_ARTIFACT: /artifacts/team-b/005930.KS.json
+    user: "1000:1000"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 1.0
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    ports:
+      - "127.0.0.1:${P1_DASHBOARD_PORT:-3000}:3000"
+    volumes:
+      - p1-return-preview:/artifacts/team-b:ro
+    depends_on:
+      decision-platform: {condition: service_healthy}
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://127.0.0.1:3000/healthz')
+          .then(async response => { const body=await response.json(); if (!response.ok || body.status !== 'UP') process.exit(1); })
+          .catch(() => process.exit(1))
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    networks: [p1-app]
+
+  # 서버에 올릴 때만 띄운다(--profile tls). 켜지 않으면 지금 배치가 그대로다 -
+  # 전 포트가 127.0.0.1 에 묶여 있고 바깥을 보는 것이 없다.
+  tls-proxy:
+    profiles: [tls]
+    image: nginx:1.29-alpine
+    platform: linux/amd64
+    user: "65532:65532"
+    # 비공개 키는 0640 이고 운영자 그룹 소유다. 스택의 다른 서비스와 같은 방법으로
+    # 그 그룹을 더한다 - 키를 모두가 읽게 여는 대신.
+    group_add: ["${P1_SECRET_GID}"]
+    command: ["nginx", "-c", "/etc/nginx/nginx.conf", "-g", "daemon off;"]
+    ports:
+      - "${P1_TLS_BIND:-0.0.0.0}:${P1_TLS_HTTPS_PORT:-8443}:8443"
+      - "${P1_TLS_BIND:-0.0.0.0}:${P1_TLS_HTTP_PORT:-8080}:8080"
+    volumes:
+      - ./docker/tls-proxy.nginx.conf:/etc/nginx/nginx.conf:ro
+    secrets: [proxy_tls_certificate, proxy_tls_private_key]
+    depends_on:
+      decision-platform: {condition: service_healthy}
+      experience-dashboard: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "nginx", "-t", "-c", "/etc/nginx/nginx.conf"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+    networks: [p1-app]
+
+secrets:
+  postgres_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/postgres.env"}
+  redis_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/redis.env"}
+  role_bootstrap_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/role-bootstrap.env"}
+  migration_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/migration.env"}
+  bootstrap_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/bootstrap.env"}
+  actor_capability_authority_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/actor-capability-authority.env"}
+  spring_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/spring.env"}
+  python_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/python.env"}
+  kis_mock_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/kis-mock.env"}
+  demo_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/demo.env"}
+  demo_user_password: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/demo-user.password"}
+  proxy_tls_certificate: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/proxy-tls.crt"}
+  proxy_tls_private_key: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/proxy-tls.key"}
+  rag_history_kek: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/rag-history-kek-v1.key"}
+  seed_import_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/seed-import.env"}
+  p1_provider_claim_dsn: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/p1-provider-claim.dsn"}
+  artifact_import_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/artifact-import.env"}
+  team_a_acceptance_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/team-a-acceptance.env"}
+  return_inference_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/return-inference.env"}
+  automation_runtime_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/automation-runtime.env"}
+  automation_gate_author_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/automation-gate-author.env"}
+  calendar_offline_seed_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/calendar-offline-seed.env"}
+  disclosure_collector_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/disclosure-collector.env"}
+  rag_source_register_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/rag-source-register.env"}
+  automation_observation_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/automation-observation.env"}
+  market_data_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/market-data.env"}
+  market_data_provider_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/market-data-provider.env"}
+  after_hours_replay_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/after-hours-replay.env"}
+  rag_v2_env: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/rag-v2.env"}
+  actor_tls_ca: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/actor-tls-ca.crt"}
+  actor_server_p12: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/actor-server.p12"}
+  actor_client_p12: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/actor-client.p12"}
+  kis_mock_approval_private: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/kis-mock-approval-private.pem"}
+  kis_mock_approval_public: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/kis-mock-approval-public.pem"}
+  kis_mock_approval_trust_policy: {file: "${P1_SECRETS_DIR:-./.state-app/secrets}/kis-mock-approval-trust-policy.json"}
+
+volumes:
+  p1-rag-runtime: {}
+  p1-postgres-current: {}
+  p1-redis: {}
+  p1-bge-model-cache: {}
+  p1-paddleocr-model-cache: {}
+  p1-return-preview: {}
+
+networks:
+  p1-data:
+    internal: true
+  p1-app: {}
+  p1-model:
+    internal: true
+  # No host port is published. This bridge only fills exact-revision model caches.
+  p1-model-fetch: {}

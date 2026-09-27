@@ -1,0 +1,287 @@
+package com.capstone.decision.api.rag
+
+import com.capstone.decision.api.common.ApiResponseFactory
+import com.capstone.decision.api.common.ErrorCode
+import com.capstone.decision.application.rag.RagValidationException
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertThrows
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
+import org.springframework.mock.web.MockHttpServletRequest
+import tools.jackson.databind.json.JsonMapper
+
+class RagAskRequestParserTest {
+    private val parser = RagRequestParser()
+
+    @Test
+    fun `ask parser accepts only the four public fields and exact header pattern`() {
+        val command =
+            parser.parseAsk(
+                """
+                {
+                  "question":"금 ETF의 롤오버 위험은 무엇인가요?",
+                  "answerMode":"CONCISE",
+                  "relatedSymbols":["132030"],
+                  "topics":["PRODUCT_RISK"]
+                }
+                """.trimIndent(),
+            )
+
+        assertEquals("금 ETF의 롤오버 위험은 무엇인가요?", command.question)
+        assertEquals("CONCISE", command.answerMode.name)
+        assertEquals(listOf("132030"), command.relatedSymbols)
+        assertEquals(listOf("PRODUCT_RISK"), command.topics)
+        assertEquals(
+            "idem-rag-ask-0001",
+            parser.requireIdempotencyKey("idem-rag-ask-0001"),
+        )
+    }
+
+    @Test
+    fun `selecting every allowed topic is accepted rather than rejected as out of range`() {
+        // 상한을 한 숫자로 공유하면 허용값이 그보다 많은 필드에서 "전부 선택"이 거부된다.
+        // 실제로 topics(허용 6종)가 5로 막혀 화면에서 주제를 모두 고른 질문이 400 으로
+        // 떨어졌고, 그 상태가 "Agent 가 죽었다"로 보였다. 같은 일이 다시 생기지 않게 잠근다.
+        val command =
+            parser.parseAsk(
+                """
+                {
+                  "question":"이 시스템의 자동매매는 하루에 몇 번 판단하나요?",
+                  "answerMode":"CONCISE",
+                  "topics":["API","DATA","FINANCIAL_ENGINEERING","METHODOLOGY","PRODUCT_RISK","RISK"]
+                }
+                """.trimIndent(),
+            )
+
+        assertEquals(
+            listOf("API", "DATA", "FINANCIAL_ENGINEERING", "METHODOLOGY", "PRODUCT_RISK", "RISK"),
+            command.topics.sorted(),
+        )
+    }
+
+    @Test
+    fun `related symbols keep their own bound because they have no allowed set`() {
+        // 상한을 허용 집합에서 끌어오되, 허용 집합이 없는 필드까지 열어 주지는 않는다.
+        assertThrows(RagValidationException::class.java) {
+            parser.parseAsk(
+                """
+                {
+                  "question":"여섯 종목을 한 번에 물어봅니다.",
+                  "answerMode":"CONCISE",
+                  "relatedSymbols":["005930","000660","035420","051910","006400","207940"]
+                }
+                """.trimIndent(),
+            )
+        }
+    }
+
+    @Test
+    fun `omitted topics mean every allowed topic rather than an empty retrieval scope`() {
+        // 스키마의 required 는 question 과 answerMode 뿐이므로 topics 는 optional 이고,
+        // optional 의 뜻은 "검색 주제를 제한하지 않는다"다. 빈 목록을 그대로 넘기면 검색 범위
+        // 함수가 최소 하나를 요구해 거부하고, 그 예외가 503 RAG_UNAVAILABLE 로 매핑돼
+        // 사용자에게 "런타임이 없다"는 거짓 메시지가 보인다. 그 회귀를 잠근다.
+        val command =
+            parser.parseAsk(
+                """
+                {
+                  "question":"금 ETF의 롤오버 위험은 무엇인가요?",
+                  "answerMode":"CONCISE"
+                }
+                """.trimIndent(),
+            )
+
+        assertEquals(
+            listOf("API", "DATA", "FINANCIAL_ENGINEERING", "METHODOLOGY", "PRODUCT_RISK", "RISK"),
+            command.topics.sorted(),
+        )
+        assertTrue(command.relatedSymbols.isEmpty())
+    }
+
+    @Test
+    fun `explicit topics are not widened by the omitted-topics default`() {
+        val command =
+            parser.parseAsk(
+                """
+                {
+                  "question":"금 ETF의 롤오버 위험은 무엇인가요?",
+                  "answerMode":"DETAILED",
+                  "topics":["RISK"]
+                }
+                """.trimIndent(),
+            )
+
+        assertEquals(listOf("RISK"), command.topics)
+    }
+
+    @Test
+    fun `ask parser rejects duplicate unknown profile and provider controls`() {
+        listOf(
+            """{"question":"q","question":"q2","answerMode":"CONCISE"}""",
+            """{"question":"q","answerMode":"CONCISE","provider":"gemini"}""",
+            """{"question":"q","answerMode":"CONCISE","topK":5}""",
+            """{"question":"q","answerMode":"CONCISE","profileId":"bge_m3_local_1024_v1"}""",
+        ).forEach { body ->
+            assertThrows(RagValidationException::class.java) {
+                parser.parseAsk(body)
+            }
+        }
+    }
+
+    @Test
+    fun `ask parser enforces NFC scalar utf8 array and header bounds`() {
+        listOf(
+            """{"question":"Cafe\u0301","answerMode":"CONCISE"}""",
+            """{"question":"\uD800","answerMode":"CONCISE"}""",
+            """{"question":"${"가".repeat(1001)}","answerMode":"CONCISE"}""",
+            """{"question":"q","answerMode":"CONCISE","relatedSymbols":["NVDA"]}""",
+            """{"question":"q","answerMode":"CONCISE","relatedSymbols":["005930","005930"]}""",
+            """{"question":"q","answerMode":"CONCISE","topics":["UNKNOWN"]}""",
+        ).forEach { body ->
+            assertThrows(RagValidationException::class.java) {
+                parser.parseAsk(body)
+            }
+        }
+        listOf(
+            null,
+            "short",
+            "x".repeat(129),
+            "invalid:key:00001",
+            "non ascii 한글 key 0001",
+        ).forEach { key ->
+            assertThrows(RagValidationException::class.java) {
+                parser.requireIdempotencyKey(key)
+            }
+        }
+    }
+
+    @Test
+    fun `history feedback and consent parsers keep exact bounded public shapes`() {
+        assertEquals(
+            "rag_ans_${"a".repeat(32)}",
+            parser.parseAnswerId("rag_ans_${"a".repeat(32)}"),
+        )
+        assertEquals(true, parser.parseFeedback("""{"helpful":true}"""))
+        val consent =
+            parser.parseConsent(
+                """
+                {
+                  "consentType":"EXTERNAL_AI_RAG_V1",
+                  "action":"REVOKE",
+                  "policyVersion":"EXTERNAL_AI_RAG_V1"
+                }
+                """.trimIndent(),
+            )
+        assertEquals("REVOKE", consent.action)
+        assertEquals("EXTERNAL_AI_RAG_V1", consent.policyVersion)
+
+        val request =
+            MockHttpServletRequest().apply {
+                addParameter("cursor", "opaque-cursor")
+                addParameter("limit", "50")
+            }
+        val history = parser.parseHistoryQuery(request)
+        assertEquals("opaque-cursor", history.cursor)
+        assertEquals(50, history.limit)
+    }
+
+    @Test
+    fun `Vertex scope header accepts only one opaque preparation scope`() {
+        val valid =
+            MockHttpServletRequest().apply {
+                addHeader("X-Rag-V2-Vertex-Scope-Claim", "rvs_${"a".repeat(32)}")
+            }
+        assertEquals("rvs_${"a".repeat(32)}", parser.parseV2VertexScopeClaim(valid))
+
+        listOf(
+            MockHttpServletRequest().apply {
+                addHeader("X-Rag-V2-Vertex-Scope-Claim", "rvs_${"a".repeat(31)}")
+            },
+            MockHttpServletRequest().apply {
+                addHeader("X-Rag-V2-Vertex-Scope-Claim", "rvs_${"a".repeat(32)}")
+                addHeader("X-Rag-V2-Vertex-Scope-Claim", "rvs_${"b".repeat(32)}")
+            },
+        ).forEach { request ->
+            assertThrows(RagValidationException::class.java) {
+                parser.parseV2VertexScopeClaim(request)
+            }
+        }
+    }
+
+    @Test
+    fun `Vertex preparation and resume require a packet-compatible request ID`() {
+        assertEquals(
+            "req_vertex_packet_0000001",
+            parser.requireV2VertexRequestId("req_vertex_packet_0000001"),
+        )
+        assertThrows(RagValidationException::class.java) {
+            parser.requireV2VertexRequestId("client-request-id")
+        }
+    }
+
+    @Test
+    fun `history feedback and consent reject unknown duplicate and out of range input`() {
+        listOf(
+            """{"helpful":true,"comment":"no"}""",
+            """{"helpful":true,"helpful":false}""",
+            """{"helpful":"true"}""",
+        ).forEach { body ->
+            assertThrows(RagValidationException::class.java) {
+                parser.parseFeedback(body)
+            }
+        }
+        listOf(
+            """{"consentType":"EXTERNAL_AI_RAG_V1","action":"GRANT","policyVersion":"v2"}""",
+            """{"consentType":"LIVE_STEP1_STRATEGY_SUMMARY","action":"GRANT","policyVersion":"EXTERNAL_AI_RAG_V1"}""",
+            """{"consentType":"EXTERNAL_AI_RAG_V1","action":"GRANT","policyVersion":"EXTERNAL_AI_RAG_V1","actor":"caller"}""",
+        ).forEach { body ->
+            assertThrows(RagValidationException::class.java) {
+                parser.parseConsent(body)
+            }
+        }
+        listOf("missing", "rag_ans_${"g".repeat(32)}", "rag_ans_${"a".repeat(31)}").forEach { answerId ->
+            assertThrows(RagValidationException::class.java) {
+                parser.parseAnswerId(answerId)
+            }
+        }
+
+        val invalidQuery =
+            MockHttpServletRequest().apply {
+                addParameter("limit", "51")
+                addParameter("preview", "true")
+            }
+        assertThrows(RagValidationException::class.java) {
+            parser.parseHistoryQuery(invalidQuery)
+        }
+    }
+
+    @Test
+    fun `attacker controlled query validation response stays inside 32 KiB`() {
+        val request =
+            MockHttpServletRequest().apply {
+                repeat(40) { index ->
+                    addParameter("${"\\".repeat(500)}$index", "value")
+                }
+            }
+
+        val exception =
+            assertThrows(RagValidationException::class.java) {
+                parser.requireNoQuery(request)
+            }
+        val envelope =
+            ApiResponseFactory.error(
+                requestId = "req_rag_query_budget",
+                code = ErrorCode.VALIDATION_ERROR,
+                details = mapOf("violations" to exception.violations),
+            )
+
+        assertTrue(exception.violations.size <= 64)
+        assertTrue(
+            JsonMapper
+                .builder()
+                .build()
+                .writeValueAsBytes(envelope)
+                .size <= 32 * 1_024,
+        )
+    }
+}

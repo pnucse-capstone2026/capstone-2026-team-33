@@ -1,0 +1,417 @@
+#!/bin/sh
+set -eu
+
+profile=${1:?secret profile is required}
+shift
+
+case "$profile" in
+  spring) secret_files=/run/secrets/spring_env ;;
+  public-demo) secret_files=/run/secrets/mars_public_demo_env ;;
+  public-full) secret_files=/run/secrets/mars_public_full_env ;;
+  decision-platform) secret_files="/run/secrets/spring_env /run/secrets/python_env /run/secrets/kis_mock_env /run/secrets/return_inference_env /run/secrets/automation_runtime_env /run/secrets/automation_observation_env /run/secrets/rag_v2_env" ;;
+  automation-runtime) secret_files=/run/secrets/automation_runtime_env ;;
+  automation-cli) secret_files="/run/secrets/automation_runtime_env /run/secrets/kis_mock_env /run/secrets/redis_env" ;;
+  automation-gate-author) secret_files=/run/secrets/automation_gate_author_env ;;
+  calendar-offline-seed) secret_files=/run/secrets/calendar_offline_seed_env ;;
+  # 공시 근거 수집기. calendar-offline-seed 를 재사용하지 않는 이유는 이 컨테이너만
+  # OpenDART 인증정보를 들기 때문이다 - 그 값을 오프라인 seeding 컨테이너에 주지 않는다.
+  disclosure-collector) secret_files=/run/secrets/disclosure_collector_env ;;
+  rag-source-register) secret_files=/run/secrets/rag_source_register_env ;;
+  market-data) secret_files="/run/secrets/market_data_env /run/secrets/market_data_provider_env /run/secrets/automation_runtime_env" ;;
+  # 상주 일일 수집기. market-data 를 재사용하면 KIS 앱키와 자동운용 DSN 까지 들어온다.
+  # 공개 일봉을 받아 적는 일에 필요한 것은 writer DSN 하나뿐이다.
+  market-data-daily) secret_files=/run/secrets/market_data_env ;;
+  world-news) secret_files=/run/secrets/market_data_env ;;
+  after-hours-replay) secret_files=/run/secrets/after_hours_replay_env ;;
+  certification) secret_files="/run/secrets/spring_env /run/secrets/python_env /run/secrets/kis_mock_env" ;;
+  authority) secret_files=/run/secrets/actor_capability_authority_env ;;
+  role-bootstrap) secret_files=/run/secrets/role_bootstrap_env ;;
+  migration) secret_files=/run/secrets/migration_env ;;
+  seed-import) secret_files=/run/secrets/seed_import_env ;;
+  artifact-import) secret_files=/run/secrets/artifact_import_env ;;
+  team-a-acceptance) secret_files=/run/secrets/team_a_acceptance_env ;;
+  bootstrap) secret_files=/run/secrets/bootstrap_env ;;
+  python) secret_files=/run/secrets/python_env ;;
+  kafka-publisher) secret_files=/run/secrets/kafka_publisher_env ;;
+  poison-recorder) secret_files=/run/secrets/poison_recorder_env ;;
+  kafka-admin) secret_files=/run/secrets/kafka_admin_env ;;
+  demo) secret_files=/run/secrets/demo_env ;;
+  postgres) secret_files=/run/secrets/postgres_env ;;
+  redis) secret_files=/run/secrets/redis_env ;;
+  *) echo "p1 secret loading failed: unknown_profile" >&2; exit 1 ;;
+esac
+
+for secret_file in $secret_files; do
+  if [ ! -f "$secret_file" ] || [ -L "$secret_file" ]; then
+    echo "p1 secret loading failed: invalid_secret_file" >&2
+    exit 1
+  fi
+  size=$(wc -c < "$secret_file")
+  if [ "$size" -lt 1 ] || [ "$size" -gt 65536 ]; then
+    echo "p1 secret loading failed: invalid_secret_size" >&2
+    exit 1
+  fi
+done
+
+# 마운트된 RAG 런타임 루트가 비어 있으면 이미지에 구워 둔 기본 트리로 채운다.
+#
+# 레포를 받지 않고 이미지와 .env 만 가진 서버에서는 토크나이저와 질의 런타임 기술서를
+# 구할 방법이 없다. 그것이 없으면 RAG 가 조용히 꺼지고 금융 Agent 가 통째로 죽는다.
+# 이미 값이 있으면 건드리지 않는다 - 운영자가 올린 것이 항상 이긴다.
+seed_rag_runtime_root() (
+  root="${CAPSTONE_RAG_LOCAL_ROOT:-/run/rag-runtime}"
+  seed=/opt/capstone/rag-runtime-default
+  [ -d "$seed" ] || return 0
+  [ -d "$root" ] || return 0
+  # 이름 있는 볼륨은 root 소유로 만들어진다. 컨테이너는 65532 로 도는데 볼륨이 비어 있다면
+  # 아직 아무도 쓴 적이 없다는 뜻이므로 소유권을 옮겨 받는다. 운영자가 올린 트리(비어 있지
+  # 않음)는 건드리지 않는다.
+  if [ ! -w "$root" ] && [ -z "$(ls -A "$root" 2>/dev/null)" ] && [ "$(id -u)" = 0 ]; then
+    chown 65532:65532 "$root" 2>/dev/null || true
+  fi
+  [ -w "$root" ] || return 0
+  copied=0
+  for rel in artifacts/voyage-context-4/tokenizer.json control/pre-s5-voyage-query-runtime.json; do
+    [ -f "$seed/$rel" ] || continue
+    [ -f "$root/$rel" ] && continue
+    mkdir -p "$root/$(dirname "$rel")" || continue
+    cp "$seed/$rel" "$root/$rel" || continue
+    copied=$((copied + 1))
+  done
+  [ "$copied" -gt 0 ] && printf 'P1_RAG_RUNTIME_SEEDED=%s
+' "$copied"
+  return 0
+)
+
+allowed_key() {
+  key_profile=$profile
+  [ "$key_profile" != certification ] || key_profile=decision-platform
+  if [ "$key_profile" = public-demo ]; then
+    case "$1" in
+      DEMO_CREDENTIAL_SEPARATION_KEY|DEMO_USER_CREDENTIAL_BUNDLE|DEMO_ADMIN_CREDENTIAL_BUNDLE|KIS_*|P1_AUTOMATION_*|GOOGLE_OIDC_*|KAKAO_OAUTH_*) return 1 ;;
+      STRONG_LLM_GRPC_SHARED_SECRET|MARS_VERTEX_SERVICE_ACCOUNT_JSON_B64) return 0 ;;
+    esac
+    # Reuse the Spring whitelist, then explicitly reject the legacy password
+    # and account keys above. This keeps new Spring secrets reviewable in one place.
+    key_profile=spring
+  fi
+  if [ "$key_profile" = public-full ]; then
+    case "$1" in
+      KIS_MOCK_ORDER_REFERENCE_KEY) return 0 ;;
+      P1_AUTOMATION_DATABASE_DSN|AUTOMATION_RUNTIME_SHARED_SECRET) return 0 ;;
+      RETURN_INFERENCE_GRPC_SHARED_SECRET|ASYNC_WORKER_DATABASE_DSN) return 0 ;;
+      BROKERAGE_DB_CAPABILITY_TOKEN_SHA256|BROKERAGE_GRPC_SHARED_SECRET|GOOGLE_OIDC_CLIENT_ID|GOOGLE_OIDC_CLIENT_SECRET|GOOGLE_OIDC_ADMIN_SUBJECT_SHA256|KAKAO_OAUTH_CLIENT_ID|KAKAO_OAUTH_CLIENT_SECRET|MARS_VERTEX_SERVICE_ACCOUNT_JSON_B64|RAG_V2_GRPC_SHARED_SECRET|RAG_V2_QUERY_DATABASE_DSN|RAG_V2_VOYAGE_QUERY_WRITER_DSN|STRONG_LLM_GRPC_SHARED_SECRET|VOYAGE_API_KEY) return 0 ;;
+      DEMO_CREDENTIAL_SEPARATION_KEY|DEMO_USER_CREDENTIAL_BUNDLE|DEMO_ADMIN_CREDENTIAL_BUNDLE|KIS_*|P1_AUTOMATION_*) return 1 ;;
+    esac
+    key_profile=spring
+  fi
+  case "$key_profile:$1" in
+    postgres:POSTGRES_PASSWORD|postgres:POSTGRES_APP_PASSWORD|postgres:POSTGRES_MIGRATION_PASSWORD|postgres:POSTGRES_COLLECTOR_PASSWORD|postgres:POSTGRES_DISCLOSURE_READER_PASSWORD|postgres:POSTGRES_MARKET_WRITER_PASSWORD|postgres:POSTGRES_PORTFOLIO_WRITER_PASSWORD|postgres:POSTGRES_RISK_WRITER_PASSWORD|postgres:POSTGRES_FILL_WRITER_PASSWORD|postgres:POSTGRES_RAG_WRITER_PASSWORD|postgres:POSTGRES_RAG_ADMIN_PASSWORD|postgres:POSTGRES_RAG_QUERY_PASSWORD|postgres:POSTGRES_SIGNAL_WRITER_PASSWORD|postgres:POSTGRES_SIGNAL_SCHEDULER_PASSWORD|postgres:POSTGRES_SIGNAL_ADMIN_PASSWORD|postgres:POSTGRES_WORKER_PASSWORD|postgres:POSTGRES_AUTOMATION_RUNTIME_PASSWORD|postgres:POSTGRES_OUTBOX_PUBLISHER_PASSWORD|postgres:POSTGRES_POISON_RECORDER_PASSWORD|postgres:POSTGRES_REPLAY_PASSWORD|postgres:POSTGRES_IDENTITY_PASSWORD|postgres:POSTGRES_AUTH_PASSWORD|postgres:POSTGRES_REPLAY_AUTHORIZER_PASSWORD|postgres:POSTGRES_DEMO_PASSWORD) return 0 ;;
+    role-bootstrap:POSTGRES_ADMIN_USER|role-bootstrap:POSTGRES_PASSWORD|role-bootstrap:POSTGRES_AUTH_PASSWORD|role-bootstrap:POSTGRES_AUTOMATION_RUNTIME_PASSWORD|role-bootstrap:POSTGRES_OUTBOX_PUBLISHER_PASSWORD|role-bootstrap:POSTGRES_POISON_RECORDER_PASSWORD) return 0 ;;
+    spring:POSTGRES_APP_PASSWORD|spring:POSTGRES_WORKER_PASSWORD|spring:POSTGRES_AUTH_PASSWORD|spring:ACTOR_CAPABILITY_SHARED_SECRET|spring:ACTOR_CAPABILITY_PUBLIC_KEY|spring:ACTOR_CAPABILITY_TLS_KEY_STORE_PASSWORD|spring:REDIS_PASSWORD|spring:JWT_SECRET|spring:JWT_ISSUER|spring:JWT_AUDIENCE|spring:LOGIN_SCOPE_HMAC_KEY|spring:PRINCIPLE_CURSOR_HMAC_KEY|spring:DECISION_IDEMPOTENCY_SCOPE_HMAC_KEY|spring:DECISION_GRPC_SHARED_SECRET|spring:BROKERAGE_IDEMPOTENCY_SCOPE_HMAC_KEY|spring:RAG_IDEMPOTENCY_SCOPE_HMAC_KEY|spring:RAG_REQUEST_FINGERPRINT_HMAC_KEY|spring:RAG_PROVIDER_USAGE_HMAC_KEY|spring:RAG_RATE_LIMIT_HMAC_KEY|spring:RAG_HISTORY_CURSOR_HMAC_KEY|spring:DEMO_CREDENTIAL_SEPARATION_KEY|spring:DEMO_USER_CREDENTIAL_BUNDLE|spring:DEMO_ADMIN_CREDENTIAL_BUNDLE|spring:ASYNC_CURSOR_HMAC_KEY|spring:ASYNC_PARTITION_HMAC_KEY|spring:ASYNC_WORKER_GRPC_SHARED_SECRET) return 0 ;;
+    decision-platform:POSTGRES_APP_PASSWORD|decision-platform:POSTGRES_WORKER_PASSWORD|decision-platform:POSTGRES_AUTH_PASSWORD|decision-platform:ACTOR_CAPABILITY_SHARED_SECRET|decision-platform:ACTOR_CAPABILITY_PUBLIC_KEY|decision-platform:ACTOR_CAPABILITY_TLS_KEY_STORE_PASSWORD|decision-platform:REDIS_PASSWORD|decision-platform:JWT_SECRET|decision-platform:JWT_ISSUER|decision-platform:JWT_AUDIENCE|decision-platform:LOGIN_SCOPE_HMAC_KEY|decision-platform:PRINCIPLE_CURSOR_HMAC_KEY|decision-platform:DECISION_IDEMPOTENCY_SCOPE_HMAC_KEY|decision-platform:DECISION_GRPC_SHARED_SECRET|decision-platform:BROKERAGE_IDEMPOTENCY_SCOPE_HMAC_KEY|decision-platform:BROKERAGE_GRPC_SHARED_SECRET|decision-platform:RAG_IDEMPOTENCY_SCOPE_HMAC_KEY|decision-platform:RAG_REQUEST_FINGERPRINT_HMAC_KEY|decision-platform:RAG_PROVIDER_USAGE_HMAC_KEY|decision-platform:RAG_RATE_LIMIT_HMAC_KEY|decision-platform:RAG_HISTORY_CURSOR_HMAC_KEY|decision-platform:DEMO_CREDENTIAL_SEPARATION_KEY|decision-platform:DEMO_USER_CREDENTIAL_BUNDLE|decision-platform:DEMO_ADMIN_CREDENTIAL_BUNDLE|decision-platform:ASYNC_CURSOR_HMAC_KEY|decision-platform:ASYNC_PARTITION_HMAC_KEY|decision-platform:ASYNC_WORKER_GRPC_SHARED_SECRET|decision-platform:ASYNC_WORKER_DATABASE_DSN|decision-platform:KAFKA_SASL_USERNAME|decision-platform:KAFKA_SASL_PASSWORD|decision-platform:KAFKA_ENVELOPE_PUBLIC_KEY|decision-platform:POISON_RECORDER_URL|decision-platform:POISON_RECORDER_SHARED_SECRET|decision-platform:KIS_MOCK_CONFIGURED|decision-platform:KIS_MOCK_APP_KEY|decision-platform:KIS_MOCK_APP_SECRET|decision-platform:KIS_MOCK_ACCOUNT_NO|decision-platform:KIS_MOCK_BOUND_ACCOUNT_ID|decision-platform:KIS_MOCK_ORDER_REFERENCE_KEY|decision-platform:KIS_BROKERAGE_TOKEN_P_PHYSICAL_CAP|decision-platform:KIS_BROKERAGE_PHYSICAL_CAP) return 0 ;;
+    decision-platform:RETURN_INFERENCE_GRPC_SHARED_SECRET) return 0 ;;
+    # 선택 구성: 운영자가 루트 .env 에 두 제공자를 모두 넣었을 때만 full-appctl 이 동기화한다.
+    decision-platform:GOOGLE_OIDC_CLIENT_ID|decision-platform:GOOGLE_OIDC_CLIENT_SECRET|decision-platform:GOOGLE_OIDC_ADMIN_SUBJECT_SHA256|decision-platform:KAKAO_OAUTH_CLIENT_ID|decision-platform:KAKAO_OAUTH_CLIENT_SECRET) return 0 ;;
+    decision-platform:RAG_V2_QUERY_DATABASE_DSN|decision-platform:RAG_V2_VOYAGE_QUERY_WRITER_DSN|decision-platform:RAG_V2_GRPC_SHARED_SECRET|decision-platform:VOYAGE_API_KEY) return 0 ;;
+    decision-platform:STRONG_LLM_GRPC_SHARED_SECRET|decision-platform:STRONG_LLM_API_KEY|decision-platform:STRONG_LLM_FALLBACK_API_KEY) return 0 ;;
+    decision-platform:P1_AUTOMATION_DATABASE_DSN|decision-platform:AUTOMATION_RUNTIME_SHARED_SECRET|decision-platform:P1_AUTOMATION_OWNER_USER_ID|decision-platform:P1_AUTOMATION_OWNER_USERNAME|decision-platform:P1_AUTOMATION_OWNER_PASSWORD) return 0 ;;
+    automation-runtime:P1_AUTOMATION_DATABASE_DSN|automation-runtime:AUTOMATION_RUNTIME_SHARED_SECRET|automation-runtime:P1_AUTOMATION_OWNER_USER_ID|automation-runtime:P1_AUTOMATION_OWNER_USERNAME|automation-runtime:P1_AUTOMATION_OWNER_PASSWORD) return 0 ;;
+    automation-cli:P1_AUTOMATION_DATABASE_DSN|automation-cli:AUTOMATION_RUNTIME_SHARED_SECRET|automation-cli:P1_AUTOMATION_OWNER_USER_ID|automation-cli:P1_AUTOMATION_OWNER_USERNAME|automation-cli:P1_AUTOMATION_OWNER_PASSWORD|automation-cli:KIS_MOCK_CONFIGURED|automation-cli:KIS_MOCK_APP_KEY|automation-cli:KIS_MOCK_APP_SECRET|automation-cli:KIS_MOCK_ACCOUNT_NO|automation-cli:KIS_MOCK_BOUND_ACCOUNT_ID|automation-cli:KIS_MOCK_ORDER_REFERENCE_KEY|automation-cli:KIS_BROKERAGE_TOKEN_P_PHYSICAL_CAP|automation-cli:KIS_BROKERAGE_PHYSICAL_CAP|automation-cli:REDIS_PASSWORD) return 0 ;;
+    automation-gate-author:P1_AUTOMATION_GATE_AUTHOR_DSN) return 0 ;;
+    # 자동운용 런타임이 관측 표에 append 할 때만 쓰는 좁은 writer 두 개다. 값이 있어도
+    # attest_source_writer_dsn 이 role 과 표 권한을 실제로 확인한 뒤에만 적재된다.
+    decision-platform:DECISION_PORTFOLIO_WRITER_DATABASE_DSN|decision-platform:DECISION_RISK_WRITER_DATABASE_DSN|decision-platform:DECISION_MARKET_WRITER_DATABASE_DSN) return 0 ;;
+    # 공시 투영에만 SELECT 를 갖는 read-only role 이다. 뉴스 거부권의 근거가 여기서 온다.
+    decision-platform:DECISION_DISCLOSURE_READER_DATABASE_DSN|automation-runtime:DECISION_DISCLOSURE_READER_DATABASE_DSN|automation-cli:DECISION_DISCLOSURE_READER_DATABASE_DSN|market-data:DECISION_DISCLOSURE_READER_DATABASE_DSN) return 0 ;;
+    calendar-offline-seed:P1_CALENDAR_OFFLINE_SEED_DSN) return 0 ;;
+    # writer DSN 하나와 provider 인증정보 하나다. 자동운용 DSN 도 KIS 앱키도 들어오지 않는다.
+    disclosure-collector:P1_DISCLOSURE_COLLECTOR_DSN|disclosure-collector:OPENDART_API_KEY) return 0 ;;
+    # 커밋된 S4.1 seed 를 등록만 한다. CLI 가 임의 URL 인자를 받지 않으므로 이 자격증명으로
+    # 열리는 것은 자기 표 등록뿐이고 network fetch 경로가 생기지 않는다.
+    rag-source-register:RAG_SOURCE_WRITER_DATABASE_DSN|rag-source-register:RAG_SOURCE_REGISTER_TARGET) return 0 ;;
+    market-data-daily:MARKET_DATA_WRITER_DSN) return 0 ;;
+    world-news:MARKET_DATA_WRITER_DSN) return 0 ;;
+    market-data:MARKET_DATA_WRITER_DSN|market-data:P1_AUTOMATION_DATABASE_DSN|market-data:AUTOMATION_RUNTIME_SHARED_SECRET|market-data:P1_AUTOMATION_OWNER_USER_ID|market-data:P1_AUTOMATION_OWNER_USERNAME|market-data:P1_AUTOMATION_OWNER_PASSWORD|market-data:KIS_MOCK_CONFIGURED|market-data:KIS_MOCK_APP_KEY|market-data:KIS_MOCK_APP_SECRET|market-data:KIS_LIVE_APP_KEY|market-data:KIS_LIVE_APP_SECRET|market-data:KRX_OPENAPI_AUTH_KEY|market-data:REDIS_PASSWORD) return 0 ;;
+    after-hours-replay:P1_AFTER_HOURS_REPLAY_DATABASE_DSN|after-hours-replay:P1_AFTER_HOURS_REPLAY_ISOLATED) return 0 ;;
+    authority:POSTGRES_IDENTITY_PASSWORD|authority:ACTOR_CAPABILITY_SHARED_SECRET|authority:ACTOR_CAPABILITY_PRIVATE_KEY|authority:ACTOR_CAPABILITY_PUBLIC_KEY|authority:ACTOR_CAPABILITY_TLS_KEY_STORE_PASSWORD) return 0 ;;
+    migration:POSTGRES_MIGRATION_PASSWORD|migration:BROKERAGE_DB_CAPABILITY_TOKEN_SHA256|migration:DEMO_CREDENTIAL_SEPARATION_KEY|migration:DEMO_USER_CREDENTIAL_BUNDLE|migration:DEMO_ADMIN_CREDENTIAL_BUNDLE) return 0 ;;
+    seed-import:P1_SEED_DATABASE_DSN) return 0 ;;
+    artifact-import:P1_ARTIFACT_IMPORT_DATABASE_DSN) return 0 ;;
+    team-a-acceptance:P1_TEAM_A_ACCEPTANCE_DATABASE_DSN) return 0 ;;
+    bootstrap:POSTGRES_MIGRATION_PASSWORD|bootstrap:DEMO_CREDENTIAL_SEPARATION_KEY|bootstrap:DEMO_USER_CREDENTIAL_BUNDLE|bootstrap:DEMO_ADMIN_CREDENTIAL_BUNDLE) return 0 ;;
+    python:ASYNC_WORKER_DATABASE_DSN|python:ASYNC_PARTITION_HMAC_KEY|python:ASYNC_WORKER_GRPC_SHARED_SECRET|python:KAFKA_SASL_USERNAME|python:KAFKA_SASL_PASSWORD|python:KAFKA_ENVELOPE_PUBLIC_KEY|python:POISON_RECORDER_URL|python:POISON_RECORDER_SHARED_SECRET) return 0 ;;
+    kafka-publisher:OUTBOX_PUBLISHER_DATABASE_DSN|kafka-publisher:KAFKA_SASL_USERNAME|kafka-publisher:KAFKA_SASL_PASSWORD|kafka-publisher:KAFKA_ENVELOPE_PRIVATE_KEY) return 0 ;;
+    poison-recorder:POISON_RECORDER_DATABASE_DSN|poison-recorder:POISON_RECORDER_SHARED_SECRET) return 0 ;;
+    kafka-admin:KAFKA_SASL_USERNAME|kafka-admin:KAFKA_SASL_PASSWORD) return 0 ;;
+    demo:P1_DEMO_DATABASE_DSN|demo:ASYNC_PARTITION_HMAC_KEY) return 0 ;;
+    redis:REDIS_PASSWORD) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+required_keys() {
+  key_profile=$profile
+  case "$key_profile" in
+    # certification runner는 spring_env, python_env, kis_mock_env만 마운트한다. 전체
+    # decision-platform 필수 집합을 요구하면 automation_runtime_env 키에서 항상 실패한다.
+    certification) printf '%s\n' 'REDIS_PASSWORD KIS_MOCK_CONFIGURED KIS_MOCK_APP_KEY KIS_MOCK_APP_SECRET KIS_MOCK_ACCOUNT_NO KIS_MOCK_BOUND_ACCOUNT_ID KIS_MOCK_ORDER_REFERENCE_KEY KIS_BROKERAGE_TOKEN_P_PHYSICAL_CAP KIS_BROKERAGE_PHYSICAL_CAP'
+      return ;;
+  esac
+  case "$key_profile" in
+    postgres) printf '%s\n' 'POSTGRES_PASSWORD POSTGRES_APP_PASSWORD POSTGRES_MIGRATION_PASSWORD POSTGRES_COLLECTOR_PASSWORD POSTGRES_DISCLOSURE_READER_PASSWORD POSTGRES_MARKET_WRITER_PASSWORD POSTGRES_PORTFOLIO_WRITER_PASSWORD POSTGRES_RISK_WRITER_PASSWORD POSTGRES_FILL_WRITER_PASSWORD POSTGRES_RAG_WRITER_PASSWORD POSTGRES_RAG_ADMIN_PASSWORD POSTGRES_RAG_QUERY_PASSWORD POSTGRES_SIGNAL_WRITER_PASSWORD POSTGRES_SIGNAL_SCHEDULER_PASSWORD POSTGRES_SIGNAL_ADMIN_PASSWORD POSTGRES_WORKER_PASSWORD POSTGRES_AUTOMATION_RUNTIME_PASSWORD POSTGRES_OUTBOX_PUBLISHER_PASSWORD POSTGRES_POISON_RECORDER_PASSWORD POSTGRES_REPLAY_PASSWORD POSTGRES_IDENTITY_PASSWORD POSTGRES_AUTH_PASSWORD POSTGRES_REPLAY_AUTHORIZER_PASSWORD POSTGRES_DEMO_PASSWORD' ;;
+    role-bootstrap) printf '%s\n' 'POSTGRES_ADMIN_USER POSTGRES_PASSWORD POSTGRES_AUTH_PASSWORD POSTGRES_AUTOMATION_RUNTIME_PASSWORD POSTGRES_OUTBOX_PUBLISHER_PASSWORD POSTGRES_POISON_RECORDER_PASSWORD' ;;
+    spring) printf '%s\n' 'POSTGRES_APP_PASSWORD POSTGRES_WORKER_PASSWORD POSTGRES_AUTH_PASSWORD ACTOR_CAPABILITY_SHARED_SECRET ACTOR_CAPABILITY_PUBLIC_KEY REDIS_PASSWORD JWT_SECRET JWT_ISSUER JWT_AUDIENCE LOGIN_SCOPE_HMAC_KEY PRINCIPLE_CURSOR_HMAC_KEY DECISION_IDEMPOTENCY_SCOPE_HMAC_KEY DECISION_GRPC_SHARED_SECRET BROKERAGE_IDEMPOTENCY_SCOPE_HMAC_KEY RAG_IDEMPOTENCY_SCOPE_HMAC_KEY RAG_REQUEST_FINGERPRINT_HMAC_KEY RAG_PROVIDER_USAGE_HMAC_KEY RAG_RATE_LIMIT_HMAC_KEY RAG_HISTORY_CURSOR_HMAC_KEY DEMO_CREDENTIAL_SEPARATION_KEY DEMO_USER_CREDENTIAL_BUNDLE DEMO_ADMIN_CREDENTIAL_BUNDLE ASYNC_CURSOR_HMAC_KEY ASYNC_PARTITION_HMAC_KEY ASYNC_WORKER_GRPC_SHARED_SECRET' ;;
+    public-demo) printf '%s\n' 'POSTGRES_APP_PASSWORD POSTGRES_WORKER_PASSWORD POSTGRES_AUTH_PASSWORD ACTOR_CAPABILITY_SHARED_SECRET ACTOR_CAPABILITY_PUBLIC_KEY ACTOR_CAPABILITY_TLS_KEY_STORE_PASSWORD REDIS_PASSWORD JWT_SECRET JWT_ISSUER JWT_AUDIENCE LOGIN_SCOPE_HMAC_KEY PRINCIPLE_CURSOR_HMAC_KEY DECISION_IDEMPOTENCY_SCOPE_HMAC_KEY DECISION_GRPC_SHARED_SECRET BROKERAGE_IDEMPOTENCY_SCOPE_HMAC_KEY RAG_IDEMPOTENCY_SCOPE_HMAC_KEY RAG_REQUEST_FINGERPRINT_HMAC_KEY RAG_PROVIDER_USAGE_HMAC_KEY RAG_RATE_LIMIT_HMAC_KEY RAG_HISTORY_CURSOR_HMAC_KEY ASYNC_CURSOR_HMAC_KEY ASYNC_PARTITION_HMAC_KEY ASYNC_WORKER_GRPC_SHARED_SECRET STRONG_LLM_GRPC_SHARED_SECRET MARS_VERTEX_SERVICE_ACCOUNT_JSON_B64' ;;
+    public-full) printf '%s\n' 'POSTGRES_APP_PASSWORD POSTGRES_WORKER_PASSWORD POSTGRES_AUTH_PASSWORD ACTOR_CAPABILITY_SHARED_SECRET ACTOR_CAPABILITY_PUBLIC_KEY ACTOR_CAPABILITY_TLS_KEY_STORE_PASSWORD REDIS_PASSWORD JWT_SECRET JWT_ISSUER JWT_AUDIENCE LOGIN_SCOPE_HMAC_KEY PRINCIPLE_CURSOR_HMAC_KEY DECISION_IDEMPOTENCY_SCOPE_HMAC_KEY DECISION_GRPC_SHARED_SECRET BROKERAGE_IDEMPOTENCY_SCOPE_HMAC_KEY RAG_IDEMPOTENCY_SCOPE_HMAC_KEY RAG_REQUEST_FINGERPRINT_HMAC_KEY RAG_PROVIDER_USAGE_HMAC_KEY RAG_RATE_LIMIT_HMAC_KEY RAG_HISTORY_CURSOR_HMAC_KEY ASYNC_CURSOR_HMAC_KEY ASYNC_PARTITION_HMAC_KEY ASYNC_WORKER_GRPC_SHARED_SECRET STRONG_LLM_GRPC_SHARED_SECRET BROKERAGE_DB_CAPABILITY_TOKEN_SHA256 BROKERAGE_GRPC_SHARED_SECRET GOOGLE_OIDC_CLIENT_ID GOOGLE_OIDC_CLIENT_SECRET GOOGLE_OIDC_ADMIN_SUBJECT_SHA256 KAKAO_OAUTH_CLIENT_ID KAKAO_OAUTH_CLIENT_SECRET KIS_MOCK_ORDER_REFERENCE_KEY MARS_VERTEX_SERVICE_ACCOUNT_JSON_B64 RAG_V2_GRPC_SHARED_SECRET RAG_V2_QUERY_DATABASE_DSN RAG_V2_VOYAGE_QUERY_WRITER_DSN VOYAGE_API_KEY RETURN_INFERENCE_GRPC_SHARED_SECRET P1_AUTOMATION_DATABASE_DSN AUTOMATION_RUNTIME_SHARED_SECRET ASYNC_WORKER_DATABASE_DSN' ;;
+    decision-platform) printf '%s\n' 'POSTGRES_APP_PASSWORD POSTGRES_WORKER_PASSWORD POSTGRES_AUTH_PASSWORD ACTOR_CAPABILITY_SHARED_SECRET ACTOR_CAPABILITY_PUBLIC_KEY ACTOR_CAPABILITY_TLS_KEY_STORE_PASSWORD REDIS_PASSWORD JWT_SECRET JWT_ISSUER JWT_AUDIENCE LOGIN_SCOPE_HMAC_KEY PRINCIPLE_CURSOR_HMAC_KEY DECISION_IDEMPOTENCY_SCOPE_HMAC_KEY DECISION_GRPC_SHARED_SECRET BROKERAGE_IDEMPOTENCY_SCOPE_HMAC_KEY BROKERAGE_GRPC_SHARED_SECRET RAG_IDEMPOTENCY_SCOPE_HMAC_KEY RAG_REQUEST_FINGERPRINT_HMAC_KEY RAG_PROVIDER_USAGE_HMAC_KEY RAG_RATE_LIMIT_HMAC_KEY RAG_HISTORY_CURSOR_HMAC_KEY DEMO_CREDENTIAL_SEPARATION_KEY DEMO_USER_CREDENTIAL_BUNDLE DEMO_ADMIN_CREDENTIAL_BUNDLE ASYNC_CURSOR_HMAC_KEY ASYNC_PARTITION_HMAC_KEY ASYNC_WORKER_GRPC_SHARED_SECRET ASYNC_WORKER_DATABASE_DSN KAFKA_SASL_USERNAME KAFKA_SASL_PASSWORD KAFKA_ENVELOPE_PUBLIC_KEY POISON_RECORDER_URL POISON_RECORDER_SHARED_SECRET KIS_MOCK_CONFIGURED KIS_MOCK_APP_KEY KIS_MOCK_APP_SECRET KIS_MOCK_ACCOUNT_NO KIS_MOCK_BOUND_ACCOUNT_ID KIS_MOCK_ORDER_REFERENCE_KEY KIS_BROKERAGE_TOKEN_P_PHYSICAL_CAP KIS_BROKERAGE_PHYSICAL_CAP P1_AUTOMATION_DATABASE_DSN AUTOMATION_RUNTIME_SHARED_SECRET P1_AUTOMATION_OWNER_USER_ID P1_AUTOMATION_OWNER_USERNAME P1_AUTOMATION_OWNER_PASSWORD RAG_V2_QUERY_DATABASE_DSN RAG_V2_VOYAGE_QUERY_WRITER_DSN RAG_V2_GRPC_SHARED_SECRET' ;;
+    automation-runtime) printf '%s\n' 'P1_AUTOMATION_DATABASE_DSN AUTOMATION_RUNTIME_SHARED_SECRET P1_AUTOMATION_OWNER_USER_ID P1_AUTOMATION_OWNER_USERNAME P1_AUTOMATION_OWNER_PASSWORD' ;;
+    automation-cli) printf '%s\n' 'P1_AUTOMATION_DATABASE_DSN AUTOMATION_RUNTIME_SHARED_SECRET P1_AUTOMATION_OWNER_USER_ID P1_AUTOMATION_OWNER_USERNAME P1_AUTOMATION_OWNER_PASSWORD KIS_MOCK_CONFIGURED KIS_MOCK_APP_KEY KIS_MOCK_APP_SECRET KIS_MOCK_ACCOUNT_NO KIS_MOCK_BOUND_ACCOUNT_ID KIS_MOCK_ORDER_REFERENCE_KEY KIS_BROKERAGE_TOKEN_P_PHYSICAL_CAP KIS_BROKERAGE_PHYSICAL_CAP REDIS_PASSWORD' ;;
+    automation-gate-author) printf '%s\n' 'P1_AUTOMATION_GATE_AUTHOR_DSN' ;;
+    calendar-offline-seed) printf '%s\n' 'P1_CALENDAR_OFFLINE_SEED_DSN' ;;
+    disclosure-collector) printf '%s\n' 'P1_DISCLOSURE_COLLECTOR_DSN' ;;
+    market-data-daily) printf '%s\n' 'MARKET_DATA_WRITER_DSN' ;;
+    world-news) printf '%s\n' 'MARKET_DATA_WRITER_DSN' ;;
+    market-data) printf '%s\n' 'MARKET_DATA_WRITER_DSN P1_AUTOMATION_DATABASE_DSN AUTOMATION_RUNTIME_SHARED_SECRET P1_AUTOMATION_OWNER_USER_ID KIS_MOCK_CONFIGURED KIS_MOCK_APP_KEY KIS_MOCK_APP_SECRET REDIS_PASSWORD' ;;
+    after-hours-replay) printf '%s\n' 'P1_AFTER_HOURS_REPLAY_DATABASE_DSN P1_AFTER_HOURS_REPLAY_ISOLATED' ;;
+    authority) printf '%s\n' 'POSTGRES_IDENTITY_PASSWORD ACTOR_CAPABILITY_SHARED_SECRET ACTOR_CAPABILITY_PRIVATE_KEY ACTOR_CAPABILITY_PUBLIC_KEY ACTOR_CAPABILITY_TLS_KEY_STORE_PASSWORD' ;;
+    migration)
+      if [ "${MARS_PUBLIC_SURFACE_MODE:-LOCAL}" = LOCAL ]; then
+        printf '%s\n' 'POSTGRES_MIGRATION_PASSWORD BROKERAGE_DB_CAPABILITY_TOKEN_SHA256 DEMO_CREDENTIAL_SEPARATION_KEY DEMO_USER_CREDENTIAL_BUNDLE DEMO_ADMIN_CREDENTIAL_BUNDLE'
+      else
+        printf '%s\n' 'POSTGRES_MIGRATION_PASSWORD BROKERAGE_DB_CAPABILITY_TOKEN_SHA256'
+      fi ;;
+    seed-import) printf '%s\n' 'P1_SEED_DATABASE_DSN' ;;
+    artifact-import) printf '%s\n' 'P1_ARTIFACT_IMPORT_DATABASE_DSN' ;;
+    team-a-acceptance) printf '%s\n' 'P1_TEAM_A_ACCEPTANCE_DATABASE_DSN' ;;
+    bootstrap) printf '%s\n' 'POSTGRES_MIGRATION_PASSWORD DEMO_CREDENTIAL_SEPARATION_KEY DEMO_USER_CREDENTIAL_BUNDLE DEMO_ADMIN_CREDENTIAL_BUNDLE' ;;
+    python) printf '%s\n' 'ASYNC_WORKER_DATABASE_DSN ASYNC_PARTITION_HMAC_KEY ASYNC_WORKER_GRPC_SHARED_SECRET KAFKA_SASL_USERNAME KAFKA_SASL_PASSWORD KAFKA_ENVELOPE_PUBLIC_KEY POISON_RECORDER_URL POISON_RECORDER_SHARED_SECRET' ;;
+    kafka-publisher) printf '%s\n' 'OUTBOX_PUBLISHER_DATABASE_DSN KAFKA_SASL_USERNAME KAFKA_SASL_PASSWORD KAFKA_ENVELOPE_PRIVATE_KEY' ;;
+    poison-recorder) printf '%s\n' 'POISON_RECORDER_DATABASE_DSN POISON_RECORDER_SHARED_SECRET' ;;
+    kafka-admin) printf '%s\n' 'KAFKA_SASL_USERNAME KAFKA_SASL_PASSWORD' ;;
+    demo) printf '%s\n' 'P1_DEMO_DATABASE_DSN ASYNC_PARTITION_HMAC_KEY' ;;
+    redis) printf '%s\n' 'REDIS_PASSWORD' ;;
+  esac
+}
+
+seen='|'
+for secret_file in $secret_files; do
+while read -r line || [ -n "$line" ]; do
+  # IFS='=' 분해는 base64 padding으로 끝나는 값의 마지막 '='를 버린다. 첫 '=' 기준으로만
+  # 나눠 값 원문을 그대로 보존한다.
+  key=${line%%=*}
+  value=${line#*=}
+  if [ -z "$key" ] || [ "$key" = "$line" ] || ! allowed_key "$key"; then
+    echo "p1 secret loading failed: unexpected_key" >&2
+    exit 1
+  fi
+  case "$seen" in
+    *"|$key|"*)
+      current=$(printenv "$key" 2>/dev/null || true)
+      [ "$current" = "$value" ] || { echo "p1 secret loading failed: duplicate_key" >&2; exit 1; }
+      continue
+      ;;
+  esac
+  if [ -z "$value" ]; then
+    echo "p1 secret loading failed: invalid_value" >&2
+    exit 1
+  fi
+  seen="$seen$key|"
+  export "$key=$value"
+done < "$secret_file"
+done
+
+for key in $(required_keys); do
+  case "$seen" in
+    *"|$key|"*) ;;
+    *) echo "p1 secret loading failed: missing_key" >&2; exit 1 ;;
+  esac
+done
+
+if [ "$profile" = decision-platform ]; then
+  case "$seen" in
+    *'|RETURN_INFERENCE_GRPC_SHARED_SECRET|'*) ;;
+    *) echo "p1 secret loading failed: missing_return_inference_secret" >&2; exit 1 ;;
+  esac
+fi
+
+if [ "$profile" = decision-platform ] || [ "$profile" = certification ] || [ "$profile" = automation-cli ]; then
+  case "${KIS_MOCK_BROKERAGE_ONLINE_ENABLED:-false}:$KIS_MOCK_CONFIGURED" in
+    false:false|false:true|true:true) ;;
+    true:false) echo "p1 secret loading failed: kis_mock_not_configured" >&2; exit 1 ;;
+    *) echo "p1 secret loading failed: invalid_kis_mock_gate" >&2; exit 1 ;;
+  esac
+fi
+
+if [ "$profile" = public-full ] && [ "${KIS_MOCK_BROKERAGE_ONLINE_ENABLED:-false}" != true ]; then
+  echo "p1 secret loading failed: kis_mock_brokerage_disabled" >&2
+  exit 1
+fi
+
+if [ "$profile" = spring ] || [ "$profile" = decision-platform ] ||
+  [ "$profile" = public-demo ] || [ "$profile" = public-full ]; then
+  if [ ! -f /run/secrets/rag_history_kek ] || [ -L /run/secrets/rag_history_kek ]; then
+    echo "p1 secret loading failed: invalid_rag_key" >&2
+    exit 1
+  fi
+  install -d -m 700 /tmp/rag-history
+  rag_key_size=$(wc -c < /run/secrets/rag_history_kek)
+  if [ "$rag_key_size" -eq 32 ]; then
+    # Older p1ctl states stored the same 32 key bytes as raw binary. Convert
+    # only the container-local copy to the provider's lowercase hex envelope.
+    od -An -v -tx1 /run/secrets/rag_history_kek \
+      | tr -d ' \n' > /tmp/rag-history/rag-history-kek-v1.key
+    chmod 600 /tmp/rag-history/rag-history-kek-v1.key
+  else
+    install -m 600 /run/secrets/rag_history_kek /tmp/rag-history/rag-history-kek-v1.key
+  fi
+  export RAG_HISTORY_SECRET_DIRECTORY=/tmp/rag-history
+  export RAG_HISTORY_CURRENT_KEK_VERSION=kek-v1
+fi
+
+if [ "$profile" = decision-platform ] && [ -n "${RETURN_INFERENCE_BUNDLE_ROOT:-}" ]; then
+  # exact-10 번들을 컨테이너 tmpfs 로 복사한다. safe_io 가 approved_root 와 각 파일이 실행
+  # uid 소유이고 group/other 쓰기가 없기를 요구하는데, host bind mount 는 host uid 를 그대로
+  # 들고 온다(이 컨테이너는 65532 로 돌고 host seed 는 1000 소유다).
+  # rag-v2-root 가 이미 쓰는 방식대로 읽기전용 원본에서 복사만 한다.
+  seed_src=$RETURN_INFERENCE_BUNDLE_ROOT
+  case "$seed_src" in
+    /tmp/*) : ;;  # 이미 tmpfs 경로면 그대로 쓴다
+    *)
+      if [ -d "$seed_src" ] && [ ! -L "$seed_src" ]; then
+        seed_dst=/tmp/team-b-seed
+        install -d -m 700 "$seed_dst" "$seed_dst/team-b"
+        seed_count=0
+        for seed_leaf in "$seed_src"/*; do
+          [ -e "$seed_leaf" ] || continue
+          if [ ! -f "$seed_leaf" ] || [ -L "$seed_leaf" ]; then
+            echo "p1 secret loading failed: team_b_seed_leaf_unsafe" >&2
+            exit 1
+          fi
+          install -m 600 "$seed_leaf" "$seed_dst/team-b/$(basename "$seed_leaf")"
+          seed_count=$((seed_count + 1))
+        done
+        if [ "$seed_count" -gt 0 ]; then
+          export RETURN_INFERENCE_BUNDLE_ROOT="$seed_dst/team-b"
+        fi
+        unset seed_dst seed_count seed_leaf
+      fi
+      ;;
+  esac
+  unset seed_src
+fi
+
+# 마운트가 비어 있으면 이미지에 구워 둔 기본 트리로 먼저 채운다. 아래 검사는 그 뒤에
+# 돈다 - 레포 없이 이미지만 받은 서버에서도 leaf 가 갖춰진다.
+if { [ "$profile" = decision-platform ] || [ "$profile" = public-full ]; } &&
+  [ "${RAG_V2_GRPC_ENABLED:-false}" = true ]; then
+  CAPSTONE_RAG_LOCAL_ROOT=${P1_RAG_RUNTIME_DIR_MOUNT:-/run/rag-runtime} seed_rag_runtime_root
+fi
+
+if { [ "$profile" = decision-platform ] || [ "$profile" = public-full ]; } &&
+  [ "${RAG_V2_GRPC_ENABLED:-false}" = true ]; then
+  # RAG v2 질의 경로의 local root를 컨테이너 안 tmpfs에 만든다. loader가 0700 디렉터리와 0600
+  # 파일을, 그리고 그 소유자가 실행 uid와 같기를 요구하는데, host bind mount는 host uid를 그대로
+  # 들고 온다. rag-history가 이미 쓰는 방식대로 읽기전용 원본에서 복사만 한다.
+  src=${P1_RAG_RUNTIME_DIR_MOUNT:-/run/rag-runtime}
+  if [ ! -d "$src" ] || [ -L "$src" ]; then
+    echo "p1 secret loading failed: rag_v2_runtime_root_missing" >&2
+    exit 1
+  fi
+  for leaf in control/pre-s5-voyage-query-runtime.json \
+              artifacts/voyage-context-4/tokenizer.json; do
+    if [ ! -f "$src/$leaf" ] || [ -L "$src/$leaf" ]; then
+      echo "p1 secret loading failed: rag_v2_runtime_leaf_missing" >&2
+      exit 1
+    fi
+  done
+  install -d -m 700 /tmp/rag-v2-root /tmp/rag-v2-root/control /tmp/rag-v2-root/secrets \
+    /tmp/rag-v2-root/artifacts /tmp/rag-v2-root/artifacts/voyage-context-4
+  install -m 600 "$src/control/pre-s5-voyage-query-runtime.json" \
+    /tmp/rag-v2-root/control/pre-s5-voyage-query-runtime.json
+  # writer DSN은 bind mount로 들여오지 않는다. compose secret으로 이미 들어와 있는 값을
+  # 로컬 루트가 요구하는 0600 leaf로 옮겨 적을 뿐이다. 비밀이 host 쪽에서 넓게 읽히지 않는다.
+  if [ -z "${RAG_V2_QUERY_DATABASE_DSN:-}" ] || [ -z "${RAG_V2_VOYAGE_QUERY_WRITER_DSN:-}" ]; then
+    echo "p1 secret loading failed: rag_v2_query_dsn_missing" >&2
+    exit 1
+  fi
+  printf '%s' "$RAG_V2_QUERY_DATABASE_DSN" > /tmp/rag-v2-root/secrets/rag-v2-query-database-dsn
+  chmod 600 /tmp/rag-v2-root/secrets/rag-v2-query-database-dsn
+  printf '%s' "$RAG_V2_VOYAGE_QUERY_WRITER_DSN" > /tmp/rag-v2-root/secrets/rag-v2-voyage-query-writer-dsn
+  chmod 600 /tmp/rag-v2-root/secrets/rag-v2-voyage-query-writer-dsn
+  # query role credential은 하위 Python/Java 프로세스 전체의 환경에 남기지 않는다.
+  # gRPC server는 아래 파일 경로를 owner-only boundary로 다시 검증해 읽는다.
+  unset RAG_V2_QUERY_DATABASE_DSN RAG_V2_VOYAGE_QUERY_WRITER_DSN
+  export RAG_V2_QUERY_SECRET_FILE=/tmp/rag-v2-root/secrets/rag-v2-query-database-dsn
+  install -m 600 "$src/artifacts/voyage-context-4/tokenizer.json" \
+    /tmp/rag-v2-root/artifacts/voyage-context-4/tokenizer.json
+# Vertex 생성형 답변은 서비스가 root .env에서 받은 Base64 값으로 credential을 메모리에 파싱한다.
+# 이전 credential JSON 파일 경로는 읽지 않는다.
+  # 자동 활성화를 켰다면 그 정책 파일도 소유자 전용 사본으로 옮긴다. 켜 두고 정책이 없으면
+  # 부팅에서 닫는다. 비용 상한 없이 provider를 자동으로 부르게 두는 것보다 안 뜨는 편이 낫다.
+  if [ "${RAG_V2_VERTEX_AUTO_ACTIVATION_ENABLED:-false}" = true ]; then
+    policy=$src/control/pre-s5-vertex-auto-activation-policy.json
+    if [ ! -f "$policy" ] || [ -L "$policy" ]; then
+      echo "p1 secret loading failed: rag_v2_vertex_auto_activation_policy_missing" >&2
+      exit 1
+    fi
+    install -m 600 "$policy" /tmp/rag-v2-root/control/pre-s5-vertex-auto-activation-policy.json
+    export RAG_V2_VERTEX_AUTO_ACTIVATION_POLICY_FILE=\
+/tmp/rag-v2-root/control/pre-s5-vertex-auto-activation-policy.json
+  fi
+  export CAPSTONE_RAG_LOCAL_ROOT=/tmp/rag-v2-root
+fi
+
+if { [ "$profile" = decision-platform ] || [ "$profile" = public-demo ] ||
+  [ "$profile" = public-full ]; } &&
+  [ "${S4_9_STRONG_LLM_ENABLED:-false}" = true ]; then
+  # Kotlin host와 Python agent는 이 공유 비밀로만 서로를 확인한다. 없으면 인증 없는 loopback
+  # 서비스가 되므로 부팅에서 닫는다. 조용히 열린 채로 뜨지 않는다.
+  if [ -z "${STRONG_LLM_GRPC_SHARED_SECRET:-}" ]; then
+    echo "p1 secret loading failed: strong_llm_shared_secret_missing" >&2
+    exit 1
+  fi
+  # Strong LLM은 RAG 검색과 독립된 automation capability다. RAG v2가 꺼진 배포에서도
+  # 같은 root-env credential 값을 provider가 메모리에서 읽는다. credential JSON 임시 파일은 만들지 않는다.
+  if [ "${STRONG_LLM_PROVIDER:-vertex}" = vertex ] ||
+    [ "${STRONG_LLM_FALLBACK_PROVIDER:-}" = vertex ]; then
+    if [ -z "${MARS_VERTEX_SERVICE_ACCOUNT_JSON_B64:-}" ]; then
+      echo "p1 secret loading failed: strong_llm_vertex_service_account_env_missing" >&2
+      exit 1
+    fi
+  fi
+fi
+
+if [ "$profile" = redis ]; then
+  exec docker-entrypoint.sh redis-server --appendonly yes --requirepass "$REDIS_PASSWORD"
+fi
+
+if [ "$profile" = postgres ]; then
+  exec "$@"
+fi
+
+if [ "$profile" = certification ] || [ "$profile" = artifact-import ]; then
+  [ "$(id -u)" = "${P1_OPERATOR_UID:?missing operator uid}" ] || {
+    echo "p1 secret loading failed: invalid_operator_uid" >&2
+    exit 1
+  }
+  exec "$@"
+fi
+
+if { [ "$profile" = market-data ] || [ "$profile" = after-hours-replay ]; } &&
+  [ "$(id -u)" != 65532 ]; then
+  [ "$(id -u)" = "${P1_OPERATOR_UID:?missing operator uid}" ] || {
+    echo "p1 secret loading failed: invalid_operator_uid" >&2
+    exit 1
+  }
+  exec "$@"
+fi
+
+if [ "$(id -u)" = 0 ]; then
+  exec setpriv --reuid 65532 --regid 65532 --clear-groups "$@"
+fi
+[ "$(id -u)" = 65532 ] || {
+  echo "p1 secret loading failed: invalid_runtime_uid" >&2
+  exit 1
+}
+exec "$@"

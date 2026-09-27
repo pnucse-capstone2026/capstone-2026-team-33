@@ -1,0 +1,291 @@
+spring:
+  profiles:
+    group:
+      mars-full: social-login
+  ai:
+    mcp:
+      server:
+        enabled: ${S4_9_MCP_ENABLED:false}
+        name: capstone-rag-mcp
+        version: 1.0.0
+        protocol: STREAMABLE
+        type: SYNC
+      annotation-scanner:
+        enabled: true
+  mvc:
+    throw-exception-if-no-handler-found: true
+  datasource:
+    url: jdbc:postgresql://${POSTGRES_HOST:127.0.0.1}:${POSTGRES_PORT:5432}/${POSTGRES_DB:trading}
+    username: decision_app
+    password: ${POSTGRES_APP_PASSWORD}
+    hikari:
+      maximum-pool-size: 10        # 코어수x2 근처, 키우지 않는다
+      connection-timeout: 500      # source cap보다 긴 pool 대기로 evaluation budget을 넘기지 않는다
+  jpa:
+    hibernate:
+      ddl-auto: validate           # 스키마 진실은 Flyway
+    open-in-view: false            # 뷰 렌더링까지 커넥션 점유 금지 — 필수
+    properties:
+      hibernate.default_batch_fetch_size: 100
+  flyway:
+    locations: classpath:db/migration,classpath:db/baseline
+    user: flyway
+    password: ${POSTGRES_MIGRATION_PASSWORD:__MISSING_MIGRATION_PASSWORD__}
+    placeholders:
+      brokerageDbCapabilityTokenSha256: ${BROKERAGE_DB_CAPABILITY_TOKEN_SHA256}
+  data:
+    redis:
+      host: ${REDIS_HOST:127.0.0.1}
+      port: ${REDIS_PORT:6379}
+      database: ${REDIS_DB:0}
+      password: ${REDIS_PASSWORD}
+      timeout: 2s
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:127.0.0.1:9092}
+    producer:
+      acks: all                    # 리더+ISR 확인 후 성공
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      properties:
+        enable.idempotence: true   # 브로커 수준 중복 발행 방지
+        max.in.flight.requests.per.connection: 5
+        delivery.timeout.ms: 30000
+        request.timeout.ms: 10000
+    consumer:
+      enable-auto-commit: false    # 처리 성공 후 수동 커밋
+      auto-offset-reset: earliest
+      max-poll-records: 200
+    listener:
+      ack-mode: MANUAL
+    properties:
+      security.protocol: ${KAFKA_SECURITY_PROTOCOL:PLAINTEXT}
+
+app:
+  automation:
+    connected-kis-account-enabled: false
+  p1:
+    automation:
+      evidence-fixture-enabled: ${P1_AUTOMATION_EVIDENCE_FIXTURE_ENABLED:false}
+  financial-engineering:
+    grpc:
+      enabled: ${FINANCIAL_ENGINEERING_GRPC_ENABLED:false}
+      target: ${FINANCIAL_ENGINEERING_GRPC_TARGET:127.0.0.1:50054}
+      shared-secret: ${FINANCIAL_ENGINEERING_GRPC_SHARED_SECRET:}
+      deadline-millis: 2000
+      request-max-bytes: 65536
+      response-max-bytes: 65536
+      concurrency-max: 8
+      retry-count: 0
+  s4-9:
+    strong-llm:
+      enabled: ${S4_9_STRONG_LLM_ENABLED:false}
+      model-id: ${VERTEX_MODEL_ID:gemini-3.5-flash}
+      request-timeout-millis: ${RAG_V2_VERTEX_REQUEST_TIMEOUT_MILLIS:30000}
+      max-output-tokens: ${RAG_LLM_MAX_OUTPUT_TOKENS:4096}
+      local-root: ${CAPSTONE_RAG_LOCAL_ROOT:}
+      service-account-json-b64: ${MARS_VERTEX_SERVICE_ACCOUNT_JSON_B64:}
+      owner-consent-policy-sha256: ${S49_OWNER_CONSENT_POLICY_SHA256:}
+      owner-consent-processor-set-sha256: ${S49_OWNER_CONSENT_PROCESSOR_SET_SHA256:}
+      grpc:
+        target: ${STRONG_LLM_GRPC_TARGET:127.0.0.1:50055}
+        shared-secret: ${STRONG_LLM_GRPC_SHARED_SECRET:}
+        deadline-millis: ${STRONG_LLM_GRPC_DEADLINE_MILLIS:45000}
+        request-max-bytes: 262144
+        response-max-bytes: 262144
+    mcp-oauth:
+      enabled: ${S4_9_MCP_ENABLED:false}
+      issuer: ${S4_9_MCP_ISSUER:http://127.0.0.1:8080}
+      resource-uri: ${S4_9_MCP_RESOURCE_URI:http://127.0.0.1:8080/mcp}
+      signing-jwk-path: ${S4_9_MCP_SIGNING_JWK_PATH:}
+      client-allowlist-path: ${S4_9_MCP_CLIENT_ALLOWLIST_PATH:}
+  demo-credentials:
+    user-credential-bundle: ${DEMO_USER_CREDENTIAL_BUNDLE:}
+    admin-credential-bundle: ${DEMO_ADMIN_CREDENTIAL_BUNDLE:}
+    separation-key: ${DEMO_CREDENTIAL_SEPARATION_KEY:}
+  http:
+    max-request-body-bytes: 1048576
+  jwt:
+    secret: ${JWT_SECRET}          # 32byte 이상, .env로만
+    issuer: ${JWT_ISSUER}
+    audience: ${JWT_AUDIENCE}
+    ttl-hours: 12
+  login:
+    scope-hmac-key: ${LOGIN_SCOPE_HMAC_KEY}
+  principle:
+    cursor-hmac-key: ${PRINCIPLE_CURSOR_HMAC_KEY}
+  idempotency:
+    ttl-hours: 24
+    claim-ttl-seconds: 900
+    max-key-length: 128
+    max-new-keys-per-user-per-ttl: 1000
+    max-request-body-bytes: 1048576
+    max-response-body-bytes: 4194304
+    paths:
+      - /api/v1/orders/**
+      - /api/v1/backtests/**
+      - /api/v1/brokerage/orders/**
+      - /api/v1/risk/kill-switch
+  decision:
+    valid-minutes: 10              # validUntil
+    idempotency-scope-hmac-key: ${DECISION_IDEMPOTENCY_SCOPE_HMAC_KEY}
+    claim-ttl-seconds: 30
+    grpc:
+      target: ${DECISION_GRPC_TARGET:127.0.0.1:50051}
+      shared-secret: ${DECISION_GRPC_SHARED_SECRET:}
+      hard-deadline-millis: 2000
+      source-deadline-millis: 500
+      total-evaluation-deadline-millis: 900
+      request-max-bytes: 262144
+      response-max-bytes: 1048576
+      concurrency-max: 8
+  rag:
+    # S4.4는 local classifier/retrieval-only 경계만 활성화하며 live provider adapter는 열지 않는다.
+    answerer: ${RAG_ANSWERER:FIXTURE_ONLY}
+    history-secret-directory: ${RAG_HISTORY_SECRET_DIRECTORY}
+    current-kek-version: ${RAG_HISTORY_CURRENT_KEK_VERSION:kek-v1}
+    idempotency-scope-hmac-key: ${RAG_IDEMPOTENCY_SCOPE_HMAC_KEY}
+    request-fingerprint-hmac-key: ${RAG_REQUEST_FINGERPRINT_HMAC_KEY}
+    provider-usage-hmac-key: ${RAG_PROVIDER_USAGE_HMAC_KEY}
+    rate-limit-hmac-key: ${RAG_RATE_LIMIT_HMAC_KEY}
+    history-cursor-hmac-key: ${RAG_HISTORY_CURSOR_HMAC_KEY}
+    claim-ttl-seconds: 120
+    retention-days: 30
+    rate-limit-per-minute: 20
+    grpc:
+      enabled: ${RAG_GRPC_ENABLED:false}
+      target: ${RAG_GRPC_TARGET:127.0.0.1:50053}
+      shared-secret: ${RAG_GRPC_SHARED_SECRET:}
+      deadline-millis: 15000
+      read-timeout-millis: 17000
+      request-max-bytes: 65536
+      response-max-bytes: 262144
+      concurrency-max: 8
+      retry-count: 0
+  rag-v2:
+    # v2는 local BGE retrieval-only process와만 연결한다. Vertex/Voyage 등 외부 provider는 이 transport에 없다.
+    grpc:
+      enabled: ${RAG_V2_GRPC_ENABLED:false}
+      target: ${RAG_V2_GRPC_TARGET:127.0.0.1:50054}
+      shared-secret: ${RAG_V2_GRPC_SHARED_SECRET:}
+      deadline-millis: 15000
+      request-max-bytes: 65536
+      response-max-bytes: 262144
+      concurrency-max: 8
+      retry-count: 0
+    # Vertex는 explicit packet/rights/consent가 모두 충족될 때만 별도 single-generator로 열린다.
+    vertex:
+      enabled: ${RAG_V2_VERTEX_ENABLED:false}
+      model-id: ${VERTEX_MODEL_ID:gemini-3.5-flash}
+      local-root: ${CAPSTONE_RAG_LOCAL_ROOT:}
+      service-account-json-b64: ${MARS_VERTEX_SERVICE_ACCOUNT_JSON_B64:}
+      head-commit: ${RAG_V2_VERTEX_HEAD_COMMIT:}
+      tree-digest: ${RAG_V2_VERTEX_TREE_DIGEST:}
+      ci-digest: ${RAG_V2_VERTEX_CI_DIGEST:}
+      security-digest: ${RAG_V2_VERTEX_SECURITY_DIGEST:}
+      request-timeout-millis: ${RAG_V2_VERTEX_REQUEST_TIMEOUT_MILLIS:30000}
+      auto-activation-enabled: ${RAG_V2_VERTEX_AUTO_ACTIVATION_ENABLED:false}
+      auto-activation-policy-file: ${RAG_V2_VERTEX_AUTO_ACTIVATION_POLICY_FILE:}
+    web:
+      enabled: ${RAG_WEB_ENABLED:false}
+      searxng-base-url: ${RAG_WEB_SEARXNG_BASE_URL:http://127.0.0.1:58080}
+      receipt-hmac-key: ${RAG_WEB_RECEIPT_HMAC_KEY:}
+      concise-max-searches: ${RAG_WEB_CONCISE_MAX_SEARCHES:1}
+      concise-max-reads: ${RAG_WEB_CONCISE_MAX_READS:3}
+      detailed-max-searches: ${RAG_WEB_DETAILED_MAX_SEARCHES:2}
+      detailed-max-reads: ${RAG_WEB_DETAILED_MAX_READS:6}
+      absolute-max-searches: ${RAG_WEB_ABSOLUTE_MAX_SEARCHES:3}
+      absolute-max-reads: ${RAG_WEB_ABSOLUTE_MAX_READS:8}
+      max-parallel-reads: ${RAG_WEB_MAX_PARALLEL_READS:3}
+      max-tool-rounds: ${RAG_LLM_MAX_TOOL_ROUNDS:3}
+      external-research-window-minutes: 15
+      external-research-max-searches: ${RAG_WEB_EXTERNAL_MAX_SEARCHES:30}
+      external-research-max-reads: ${RAG_WEB_EXTERNAL_MAX_READS:120}
+      external-research-user-parallel-reads: ${RAG_WEB_EXTERNAL_USER_PARALLEL_READS:4}
+      external-research-global-parallel-reads: ${RAG_WEB_EXTERNAL_GLOBAL_PARALLEL_READS:8}
+      external-research-max-contexts-per-caller: ${RAG_WEB_EXTERNAL_MAX_CONTEXTS_PER_CALLER:30}
+      external-research-max-total-contexts: ${RAG_WEB_EXTERNAL_MAX_TOTAL_CONTEXTS:1024}
+      vertex-google-search:
+        enabled: ${RAG_WEB_VERTEX_GOOGLE_SEARCH_ENABLED:true}
+        overage-allowed: ${RAG_WEB_VERTEX_GOOGLE_SEARCH_OVERAGE_ALLOWED:false}
+        monthly-soft-cap: ${RAG_WEB_VERTEX_GOOGLE_SEARCH_MONTHLY_SOFT_CAP:4000}
+        reserve-per-prompt: ${RAG_WEB_VERTEX_GOOGLE_SEARCH_RESERVE_PER_PROMPT:8}
+        billing-period-zone: ${RAG_WEB_GOOGLE_BILLING_PERIOD_ZONE:America/Los_Angeles}
+        billing-account-fingerprint: ${RAG_WEB_GOOGLE_BILLING_ACCOUNT_FINGERPRINT:}
+  brokerage:
+    idempotency-scope-hmac-key: ${BROKERAGE_IDEMPOTENCY_SCOPE_HMAC_KEY}
+    # DB에는 digest만 migration으로 저장하고 raw capability는 prepared bind로만 전달한다.
+    idempotency-ttl-hours: 24
+    paper:
+      slippage-bps: 5
+      # S2.3 price freshness와 같은 300초 계약을 별도 fallback 없이 공유한다.
+      price-max-age-seconds: ${app.freshness.price-seconds}
+    grpc:
+      enabled: ${BROKERAGE_GRPC_ENABLED:false}
+      target: ${BROKERAGE_GRPC_TARGET:127.0.0.1:50052}
+      shared-secret: ${BROKERAGE_GRPC_SHARED_SECRET:}
+      deadline-millis: ${BROKERAGE_GRPC_DEADLINE_MILLIS:45000}
+      request-max-bytes: 262144
+      response-max-bytes: 1048576
+      circuit-breaker-name: kisMockBrokerage
+  freshness:                       # 유형별 매트릭스(명세서 4.2.2)의 일부만 우선 정의 — 신호/공시/risk_snapshot 항목은 S2.3에서 확장
+    price-seconds: 300
+    balance-seconds: 60
+    news-hours: 24
+  async:
+    adapter: ${ASYNC_ADAPTER:db}   # db | kafka — AsyncPipelinePort 구현 선택
+    polling-enabled: ${ASYNC_POLLING_ENABLED:false}
+    cursor-hmac-key: ${ASYNC_CURSOR_HMAC_KEY}
+    partition-hmac-key: ${ASYNC_PARTITION_HMAC_KEY}
+    poll-delay: PT5S
+    claim-page-size: 100
+    worker:
+      enabled: ${ASYNC_WORKER_ENABLED:false}
+      jdbc-url: ${ASYNC_WORKER_JDBC_URL:${spring.datasource.url}}
+      username: decision_worker
+      password: ${POSTGRES_WORKER_PASSWORD}
+      grpc-target: ${ASYNC_WORKER_GRPC_TARGET:127.0.0.1:50056}
+      grpc-shared-secret: ${ASYNC_WORKER_GRPC_SHARED_SECRET}
+      grpc-deadline: PT30S
+      request-max-bytes: 65536
+      response-max-bytes: 4096
+    kafka:
+      bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:127.0.0.1:9092}
+      deployment-mode: ${KAFKA_DEPLOYMENT_MODE:local}
+      security-protocol: ${KAFKA_SECURITY_PROTOCOL:PLAINTEXT}
+      publish-timeout: PT5S
+  actor-capability:
+    transport: ${ACTOR_CAPABILITY_TRANSPORT:http}
+    authority-url: ${ACTOR_CAPABILITY_AUTHORITY_URL:http://127.0.0.1:18081/internal/actor-capabilities/issue}
+    shared-secret: ${ACTOR_CAPABILITY_SHARED_SECRET:}
+    public-key: ${ACTOR_CAPABILITY_PUBLIC_KEY:}
+    tls-key-store-path: ${ACTOR_CAPABILITY_TLS_KEY_STORE_PATH:}
+    tls-key-store-password: ${ACTOR_CAPABILITY_TLS_KEY_STORE_PASSWORD:}
+    tls-ca-certificate-path: ${ACTOR_CAPABILITY_TLS_CA_CERTIFICATE_PATH:}
+  auth:
+    jdbc-url: ${AUTH_DATABASE_DSN:${spring.datasource.url}}
+    username: decision_auth
+    password: ${POSTGRES_AUTH_PASSWORD}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      show-details: when-authorized
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html
+  default-produces-media-type: application/json
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      kisMockBrokerage:
+        sliding-window-size: 3
+        minimum-number-of-calls: 3
+        failure-rate-threshold: 100
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 1

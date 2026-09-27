@@ -1,0 +1,335 @@
+from __future__ import annotations
+
+import hashlib
+import tempfile
+import time
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any, TypedDict
+
+import psycopg
+import pytest
+from testcontainers.postgres import PostgresContainer
+
+POSTGRES_IMAGE = (
+    "pgvector/pgvector:pg16@sha256:1d533553fefe4f12e5d80c7b80622ba0c382abb5758856f52983d8789179f0fb"
+)
+MIGRATION_DIR = (
+    Path(__file__).resolve().parents[2]
+    / "spring-api"
+    / "src"
+    / "main"
+    / "resources"
+    / "db"
+    / "migration"
+)
+TEST_BROKERAGE_DB_CAPABILITY_TOKEN = "python-s31-brokerage-capability-test-only"
+TEST_BROKERAGE_DB_CAPABILITY_TOKEN_SHA256 = hashlib.sha256(
+    TEST_BROKERAGE_DB_CAPABILITY_TOKEN.encode("utf-8")
+).hexdigest()
+
+
+@pytest.fixture
+def tmp_path() -> Iterator[Path]:
+    """Windows temp mount의 mode bit 에뮬레이션을 피하고 WSL native /tmp를 제공한다."""
+
+    with tempfile.TemporaryDirectory(prefix="capstone-pytest-", dir="/tmp") as directory:
+        yield Path(directory)
+
+
+class PostgresTestCluster(TypedDict):
+    admin_dsn: str
+    collector_dsn: str
+    disclosure_reader_dsn: str
+    app_dsn: str
+    market_writer_dsn: str
+    automation_runtime_dsn: str
+    portfolio_writer_dsn: str
+    risk_writer_dsn: str
+    rag_writer_dsn: str
+    rag_admin_dsn: str
+    rag_query_dsn: str
+    signal_writer_dsn: str
+    signal_scheduler_dsn: str
+    signal_admin_dsn: str
+    worker_dsn: str
+
+
+def _connect_postgres_admin_with_host_readiness_retry(
+    admin_dsn: str,
+    *,
+    attempts: int = 50,
+    delay_seconds: float = 0.1,
+) -> psycopg.Connection[Any]:
+    """Bridge container-internal readiness and the WSL host port mapping."""
+
+    if attempts < 1:
+        raise ValueError("attempts must be positive")
+    if delay_seconds < 0:
+        raise ValueError("delay_seconds must be non-negative")
+
+    for attempt in range(attempts):
+        try:
+            return psycopg.connect(admin_dsn, autocommit=True)
+        except psycopg.OperationalError:
+            if attempt + 1 == attempts:
+                raise
+            time.sleep(delay_seconds)
+
+    raise AssertionError("unreachable PostgreSQL readiness loop")
+
+
+def _start_postgres_cluster() -> Iterator[PostgresTestCluster]:
+    """운영 PostgreSQL 이미지와 실제 migration/role 경계를 Python 통합 테스트 전체에 공유한다."""
+    container = PostgresContainer(
+        image=POSTGRES_IMAGE,
+        username="decision",
+        password="decision",
+        dbname="decision",
+    )
+    with container:
+        host = container.get_container_host_ip()
+        port = container.get_exposed_port(5432)
+        admin_dsn = f"postgresql://decision:decision@{host}:{port}/decision"
+        collector_dsn = f"postgresql://decision_collector:collector-test@{host}:{port}/decision"
+        disclosure_reader_dsn = (
+            f"postgresql://decision_disclosure_reader:disclosure-reader-test@{host}:{port}/decision"
+        )
+        app_dsn = f"postgresql://decision_app:app-test@{host}:{port}/decision"
+        market_writer_dsn = (
+            f"postgresql://decision_market_writer:market-writer-test@{host}:{port}/decision"
+        )
+        automation_runtime_dsn = f"postgresql://decision_automation_runtime:automation-runtime-test-0001@{host}:{port}/decision"
+        portfolio_writer_dsn = (
+            f"postgresql://decision_portfolio_writer:portfolio-writer-test@{host}:{port}/decision"
+        )
+        risk_writer_dsn = (
+            f"postgresql://decision_risk_writer:risk-writer-test@{host}:{port}/decision"
+        )
+        rag_writer_dsn = f"postgresql://decision_rag_writer:rag-writer-test@{host}:{port}/decision"
+        rag_admin_dsn = f"postgresql://decision_rag_admin:rag-admin-test@{host}:{port}/decision"
+        rag_query_dsn = f"postgresql://decision_rag_query:rag-query-test@{host}:{port}/decision"
+        signal_writer_dsn = (
+            f"postgresql://decision_signal_writer:signal-writer-test@{host}:{port}/decision"
+        )
+        signal_scheduler_dsn = (
+            f"postgresql://decision_signal_scheduler:signal-scheduler-test@{host}:{port}/decision"
+        )
+        signal_admin_dsn = (
+            f"postgresql://decision_signal_admin:signal-admin-test@{host}:{port}/decision"
+        )
+        worker_dsn = f"postgresql://decision_worker:worker-test-secret-0001@{host}:{port}/decision"
+        identity_dsn = (
+            f"postgresql://decision_identity:identity-test-secret-0001@{host}:{port}/decision"
+        )
+
+        with _connect_postgres_admin_with_host_readiness_retry(admin_dsn) as connection:
+            connection.execute(
+                """
+                CREATE ROLE decision_app LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD 'app-test';
+                CREATE ROLE decision_worker LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD 'worker-test-secret-0001';
+                CREATE ROLE decision_automation_runtime LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD 'automation-runtime-test-0001';
+                CREATE ROLE decision_outbox_publisher LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD 'outbox-publisher-test-0001';
+                CREATE ROLE decision_poison_recorder LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD 'poison-recorder-test-0001';
+                CREATE ROLE decision_replay LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD 'replay-test-secret-0001';
+                CREATE ROLE decision_identity LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD 'identity-test-secret-0001';
+                CREATE ROLE decision_auth LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD 'auth-test-secret-0001';
+                CREATE ROLE decision_replay_authorizer LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD 'replay-authorizer-test-0001';
+                CREATE ROLE decision_demo LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD 'demo-test-secret-0001';
+                CREATE ROLE decision_collector LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD 'collector-test';
+                CREATE ROLE decision_disclosure_reader LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD 'disclosure-reader-test';
+                CREATE ROLE decision_market_writer LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD 'market-writer-test';
+                CREATE ROLE decision_market_operational_reader NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS;
+                CREATE ROLE decision_market_research_reader NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS;
+                CREATE ROLE decision_market_retention_admin NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS;
+                CREATE ROLE decision_portfolio_writer LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD 'portfolio-writer-test';
+                CREATE ROLE decision_risk_writer LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD 'risk-writer-test';
+                CREATE ROLE decision_rag_writer LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD 'rag-writer-test';
+                CREATE ROLE decision_rag_admin LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD 'rag-admin-test';
+                CREATE ROLE decision_rag_query LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD 'rag-query-test';
+                CREATE ROLE decision_signal_writer LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD 'signal-writer-test';
+                CREATE ROLE decision_signal_scheduler LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD 'signal-scheduler-test';
+                CREATE ROLE decision_signal_admin LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD 'signal-admin-test';
+                CREATE ROLE flyway LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE
+                    NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD 'flyway-test';
+                ALTER ROLE decision_app SET statement_timeout = '2s';
+                ALTER ROLE decision_app SET lock_timeout = '500ms';
+                ALTER ROLE decision_app SET idle_in_transaction_session_timeout = '5s';
+                ALTER ROLE decision_worker SET statement_timeout = '60s';
+                ALTER ROLE decision_worker SET lock_timeout = '500ms';
+                ALTER ROLE decision_worker SET idle_in_transaction_session_timeout = '60s';
+                ALTER ROLE decision_automation_runtime SET statement_timeout = '5s';
+                ALTER ROLE decision_automation_runtime SET lock_timeout = '500ms';
+                ALTER ROLE decision_automation_runtime SET idle_in_transaction_session_timeout = '5s';
+                ALTER ROLE decision_rag_writer SET statement_timeout = '2s';
+                ALTER ROLE decision_rag_writer SET lock_timeout = '500ms';
+                ALTER ROLE decision_rag_writer SET idle_in_transaction_session_timeout = '5s';
+                ALTER ROLE decision_rag_admin SET statement_timeout = '5s';
+                ALTER ROLE decision_rag_admin SET lock_timeout = '500ms';
+                ALTER ROLE decision_rag_admin SET idle_in_transaction_session_timeout = '5s';
+                ALTER ROLE decision_rag_query SET statement_timeout = '1500ms';
+                ALTER ROLE decision_rag_query SET lock_timeout = '250ms';
+                ALTER ROLE decision_rag_query SET idle_in_transaction_session_timeout = '5s';
+                ALTER ROLE decision_signal_writer SET statement_timeout = '60s';
+                ALTER ROLE decision_signal_writer SET lock_timeout = '500ms';
+                ALTER ROLE decision_signal_writer SET idle_in_transaction_session_timeout = '60s';
+                ALTER ROLE decision_signal_scheduler SET statement_timeout = '5s';
+                ALTER ROLE decision_signal_scheduler SET lock_timeout = '500ms';
+                ALTER ROLE decision_signal_scheduler SET idle_in_transaction_session_timeout = '5s';
+                ALTER ROLE decision_signal_admin SET statement_timeout = '5s';
+                ALTER ROLE decision_signal_admin SET lock_timeout = '500ms';
+                ALTER ROLE decision_signal_admin SET idle_in_transaction_session_timeout = '5s';
+                GRANT CONNECT ON DATABASE decision TO
+                    decision_app,
+                    decision_worker,
+                    decision_automation_runtime,
+                    decision_replay,
+                    decision_identity,
+                    decision_auth,
+                    decision_replay_authorizer,
+                    decision_demo,
+                    decision_collector,
+                    decision_disclosure_reader,
+                    decision_market_writer,
+                    decision_market_operational_reader,
+                    decision_market_research_reader,
+                    decision_market_retention_admin,
+                    decision_portfolio_writer,
+                    decision_risk_writer,
+                    decision_rag_writer,
+                    decision_rag_admin,
+                    decision_rag_query,
+                    decision_signal_writer,
+                    decision_signal_scheduler,
+                    decision_signal_admin,
+                    flyway;
+                REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+                GRANT USAGE ON SCHEMA public TO
+                    decision_app,
+                    decision_worker,
+                    decision_automation_runtime,
+                    decision_replay,
+                    decision_identity,
+                    decision_auth,
+                    decision_replay_authorizer,
+                    decision_demo,
+                    decision_collector,
+                    decision_disclosure_reader,
+                    decision_market_writer,
+                    decision_market_operational_reader,
+                    decision_market_research_reader,
+                    decision_market_retention_admin,
+                    decision_portfolio_writer,
+                    decision_risk_writer,
+                    decision_rag_writer,
+                    decision_rag_admin,
+                    decision_rag_query,
+                    decision_signal_writer,
+                    decision_signal_scheduler,
+                    decision_signal_admin,
+                    flyway;
+                GRANT CREATE ON SCHEMA public TO flyway;
+                REVOKE SET ON PARAMETER app.required_actor_operation, app.required_actor_target_kind FROM PUBLIC;
+                GRANT SET ON PARAMETER app.required_actor_operation, app.required_actor_target_kind TO flyway;
+                """
+            )
+            connection.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            connection.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+            connection.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+            connection.execute("SET ROLE flyway")
+            try:
+                for migration in sorted(MIGRATION_DIR.glob("V*__*.sql"), key=_migration_version):
+                    if migration.name.startswith("V8__"):
+                        # Java V7 migration은 Python SQL runner 대상이 아니므로 V8 전에 FK용 test identity만 모사한다.
+                        connection.execute(
+                            """
+                            ALTER TABLE users
+                              ADD COLUMN security_version bigint NOT NULL DEFAULT 1,
+                              ADD COLUMN credential_reuse_tag bytea,
+                              ADD COLUMN credential_bundle_mac bytea,
+                              ADD COLUMN credential_policy_version smallint;
+                            INSERT INTO users (user_id, username, role, password_hash)
+                            VALUES
+                              ('usr_demo_user', 'python-fixture-user', 'USER', 'test-only-hash'),
+                              ('usr_demo_admin', 'python-fixture-admin', 'ADMIN', 'test-only-hash')
+                            """
+                        )
+                    migration_sql = migration.read_text(encoding="utf-8").replace(
+                        "${brokerageDbCapabilityTokenSha256}",
+                        TEST_BROKERAGE_DB_CAPABILITY_TOKEN_SHA256,
+                    )
+                    connection.execute(migration_sql)
+                    if migration.name.startswith("V4__"):
+                        # Python test path도 V5/V6 protection SQL이 참조하는 Flyway history object만 모사한다.
+                        connection.execute(
+                            """
+                            CREATE TABLE flyway_schema_history (
+                                installed_rank integer PRIMARY KEY,
+                                version text,
+                                success boolean NOT NULL DEFAULT true
+                            )
+                            """
+                        )
+            finally:
+                connection.execute("RESET ROLE")
+
+        yield {
+            "admin_dsn": admin_dsn,
+            "collector_dsn": collector_dsn,
+            "disclosure_reader_dsn": disclosure_reader_dsn,
+            "app_dsn": app_dsn,
+            "market_writer_dsn": market_writer_dsn,
+            "automation_runtime_dsn": automation_runtime_dsn,
+            "portfolio_writer_dsn": portfolio_writer_dsn,
+            "risk_writer_dsn": risk_writer_dsn,
+            "rag_writer_dsn": rag_writer_dsn,
+            "rag_admin_dsn": rag_admin_dsn,
+            "rag_query_dsn": rag_query_dsn,
+            "signal_writer_dsn": signal_writer_dsn,
+            "signal_scheduler_dsn": signal_scheduler_dsn,
+            "signal_admin_dsn": signal_admin_dsn,
+            "worker_dsn": worker_dsn,
+            "identity_dsn": identity_dsn,
+        }
+
+
+@pytest.fixture(scope="session")
+def postgres_cluster() -> Iterator[PostgresTestCluster]:
+    """대부분의 DB 통합 테스트가 공유하는 migration 완료 PostgreSQL cluster다."""
+
+    yield from _start_postgres_cluster()
+
+
+@pytest.fixture
+def isolated_postgres_cluster() -> Iterator[PostgresTestCluster]:
+    """generation처럼 영속 상태를 전이하는 테스트에 독립 PostgreSQL cluster를 제공한다."""
+
+    yield from _start_postgres_cluster()
+
+
+def _migration_version(path: Path) -> int:
+    return int(path.name.split("__", maxsplit=1)[0][1:])

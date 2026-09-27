@@ -1,0 +1,131 @@
+{
+  "activeEmbeddingProfile": "NONE",
+  "contractId": "s4-rag-v2-pre-s5-policy-v1",
+  "decisionAuthority": "NONE",
+  "generationAuthority": "EXPLANATION_ONLY",
+  "openAiCallsAllowed": false,
+  "retrieval": {
+    "channelTopK": 30,
+    "rrfK": 60,
+    "topK": 5
+  },
+  "runtimeState": "CONTRACT_ONLY",
+  "schemaVersion": 1,
+  "vertex": {
+    "activationEvidenceRequired": [
+      "SERVICE_ACCOUNT_ENV_SECURITY",
+      "DATA_GOVERNANCE_STATE",
+      "ABUSE_MONITORING_STATE",
+      "MODEL_AVAILABILITY"
+    ],
+    "ambientCredentialAllowed": false,
+    "authentication": [
+      "SERVICE_ACCOUNT_OAUTH"
+    ],
+    "contextCacheAllowed": false,
+    "credentialEnvKey": "MARS_VERTEX_SERVICE_ACCOUNT_JSON_B64",
+    "developerApiAllowed": false,
+    "fallbackAllowed": false,
+    "fileUploadAllowed": false,
+    "generationMethod": "generateContent",
+    "generationUnavailableStatus": "GENERATION_UNAVAILABLE",
+    "maximumEvidenceCount": 5,
+    "maximumGenerateContentCallsPerQuestion": 1,
+    "maximumOAuthTokenCallsPerQuestion": 1,
+    "modelId": "gemini-3.5-flash",
+    "modelIdEnvironmentVariable": "VERTEX_MODEL_ID",
+    "modelSelectionPacketBound": true,
+    "oauthScope": "https://www.googleapis.com/auth/cloud-platform",
+    "oauthTokenEndpoint": "https://oauth2.googleapis.com/token",
+    "openAiCallsAllowed": false,
+    "preparedScopeControlPlane": {
+      "headerName": "X-Rag-V2-Vertex-Scope-Claim",
+      "packetOwnerIdentityStored": false,
+      "rawEvidenceStored": false,
+      "rawQuestionStored": false,
+      "sameParsedAskCommandFingerprintBound": true,
+      "sameRequestIdRequired": true,
+      "scopeTtlSeconds": 120
+    },
+    "rawResponseStored": false,
+    "rerankerAllowed": false,
+    "retryCount": 0,
+    "sanitizedUsageLedgerOnly": true,
+    "searchMapsGroundingAllowed": false,
+    "serviceAccountOnly": true,
+    "sessionResumptionAllowed": false,
+    "toolsFunctionsAllowed": false,
+    "verifierAllowed": false
+  },
+  "voyage": {
+    "activationEvidenceRequired": [
+      "ORGANIZATION_TRAINING_OPT_OUT",
+      "PAYMENT_METHOD_PRIVACY_EVIDENCE"
+    ],
+    "activationMode": "EXACT_MANIFEST_BOUND_RESUMABLE_BATCH_SET",
+    "batchApiAllowed": false,
+    "bgePublicExecution": "TERMINALLY_SUPERSEDED_NO_FURTHER_BGE_RUN",
+    "dimension": 1024,
+    "documentBatchLimits": {
+      "completedBatchReuseRequired": true,
+      "maximumChunksPerRequest": 16000,
+      "maximumGroupsPerRequest": 1000,
+      "maximumPacketTtlSeconds": 7200,
+      "maximumResponseBytes": 16777216,
+      "operationalInputTokenCap": 110000,
+      "operationalMaximumChunksPerRequest": 672,
+      "packetByteCapCoversEstimateRequired": true,
+      "providerInputTokenCap": 120000,
+      "requestPacketPhysicalCallCap": 1,
+      "responseEnvelopeHeadroomBytes": 262144,
+      "responseEstimateBytesPerChunk": 24576,
+      "sourceCheckpointReuseRequired": true,
+      "stopRemainingBatchesAfterFirstFailure": true,
+      "tokenHeadroom": 10000
+    },
+    "filesApiAllowed": false,
+    "fullBundleScope": [
+      "EXACT30",
+      "OA112",
+      "OWNER_PRIVATE"
+    ],
+    "generationFallback": "NO_BGE_FALLBACK_RESUME_VOYAGE_BATCHES_EVALUATE_CAS",
+    "modelId": "voyage-context-4",
+    "officialTokenizer": {
+      "artifactAutoDownloadAllowed": false,
+      "batchAuthoringRequiresInstalledArtifact": true,
+      "bootstrapAcquisitionApprovalRequired": true,
+      "bootstrapEndpoint": "/voyageai/voyage-context-4/raw/8ca946072a18e398cd61f2ad0243b56d0350b1db/tokenizer.json",
+      "bootstrapMaximumPacketTtlSeconds": 300,
+      "bootstrapPhysicalCallCap": 1,
+      "bootstrapRevision": "8ca946072a18e398cd61f2ad0243b56d0350b1db",
+      "localArtifactOnly": true,
+      "packetHashBindingRequired": true,
+      "preflightExpectedInputTokenLedgerRequired": true,
+      "providerTokenCountCallAllowed": false,
+      "utf8ByteApproximationAllowed": false
+    },
+    "orderedPrechunkedDocumentGroupsRequired": true,
+    "outboundCallsAllowed": false,
+    "ownerPrivateSentinel": {
+      "allowed": true,
+      "orderedGroupCount": 0,
+      "ownerScopeSha256": null,
+      "publicBaseOnly": true,
+      "sourceScope": "OWNER_PRIVATE"
+    },
+    "partialProfileMixAllowed": false,
+    "queryEvaluationBatches": {
+      "completedBatchReuseRequired": true,
+      "componentBatchCount": 2,
+      "durableVectorStageRequired": true,
+      "exact30LogicalQueryCount": 10,
+      "maximumPacketTtlSeconds": 7200,
+      "oa112LogicalQueryCount": 112,
+      "singletonQueryGroupsRequired": true
+    },
+    "queryUnitFallbackAllowed": true,
+    "retryCount": 0,
+    "runtimeEnvironmentVariable": "VOYAGE_API_KEY"
+  }
+}

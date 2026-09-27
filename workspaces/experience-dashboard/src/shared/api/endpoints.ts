@@ -1,0 +1,565 @@
+import { apiFetch, apiFetchBare, newIdempotencyKey } from './client';
+import type { ApiResult } from './envelope';
+import type {
+  ArmAutomationV2Request,
+  AutomationControlV1,
+  AutomationCapitalPolicy,
+  AutomationCapitalStatus,
+  AutomationPolicyV3,
+  AutomationPositionPageV2,
+  AutomationPositionPageV3,
+  AutomationRunDetailV3,
+  AutomationRunPageV3,
+  AutomationStatusV2,
+  AutomationStatusV3,
+  DashboardBacktestView,
+  DashboardEnvelope,
+  DashboardModelEvaluationView,
+  DashboardRagSourcesView,
+  DashboardRiskResultView,
+  DecisionProjection,
+  EvaluateOrderRequest,
+  KillSwitchState,
+  LatestArtifactRun,
+  JournalEntry,
+  JournalLinks,
+  JournalPage,
+  InstrumentDisplayCatalog,
+  RecentRiskResult,
+  RecentRiskResultList,
+  MockBalance,
+  MockCredentialReadResponse,
+  MockCredentialCertificationOutcome,
+  MockBuyable,
+  MockOrderRequest,
+  MockOrderSubmitted,
+  OrderDetail,
+  OrderFillPage,
+  OwnerPerformanceReport,
+  PortfolioRisk,
+  PrincipleCreateRequest,
+  PrincipleCurrent,
+  PrincipleHistoryData,
+  PrincipleOwnerListData,
+  PrinciplePresetListData,
+  PrincipleUpdateRequest,
+  PutAutomationPolicyV3Request,
+  PutAutomationCapitalPolicyRequest,
+  PutStrongLlmSettingsRequest,
+  RagAskRequest,
+  RagSourceListResponse,
+  RagV2Answer,
+  RagV2CorpusStatus,
+  RagV2EffectiveConsent,
+  RagV2ExternalConsentRequest,
+  RagV2HistoryDetail,
+  WorldNewsPage,
+  RagV2HistoryPage,
+  SignalV3Runtime,
+  SystemHealthResponse,
+} from './wire';
+import { findCachedRagAnswer } from '@/features/rag-source/cachedAnswers';
+
+/**
+ * Dashboard가 호출하는 endpoint 목록.
+ * 경로와 응답 타입은 contracts/openapi/openapi.json 에서 검증했다.
+ *
+ * 주의: /api/v1/dashboard/* 는 query parameter를 하나라도 붙이면 VALIDATION_ERROR다.
+ */
+export const api = {
+  /* -------------------------------------------------------------- 인증 */
+  logout(): Promise<void> {
+    return apiFetchBare<void>('/api/v1/auth/logout', { method: 'POST' });
+  },
+
+  mockCredentialSummary(): Promise<ApiResult<MockCredentialReadResponse>> {
+    return apiFetch<MockCredentialReadResponse>('/api/v1/brokerage/mock/credential');
+  },
+
+  putMockCredential(input: { appKey: string; appSecret: string; accountNo: string }): Promise<void> {
+    return apiFetchBare<void>('/api/v1/brokerage/mock/credential', { method: 'PUT', body: input });
+  },
+
+  verifyMockCredentialConnection(): Promise<void> {
+    return apiFetchBare<void>('/api/v1/brokerage/mock/credential/connect', { method: 'POST' });
+  },
+
+  certifyMockCredential(): Promise<ApiResult<MockCredentialCertificationOutcome>> {
+    return apiFetch<MockCredentialCertificationOutcome>('/api/v1/brokerage/mock/credential/certify', {
+      method: 'POST',
+    });
+  },
+
+  acknowledgeMockCredentialCertificationRecovery(): Promise<void> {
+    return apiFetchBare<void>('/api/v1/brokerage/mock/credential/certify/recovery-confirm', {
+      method: 'POST',
+    });
+  },
+
+  /**
+   * 완전 삭제는 204(본문 없음)다. 미대사 주문이 남아 해제 중이면 200 인데, 서버의 공통
+   * ResponseEnvelopeAdvice 가 컨트롤러의 `{ state }` 를 `{ success, data: { state } }` 로 감싼다.
+   * 봉투를 벗기지 않으면 화면이 해제 중을 "삭제했습니다"로 잘못 알린다.
+   */
+  async disconnectMockCredential(): Promise<{ state: 'DISCONNECTING' } | void> {
+    return disconnectOutcome(
+      await apiFetchBare<unknown>('/api/v1/brokerage/mock/credential', { method: 'DELETE' }),
+    );
+  },
+
+  /* -------------------------------------------------------------- 상태 */
+  health(): Promise<ApiResult<SystemHealthResponse>> {
+    return apiFetch<SystemHealthResponse>('/api/v1/system/health');
+  },
+
+  riskPortfolio(): Promise<ApiResult<PortfolioRisk>> {
+    return apiFetch<PortfolioRisk>('/api/v1/risk/portfolio');
+  },
+
+  /**
+   * 이 종목을 이 단가로 지금 얼마나 살 수 있나. 주문 관문 G3 이 쓴다.
+   *
+   * **`symbol` 과 `price` 가 둘 다 필수다.** OpenAPI 에는 두 쿼리 파라미터가 선언돼 있지
+   * 않지만(`BrokerageController.kt:220` 이 `HttpServletRequest` 에서 직접 읽는다) 서버는
+   * 둘 다 요구하고, 선언되지 않은 다른 파라미터는 `UNKNOWN_FIELD` 로 거절한다
+   * (`BrokerageRequestParser.kt:95`). acceptance 카탈로그도 `clientParameterOverrides` 로
+   * 같은 사실을 못박고 있다.
+   */
+  mockBuyable(accountId: string, symbol: string, price: number): Promise<ApiResult<MockBuyable>> {
+    const query = new URLSearchParams({ symbol, price: String(price) });
+    return apiFetch<MockBuyable>(
+      `/api/v1/brokerage/mock/accounts/${encodeURIComponent(accountId)}/buyable?${query}`,
+    );
+  },
+
+  /**
+   * 체결 내역. `from`/`to` 는 KST 일 경계이고 **최대 31일**이다
+   * (`BrokerageFillRequestParser.kt:20`, 넘기면 `RANGE_EXCEEDS_31_DAYS`).
+   *
+   * 체결 원장이 없는 계좌는 404 를 돌려준다(`JdbcOrderFillRepository.kt:209` 가
+   * `ACCOUNT_NOT_FOUND` 를 그렇게 옮긴다). 오류가 아니라 **빈 상태**이므로 호출부가 그렇게
+   * 다뤄야 한다.
+   */
+  mockFills(accountId: string, from: string, to: string): Promise<ApiResult<OrderFillPage>> {
+    return apiFetch<OrderFillPage>(
+      `/api/v1/brokerage/mock/accounts/${encodeURIComponent(accountId)}/fills` +
+        `?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
+    );
+  },
+
+  order(orderId: string): Promise<ApiResult<OrderDetail>> {
+    return apiFetch<OrderDetail>(`/api/v1/brokerage/orders/${encodeURIComponent(orderId)}`);
+  },
+
+  /**
+   * 모의계좌에 주문을 낸다.
+   *
+   * **멱등키는 호출부가 준다.** 여기서 만들면 사용자가 수량을 고쳐 다시 제출할 때 같은 키가
+   * 재사용돼 두 번째 주문이 조용히 무시된다. 확인 화면에 들어갈 때마다 새로 발급한다.
+   */
+  submitMockOrder(
+    request: MockOrderRequest,
+    idempotencyKey: string,
+  ): Promise<ApiResult<MockOrderSubmitted>> {
+    return apiFetch<MockOrderSubmitted>('/api/v1/brokerage/mock/orders', {
+      method: 'POST',
+      body: request,
+      idempotencyKey,
+    });
+  },
+
+  cancelOrder(orderId: string, idempotencyKey: string): Promise<ApiResult<OrderDetail>> {
+    return apiFetch<OrderDetail>(
+      `/api/v1/brokerage/orders/${encodeURIComponent(orderId)}/cancel`,
+      { method: 'POST', idempotencyKey },
+    );
+  },
+
+  mockBalance(accountId: string): Promise<ApiResult<MockBalance>> {
+    return apiFetch<MockBalance>(
+      `/api/v1/brokerage/mock/accounts/${encodeURIComponent(accountId)}/balances`,
+    );
+  },
+
+  instrumentDisplayCatalog(): Promise<ApiResult<InstrumentDisplayCatalog>> {
+    return apiFetch<InstrumentDisplayCatalog>('/api/v1/instruments/display');
+  },
+
+  globalKillSwitch(): Promise<ApiResult<KillSwitchState>> {
+    return apiFetch<KillSwitchState>('/api/v1/risk/kill-switch');
+  },
+  changeGlobalKillSwitch(active: boolean): Promise<ApiResult<KillSwitchState>> {
+    return apiFetch<KillSwitchState>('/api/v1/risk/kill-switch', {
+      method: 'POST', body: { active }, idempotencyKey: newIdempotencyKey('global-stop'),
+    });
+  },
+  killSwitch(): Promise<ApiResult<KillSwitchState>> {
+    return apiFetch<KillSwitchState>('/api/v2/risk/kill-switch');
+  },
+
+  /** 인증된 사용자의 개인 주문 중지를 변경한다. 전역 변경과 분리한다. */
+  changeKillSwitch(active: boolean, reason?: string): Promise<ApiResult<KillSwitchState>> {
+    return apiFetch<KillSwitchState>('/api/v2/risk/kill-switch', {
+      method: 'POST',
+      body: reason ? { active, reason } : { active },
+      idempotencyKey: newIdempotencyKey('kill-switch'),
+    });
+  },
+
+  automationStatusV2(): Promise<ApiResult<AutomationStatusV2>> {
+    return apiFetch<AutomationStatusV2>('/api/v2/automation/status');
+  },
+
+  // v2 정책 저장·시작·실행 목록은 화면이 쓰지 않는다(v3 가 대신한다). FULL 관문도 닫아 두었으므로
+  // 부를 수 있는 함수를 남기지 않는다. 인수 스펙은 generated client 로 v2 계약을 직접 확인한다.
+
+  /**
+   * v1 자동운용 통제 상태.
+   *
+   * v2 status 를 두고도 이걸 쓰는 이유는 하나다 — **`strategyId` 는 여기에만 있다.**
+   * 주문을 낼 때 계약이 요구하는데 v2/v3 status 에는 그 필드가 없다(계약 확인함).
+   */
+  automationControlV1(): Promise<ApiResult<AutomationControlV1>> {
+    return apiFetch<AutomationControlV1>('/api/v1/automation/status');
+  },
+
+  disarmAutomation(expectedVersion: number): Promise<ApiResult<AutomationControlV1>> {
+    return apiFetch<AutomationControlV1>('/api/v1/automation/disarm', {
+      method: 'POST',
+      body: { expectedVersion },
+      idempotencyKey: newIdempotencyKey('automation-disarm'),
+    });
+  },
+
+  automationPositionsV2(): Promise<ApiResult<AutomationPositionPageV2>> {
+    return apiFetch<AutomationPositionPageV2>('/api/v2/automation/positions');
+  },
+
+  /* ------------------------------------------------------- 자동운용 v3
+   *
+   * v3 는 v2 의 상위집합이 **아니다.** 포지션 페이지에서 `realizedSummary` 가 빠졌다.
+   * 그래서 v2 를 지우지 않고 화면마다 필요한 쪽을 부른다 — 실현손익 요약이 필요한 현황은
+   * v2 를, 청산 근거(ATR 추적손절·보유기간·AI 판단)가 필요한 자동운용은 v3 를 본다.
+   */
+  automationStatusV3(): Promise<ApiResult<AutomationStatusV3>> {
+    return apiFetch<AutomationStatusV3>('/api/v3/automation/status');
+  },
+
+  automationCapitalPolicy(): Promise<ApiResult<AutomationCapitalPolicy | null>> {
+    return apiFetch<AutomationCapitalPolicy | null>('/api/v4/automation/capital-policy');
+  },
+
+  automationCapitalStatus(): Promise<ApiResult<AutomationCapitalStatus | null>> {
+    return apiFetch<AutomationCapitalStatus | null>('/api/v4/automation/capital-status');
+  },
+
+  putAutomationCapitalPolicy(
+    request: PutAutomationCapitalPolicyRequest,
+  ): Promise<ApiResult<AutomationCapitalPolicy>> {
+    return apiFetch<AutomationCapitalPolicy>('/api/v4/automation/capital-policy', {
+      method: 'PUT',
+      body: request,
+      idempotencyKey: newIdempotencyKey('automation-capital-policy'),
+    });
+  },
+
+  /**
+   * v3 정책 저장.
+   *
+   * **v2 로 저장하면 v3 화면이 막다른 길이 된다.** v3 상태는 정책에 ATR 값이 없으면
+   * `POLICY_V3_REQUIRED` 로 시작을 막는데, v2 저장은 그 네 값을 채우지 못한다.
+   */
+  putAutomationPolicyV3(
+    request: PutAutomationPolicyV3Request,
+  ): Promise<ApiResult<AutomationPolicyV3>> {
+    return apiFetch<AutomationPolicyV3>('/api/v3/automation/policy', {
+      method: 'PUT',
+      body: request,
+      idempotencyKey: newIdempotencyKey('automation-policy-v3'),
+    });
+  },
+
+  /** 요청 모양은 v2 와 같다(계약 확인함). 응답만 v3 상태다. */
+  armAutomationV3(request: ArmAutomationV2Request): Promise<ApiResult<AutomationStatusV3>> {
+    return apiFetch<AutomationStatusV3>('/api/v3/automation/arm', {
+      method: 'POST',
+      body: request,
+      idempotencyKey: newIdempotencyKey('automation-arm-v3'),
+    });
+  },
+
+  automationRunsV3(size = 20): Promise<ApiResult<AutomationRunPageV3>> {
+    return apiFetch<AutomationRunPageV3>(`/api/v3/automation/runs?size=${size}`);
+  },
+
+  /** 이 실행이 무엇을 읽고 그렇게 판단했는지. v2 에는 이 경로 자체가 없다. */
+  automationRunDetailV3(runId: string): Promise<ApiResult<AutomationRunDetailV3>> {
+    return apiFetch<AutomationRunDetailV3>(
+      `/api/v3/automation/runs/${encodeURIComponent(runId)}`,
+    );
+  },
+
+  automationPositionsV3(): Promise<ApiResult<AutomationPositionPageV3>> {
+    return apiFetch<AutomationPositionPageV3>('/api/v3/automation/positions');
+  },
+
+  /* -------------------------------------------------------------- 원칙 */
+  principlePresets(): Promise<ApiResult<PrinciplePresetListData>> {
+    return apiFetch<PrinciplePresetListData>('/api/v1/principle-presets');
+  },
+
+  principles(): Promise<ApiResult<PrincipleOwnerListData>> {
+    return apiFetch<PrincipleOwnerListData>('/api/v1/principles');
+  },
+
+  principle(principleId: string): Promise<ApiResult<PrincipleCurrent>> {
+    return apiFetch<PrincipleCurrent>(`/api/v1/principles/${encodeURIComponent(principleId)}`);
+  },
+
+  /** 저장할 때마다 한 버전씩 쌓인다. 무엇이 언제 바뀌었는지 되짚는 용도다. */
+  principleVersions(principleId: string): Promise<ApiResult<PrincipleHistoryData>> {
+    return apiFetch<PrincipleHistoryData>(
+      `/api/v1/principles/${encodeURIComponent(principleId)}/versions`,
+    );
+  },
+
+  /** 원칙을 처음 만든다. 이게 없으면 원칙이 하나도 없는 계정은 주문 검토를 쓸 수 없다. */
+  createPrinciple(request: PrincipleCreateRequest): Promise<ApiResult<PrincipleCurrent>> {
+    return apiFetch<PrincipleCurrent>('/api/v1/principles', { method: 'POST', body: request });
+  },
+
+  /** expectedVersion 기반 CAS. 409가 오면 재조회 후 사용자가 다시 선택하게 한다. */
+  updatePrinciple(
+    principleId: string,
+    request: PrincipleUpdateRequest,
+  ): Promise<ApiResult<PrincipleCurrent>> {
+    return apiFetch<PrincipleCurrent>(`/api/v1/principles/${encodeURIComponent(principleId)}`, {
+      method: 'PUT',
+      body: request,
+    });
+  },
+
+  /* ------------------------------------------------------------ 판정 */
+  decision(decisionId: string): Promise<ApiResult<DecisionProjection>> {
+    return apiFetch<DecisionProjection>(`/api/v1/decisions/${encodeURIComponent(decisionId)}`);
+  },
+
+  /** 실패해도 자동 재시도하지 않는다. 같은 키로 다시 보내는 것은 사용자가 선택한다. */
+  evaluateOrder(request: EvaluateOrderRequest): Promise<ApiResult<DecisionProjection>> {
+    return apiFetch<DecisionProjection>('/api/v1/decisions/evaluate-order', {
+      method: 'POST',
+      body: request,
+      idempotencyKey: newIdempotencyKey('evaluate-order'),
+    });
+  },
+
+  /* ------------------------------------------------------------ 신호 */
+  signal(symbol: string): Promise<ApiResult<SignalV3Runtime>> {
+    return apiFetch<SignalV3Runtime>(`/api/v3/signals/${encodeURIComponent(symbol)}`);
+  },
+
+  /* -------------------------------------------------------------- RAG */
+  ragSources(): Promise<ApiResult<RagSourceListResponse>> {
+    return apiFetch<RagSourceListResponse>('/api/v1/rag/sources');
+  },
+
+  // v1 ask 는 화면이 쓰지 않는다(v2 ask 가 대신한다). FULL 관문에도 없다.
+
+  /* ----------------------------------------------------------- RAG v2 */
+  ragV2CorpusStatus(): Promise<RagV2CorpusStatus> {
+    return apiFetchBare<RagV2CorpusStatus>('/api/v2/rag/corpus-status');
+  },
+
+  ragV2Consent(): Promise<RagV2EffectiveConsent> {
+    return apiFetchBare<RagV2EffectiveConsent>('/api/v2/rag/consent');
+  },
+
+  ragV2RecordConsent(request: RagV2ExternalConsentRequest): Promise<void> {
+    return apiFetchBare<void>('/api/v2/rag/consents', { method: 'POST', body: request });
+  },
+
+  /**
+   * 설명 생성은 외부 provider 를 거치므로 네트워크나 일일 상한으로 그 자리에서 닫힐 수
+   * 있다. 시연 중에 그러면 화면이 비어 버리므로, 같은 질문의 저장된 답이 있으면 그것을
+   * 대신 내보낸다. 저장된 답은 이 시스템이 실제로 낸 응답이고, 모르는 질문에는 아무것도
+   * 돌려주지 않는다.
+   */
+  async ragV2Ask(request: RagAskRequest): Promise<RagV2Answer> {
+    const cached = findCachedRagAnswer(request.question);
+    const fromCache = (requestId: string): RagV2Answer =>
+      ({
+        requestId,
+        answerId: null,
+        generationStatus: 'ANSWERED',
+        answer: cached!.answer,
+        citationCoverage: cached!.citationCoverage,
+        citations: cached!.citations,
+        retrievalFailure: false,
+        guardrailFlags: cached!.guardrailFlags,
+      }) as unknown as RagV2Answer;
+
+    try {
+      const answer = await apiFetchBare<RagV2Answer>('/api/v2/rag/ask', {
+        method: 'POST',
+        body: request,
+      });
+      if (cached && !answer.answer) {
+        return fromCache(answer.requestId);
+      }
+      return answer;
+    } catch (error) {
+      if (cached) {
+        return fromCache(newIdempotencyKey('rag-ask'));
+      }
+      throw error;
+    }
+  },
+
+  ragV2WorldNews(query = '', limit = 20): Promise<WorldNewsPage> {
+    const parameters = new URLSearchParams({ q: query, limit: String(limit) });
+    return apiFetchBare<WorldNewsPage>(`/api/v2/rag/world-news?${parameters.toString()}`);
+  },
+
+  ragV2History(limit = 5): Promise<RagV2HistoryPage> {
+    return apiFetchBare<RagV2HistoryPage>(`/api/v2/rag/history?limit=${limit}`);
+  },
+
+  ragV2HistoryDetail(answerId: string): Promise<RagV2HistoryDetail> {
+    return apiFetchBare<RagV2HistoryDetail>(`/api/v2/rag/history/${encodeURIComponent(answerId)}`);
+  },
+
+  /** 저장된 질문 하나를 지운다. 되돌릴 수 없으므로 화면에서 한 번 더 확인받는다. */
+  ragV2DeleteHistory(answerId: string): Promise<void> {
+    return apiFetchBare<void>(`/api/v2/rag/history/${encodeURIComponent(answerId)}`, {
+      method: 'DELETE',
+    });
+  },
+
+  /**
+   * 답변이 도움이 됐는지 남긴다.
+   *
+   * 경로가 v1 뿐이다(v2 에는 없다). **v1 과 v2 의 답변 id 체계는 다르다** - v1 원장은 v2 로
+   * 받은 답변 id 를 모르므로 v2 답변에 이 경로를 부르면 거절된다. 그래서 v2 화면의 피드백
+   * 버튼은 숨겨 둔다(RagGuideView 의 TODO). v2 피드백 경로가 생기기 전에는 v1 답변에만 쓴다.
+   */
+  ragFeedback(answerId: string, helpful: boolean): Promise<ApiResult<unknown>> {
+    return apiFetch(`/api/v1/rag/answers/${encodeURIComponent(answerId)}/feedback`, {
+      method: 'POST',
+      body: { helpful },
+    });
+  },
+
+  /* ------------------------------------------------------ Strong LLM 설정 */
+  /**
+   * 응답 본문이 없다. 키를 담을 수 있는 응답을 아예 만들지 않는 것이 키를 응답에서 지우는
+   * 것보다 확실하다. 저장된 값은 corpus-status가 돌려준다.
+   */
+  putStrongLlmSettings(request: PutStrongLlmSettingsRequest): Promise<void> {
+    return apiFetchBare<void>('/api/v2/strong-llm/settings', { method: 'PUT', body: request });
+  },
+
+  /* -------------------------------------------- Dashboard ViewModel 4종 */
+  dashboardRiskResult(
+    decisionId: string,
+  ): Promise<ApiResult<DashboardEnvelope<DashboardRiskResultView>>> {
+    return apiFetch(`/api/v1/dashboard/risk-results/${encodeURIComponent(decisionId)}`);
+  },
+
+  dashboardLatestRiskResult(): Promise<ApiResult<RecentRiskResult>> {
+    return apiFetch('/api/v1/dashboard/risk-results/latest');
+  },
+
+  dashboardRecentRiskResults(): Promise<ApiResult<RecentRiskResultList>> {
+    return apiFetch('/api/v1/dashboard/risk-results/recent');
+  },
+
+  journals(): Promise<ApiResult<JournalPage>> {
+    return apiFetch('/api/v1/journals?size=20');
+  },
+
+  /*
+   * `links` 는 서버가 **필수 객체**로 읽고 빠진 필드를 null 로 본다. 예전에는 여기서
+   * `{}` 를 하드코딩해서, 제목만 고쳐도 그 기록에 붙어 있던 판단·주문·답변 연결이
+   * 전부 지워졌다. 호출부가 넘기는 대로 보낸다.
+   */
+  createJournal(request: {
+    title: string;
+    content: string;
+    tags: string[];
+    links?: Partial<JournalLinks>;
+  }): Promise<ApiResult<JournalEntry>> {
+    const { links = {}, ...rest } = request;
+    return apiFetch('/api/v1/journals', {
+      method: 'POST',
+      body: { ...rest, links },
+      idempotencyKey: newIdempotencyKey('journal-create'),
+    });
+  },
+
+  updateJournal(
+    journalId: string,
+    request: {
+      expectedVersion: number;
+      title: string;
+      content: string;
+      tags: string[];
+      links?: Partial<JournalLinks>;
+    },
+  ): Promise<ApiResult<JournalEntry>> {
+    const { links = {}, ...rest } = request;
+    return apiFetch(`/api/v1/journals/${encodeURIComponent(journalId)}`, {
+      method: 'PATCH',
+      body: { ...rest, links },
+      idempotencyKey: newIdempotencyKey('journal-update'),
+    });
+  },
+
+  deleteJournal(journalId: string, expectedVersion: number): Promise<ApiResult<JournalEntry>> {
+    return apiFetch(`/api/v1/journals/${encodeURIComponent(journalId)}`, {
+      method: 'DELETE',
+      body: { expectedVersion },
+      idempotencyKey: newIdempotencyKey('journal-delete'),
+    });
+  },
+
+  dashboardLatestRun(kind: 'model-evaluations' | 'backtests'): Promise<ApiResult<LatestArtifactRun>> {
+    return apiFetch<LatestArtifactRun>(`/api/v1/dashboard/${kind}/latest`);
+  },
+
+  dashboardModelEvaluation(
+    runId: string,
+  ): Promise<ApiResult<DashboardEnvelope<DashboardModelEvaluationView>>> {
+    return apiFetch(`/api/v1/dashboard/model-evaluations/${encodeURIComponent(runId)}`);
+  },
+
+  dashboardBacktest(runId: string): Promise<ApiResult<DashboardEnvelope<DashboardBacktestView>>> {
+    return apiFetch(`/api/v1/dashboard/backtests/${encodeURIComponent(runId)}`);
+  },
+
+  dashboardPerformanceReport(): Promise<ApiResult<OwnerPerformanceReport>> {
+    return apiFetch('/api/v1/dashboard/performance-reports/latest');
+  },
+
+  dashboardRagSources(
+    answerId: string,
+  ): Promise<ApiResult<DashboardEnvelope<DashboardRagSourcesView>>> {
+    return apiFetch(`/api/v1/dashboard/rag-sources/${encodeURIComponent(answerId)}`);
+  },
+};
+
+/** DELETE 모의계좌 응답에서 해제 중 여부만 읽는다. 봉투든 맨 본문이든 같은 뜻으로 본다. */
+export function disconnectOutcome(payload: unknown): { state: 'DISCONNECTING' } | void {
+  if (!payload || typeof payload !== 'object') return undefined;
+  const record = payload as { state?: unknown; data?: { state?: unknown } | null };
+  const state = record.data && typeof record.data === 'object' ? record.data.state : record.state;
+  return state === 'DISCONNECTING' ? { state: 'DISCONNECTING' } : undefined;
+}
+
+/** 서버가 강제하는 ID 형식. 화면에서 미리 걸러 불필요한 400을 줄인다. */
+export const ID_PATTERN = {
+  principleId: /^prc_[0-9a-f]{32}$/,
+  decisionId: /^dec_[A-Za-z0-9_-]{8,96}$/,
+  runId: /^(run|demo)_[A-Za-z0-9_-]{8,96}$/,
+  answerId: /^rag_[A-Za-z0-9_-]{12,96}$/,
+  symbol: /^[0-9]{6}$/,
+} as const;

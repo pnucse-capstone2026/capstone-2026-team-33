@@ -1,0 +1,648 @@
+'use client';
+
+import { useEffect, useState } from 'react';
+import { renderAnswerText } from './answerText';
+import { useRouter } from 'next/navigation';
+import { AsyncBoundary } from '@/shared/ui/AsyncBoundary';
+import { Panel } from '@/shared/ui/Panel';
+import { Button } from '@/shared/ui/Button';
+import { Numeric } from '@/shared/ui/Numeric';
+import { useResource, toErrorState } from '@/shared/lib/useResource';
+import { formatKstDateTime, formatRatio } from '@/shared/lib/format';
+import { safeExternalUrl } from '@/shared/api/session';
+import { api } from '@/shared/api/endpoints';
+import type { RagSourceResponse, RagV2HistoryDetail, WorldNewsPage } from '@/shared/api/wire';
+import { buildNewsFeed } from './worldNewsPresentation';
+import { putJournalHandoff } from '@/shared/lib/journalHandoff';
+import type { ViewState } from '@/shared/lib/viewState';
+import {
+  EXTERNAL_DISCLOSURE,
+  EXTERNAL_POLICY,
+  EXTERNAL_PROCESSORS,
+  askRag,
+  loadConsentGranted,
+  loadRecentQuestions,
+  loadRegistry,
+  loadWorldNews,
+  recordConsent,
+  type RagAnswerView,
+  type SourceItem,
+} from './viewModel';
+
+const EXAMPLES = [
+  '금 ETF의 롤오버 위험은 무엇인가요?',
+  'MDD와 Sharpe는 각각 무엇을 말해주나요?',
+  '삼성전자 지금 사도 되나요?',
+];
+
+const STATUS_TONE: Record<string, string> = {
+  ANSWERED: 'border-allow',
+  RETRIEVAL_ONLY: 'border-hold',
+  RETRIEVAL_FAILURE: 'border-hold',
+  BLOCKED_SENSITIVE: 'border-block',
+  BLOCKED_ADVICE: 'border-block',
+  GENERATION_UNAVAILABLE: 'border-hold',
+};
+
+const CITATION_KIND_LABEL: Record<string, string> = {
+  PUBLIC_WEB: '공개 문헌',
+  LOCAL_DOCUMENT: '내 문서',
+};
+
+export function RagGuideView() {
+  const [question, setQuestion] = useState('');
+  const [answerMode, setAnswerMode] = useState<'CONCISE' | 'DETAILED'>('CONCISE');
+  const [answerState, setAnswerState] = useState<ViewState<RagAnswerView> | null>(null);
+  const [pending, setPending] = useState(false);
+  const [consentGranted, setConsentGranted] = useState<boolean | null>(null);
+  const [consentPending, setConsentPending] = useState(false);
+  const [consentError, setConsentError] = useState<string | null>(null);
+  const registry = useResource(loadRegistry, []);
+  const history = useResource(loadRecentQuestions, []);
+  const worldNews = useResource(() => loadWorldNews(), []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void loadConsentGranted().then((granted) => {
+      if (!cancelled) setConsentGranted(granted);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /**
+   * 동의·철회.
+   *
+   * 예전에는 `try { ... } finally { ... }` 로 catch 가 없어서 실패가 unhandled rejection 이
+   * 됐다. 사용자에게는 버튼을 눌렀는데 아무 일도 일어나지 않은 것으로 보였고, 동의를 못 하면
+   * 질문 자체가 막히므로 화면이 고장 난 것과 같았다. 실패를 반드시 말한다.
+   */
+  async function changeConsent(action: 'GRANT' | 'REVOKE') {
+    if (consentPending) return;
+    setConsentPending(true);
+    setConsentError(null);
+    try {
+      await recordConsent(action);
+      setConsentGranted(action === 'GRANT');
+      if (action === 'REVOKE') setAnswerState(null);
+    } catch (cause) {
+      const state = toErrorState<never>(cause);
+      setConsentError(
+        state.kind === 'error'
+          ? `${action === 'GRANT' ? '동의' : '철회'}를 저장하지 못했습니다. ${state.message}`
+          : '동의 상태를 바꾸지 못했습니다.',
+      );
+    } finally {
+      setConsentPending(false);
+    }
+  }
+
+  async function submit(text: string) {
+    const trimmed = text.trim();
+    if (trimmed.length === 0 || pending) return;
+    setPending(true);
+    setAnswerState({ kind: 'loading' });
+    try {
+      setAnswerState(await askRag(trimmed, answerMode));
+      history.reload();
+    } catch (cause) {
+      setAnswerState(toErrorState<RagAnswerView>(cause));
+    } finally {
+      setPending(false);
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      <Panel
+        contract="POST /api/v2/rag/consents"
+        title="외부 처리 동의"
+        hint="동의하기 전에는 질문이 외부로 나가지 않습니다."
+        actions={
+          <span className="text-eyebrow font-semibold uppercase text-faint">
+            {consentGranted === null ? '확인 중' : consentGranted ? '동의 완료' : '동의 필요'}
+          </span>
+        }
+      >
+        <p className="text-[13px] leading-6 text-muted">{EXTERNAL_DISCLOSURE}</p>
+        <p className="mt-2 text-[13px] leading-6 text-muted">{EXTERNAL_POLICY}</p>
+        <p className="mt-2 font-mono text-[11px] text-faint">처리자: {EXTERNAL_PROCESSORS}</p>
+        <div className="mt-3 flex gap-2">
+          <Button
+                        onClick={() => void changeConsent('GRANT')}
+            disabled={consentPending || consentGranted === true}
+            variant="primary"
+          >
+            동의
+          </Button>
+          <Button
+                        onClick={() => void changeConsent('REVOKE')}
+            disabled={consentPending || consentGranted !== true}
+            className="rounded-full border border-line px-3 py-1.5 text-[13px] text-muted hover:border-navy hover:text-navy disabled:text-faint"
+          >
+            철회
+          </Button>
+        </div>
+        {consentError ? (
+          <p role="alert" className="mt-3 text-[13px] leading-6 text-block">
+            {consentError}
+          </p>
+        ) : null}
+        {consentGranted === null ? (
+          <p className="mt-3 text-[13px] leading-6 text-muted">
+            동의 상태를 확인하는 중입니다. 확인되지 않으면 질문은 열리지 않습니다.
+          </p>
+        ) : null}
+      </Panel>
+
+      <Panel
+        contract="POST /api/v2/rag/ask"
+        title="금융 개념 물어보기"
+        hint="개념과 위험을 설명합니다. 무엇을 사고 팔지는 답하지 않습니다."
+      >
+        <div className="space-y-3">
+          <label htmlFor="rag-question" className="sr-only">
+            질문
+          </label>
+          <textarea
+            id="rag-question"
+            value={question}
+            onChange={(event) => setQuestion(event.target.value.slice(0, 1000))}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) void submit(question);
+            }}
+            rows={3}
+            placeholder="예: 금 ETF의 롤오버 위험은 무엇인가요?"
+            className="w-full resize-y rounded-card border border-line bg-panel px-4 py-3 text-[14px] leading-6 text-ink placeholder:text-faint"
+          />
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-center gap-2">
+              {(['CONCISE', 'DETAILED'] as const).map((mode) => (
+                <Button
+                  key={mode}
+                  variant={answerMode === mode ? 'primary' : 'secondary'}
+                  onClick={() => setAnswerMode(mode)}
+                  className={`border px-3 py-1.5 text-[13px] ${
+                    answerMode === mode
+                      ? 'border-brand bg-brand text-on-brand'
+                      : 'border-line bg-panel text-muted hover:border-navy hover:text-navy'
+                  }`}
+                >
+                  {mode === 'CONCISE' ? '짧게' : '자세히'}
+                </Button>
+              ))}
+              <span className="tnum font-mono text-[11px] text-faint">{question.length}/1000</span>
+            </div>
+            <Button
+              onClick={() => void submit(question)}
+              disabled={pending || consentGranted !== true || question.trim().length === 0}
+              variant="primary"
+            >
+              {pending ? '찾는 중' : '물어보기'}
+            </Button>
+          </div>
+          <div className="flex flex-wrap gap-2 pt-1">
+            {EXAMPLES.map((example) => (
+              <Button
+                key={example}
+                variant="secondary"
+                size="sm"
+                onClick={() => {
+                  setQuestion(example);
+                  void submit(example);
+                }}
+                className="rounded-full border border-line px-2.5 py-1 text-[12px] text-muted hover:border-navy hover:text-navy"
+              >
+                {example}
+              </Button>
+            ))}
+          </div>
+        </div>
+      </Panel>
+
+      {answerState ? (
+        // 재시도가 없으면 503 하나에 "불러오기 실패"만 남고 사용자가 할 수 있는 행동이 없다.
+        // 마지막으로 보낸 질문을 그대로 다시 보낸다.
+        <AsyncBoundary state={answerState} onRetry={() => void submit(question)}>
+          {(view) => (
+            <Panel
+              contract="rag-v2-answer.v1"
+              title={view.answer ? '설명' : view.statusHeadline}
+              hint={view.answer ? '질문에 대한 설명입니다. 근거 정보는 아래에서 따로 확인할 수 있습니다.' : view.statusDetail}
+            >
+              <article
+                aria-label="생성된 설명"
+                className={`border-l-2 ${STATUS_TONE[view.generationStatus] ?? 'border-line'} pl-4`}
+              >
+                {view.answer ? (
+                  <p className="whitespace-pre-line text-[14px] leading-7 text-ink">{renderAnswerText(view.answer)}</p>
+                ) : (
+                  <p className="text-[13px] leading-6 text-muted">
+                    잠시 후 다시 질문할 수 있습니다. 확인 가능한 근거가 있으면 아래에 표시합니다.
+                  </p>
+                )}
+              </article>
+
+              <details className="mt-5 border-t border-line pt-4">
+                <summary className="cursor-pointer text-[13px] text-navy">근거와 출처 보기</summary>
+                <div className="mt-4 flex items-center gap-2">
+                  <span className="text-eyebrow font-semibold uppercase text-faint">출처 연결률</span>
+                  <Numeric
+                    value={view.citationCoverage}
+                    format={(v) => formatRatio(v, 0)}
+                    missingReason="생성된 문장이 없어 출처 연결률을 계산하지 않았습니다."
+                  />
+                </div>
+                {view.sourcesUnavailableReason ? (
+                  <p className="mt-4 rounded-tile border border-dashed border-rule px-4 py-4 text-[13px] leading-5 text-muted">
+                    {view.sourcesUnavailableReason}
+                  </p>
+                ) : null}
+                {view.topSources.length > 0 ? (
+                  <div className="mt-5">
+                    <p className="text-eyebrow font-semibold uppercase text-faint">핵심 출처</p>
+                    <ul className="mt-2 space-y-4">
+                      {view.topSources.map((source) => (
+                        <SourceRow key={source.sourceId} source={source} />
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+                {view.expandableSources.length > 0 ? (
+                  <details className="mt-5 border-t border-line pt-4">
+                    <summary className="cursor-pointer text-[13px] text-navy">
+                      관련 출처 {view.expandableSources.length}개 더 보기
+                    </summary>
+                    <ul className="mt-3 space-y-4">
+                      {view.expandableSources.map((source) => (
+                        <SourceRow key={source.sourceId} source={source} />
+                      ))}
+                    </ul>
+                  </details>
+                ) : null}
+              </details>
+            </Panel>
+          )}
+        </AsyncBoundary>
+      ) : null}
+
+      <AsyncBoundary state={history.state} onRetry={history.reload}>
+        {(items) => (
+          <Panel
+            title="최근 질문"
+            hint="내 계정에 저장된 질문과 답변입니다. 제목을 누르면 전체 답변이 펼쳐집니다."
+            actions={
+              items.length > 0 ? (
+                <span className="text-[11px] text-faint">{items.length}건</span>
+              ) : null
+            }
+          >
+            {items.length === 0 ? (
+              // 빈 상태도 패널 안에 둔다. 제목이 없으면 이 문장이 무엇에 대한 말인지 모른다.
+              <p className="text-[13px] leading-6 text-muted">
+                아직 저장된 질문이 없습니다. 위에서 궁금한 개념을 물어보면 여기에 쌓입니다.
+              </p>
+            ) : (
+              <div className="divide-y divide-line/60">
+                {items.map((item) => (
+                  <HistoryEntry key={item.answerId} item={item} onChanged={history.reload} />
+                ))}
+              </div>
+            )}
+          </Panel>
+        )}
+      </AsyncBoundary>
+
+      <AsyncBoundary state={worldNews.state} onRetry={worldNews.reload}>
+        {(page) => <WorldNewsPanel page={page} />}
+      </AsyncBoundary>
+
+      <AsyncBoundary state={registry.state} onRetry={registry.reload}>
+        {(cards) => <FinanceLibrary cards={cards} />}
+      </AsyncBoundary>
+    </div>
+  );
+}
+
+function WorldNewsPanel({ page }: { page: WorldNewsPage }) {
+  /*
+   * 저장소 모양을 그대로 뿌리지 않는다. provider 코드·권리 프로필·수집 상태는 파이프라인
+   * 안에서 의미가 있는 값이고, 여기 온 사람은 기사를 읽으러 왔다. 가공은
+   * `worldNewsPresentation` 이 맡고 이 컴포넌트는 그리기만 한다.
+   */
+  const feed = buildNewsFeed(page, safeExternalUrl);
+  return (
+    <Panel
+      contract="GET /api/v2/rag/world-news"
+      title="오늘의 세계 뉴스"
+      hint="바깥 세상에서 무슨 일이 있었는지 보여 주는 참고 자료입니다. 이 목록은 종목 판단이나 주문에 쓰이지 않습니다."
+      actions={
+        feed.asOfRelative ? (
+          <span className="text-[11px] text-faint">{feed.asOfRelative} 기준</span>
+        ) : null
+      }
+    >
+      {feed.warnings.length > 0 ? (
+        <div className="mb-5 border-l-2 border-hold pl-4">
+          {feed.warnings.map((warning) => (
+            <p key={warning.label} className="text-[12px] leading-5 text-muted">
+              <span className="font-medium text-ink">{warning.label}</span> — {warning.meaning}
+            </p>
+          ))}
+        </div>
+      ) : null}
+      {feed.cards.length === 0 ? (
+        /*
+         * 왜 비었는지 갈라서 말한다. 셋은 원인이 다르다 - 들어온 기사가 전부 금융과
+         * 무관했거나, 수집이 실패했거나, 정말 새 기사가 없거나. 뭉뚱그리면 사용자는
+         * 시스템이 고장 났다고 읽는다.
+         */
+        <p className="text-[13px] leading-6 text-muted">
+          {feed.hiddenUnrelated > 0
+            ? `방금 들어온 기사 ${feed.hiddenUnrelated}건은 모두 금융과 관련이 적어 접었습니다. 이 목록은 금융 관련 기사만 모읍니다.`
+            : feed.warnings.length > 0
+              ? '지금은 보여 드릴 기사가 없습니다. 위 수집 상태를 확인하세요.'
+              : '지금은 보여 드릴 기사가 없습니다. 수집은 정상이며 새 기사가 없을 뿐입니다.'}
+        </p>
+      ) : (
+        <ul className="divide-y divide-line/60">
+          {feed.cards.map((card) => (
+            <li key={card.key} className="py-5 first:pt-0 last:pb-0">
+              <p className="text-[15px] font-medium leading-6 text-ink">{card.title}</p>
+              {card.quote ? (
+                /*
+                 * 인용은 자르지 않는다 - 길이로 자르면 뜻이 바뀐다. 대신 줄 수로 접고,
+                 * 긴 기사만 펼치게 한다.
+                 */
+                <p className="mt-2 line-clamp-3 text-[13px] leading-6 text-muted">{card.quote}</p>
+              ) : null}
+              <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 text-[12px] text-faint">
+                {card.relativeTime ? (
+                  <span title={card.absoluteTime ?? undefined}>
+                    {/* 불확실한 시각에는 '약' 한 글자만 붙인다. 카드마다 같은 문장을
+                        반복하면 그 문장은 읽히지 않고 목록만 어지럽힌다. */}
+                    {card.timeUncertain ? `약 ${card.relativeTime}` : card.relativeTime}
+                  </span>
+                ) : null}
+                <span>{card.providerLabel}</span>
+                {card.duplicateCount > 0 ? (
+                  <span>다른 매체 {card.duplicateCount}곳에서도 보도</span>
+                ) : null}
+                {card.href ? (
+                  <a
+                    href={card.href}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="text-navy underline underline-offset-2"
+                  >
+                    기사 원문
+                  </a>
+                ) : null}
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+      {feed.timeNote || feed.hiddenUnrelated > 0 ? (
+        <div className="mt-4 space-y-1 border-t border-line pt-3 text-[11px] leading-5 text-faint">
+          {feed.timeNote ? <p>{feed.timeNote}</p> : null}
+          {/*
+           * 화면이 조용히 골라내면 무엇을 숨겼는지 아무도 모른다. 몇 건을 접었는지 적는다.
+           * 수집기 쪽 필터가 자리를 잡으면 이 숫자는 0 으로 수렴한다.
+           */}
+          {feed.hiddenUnrelated > 0 ? (
+            <p>
+              금융과 관련이 적은 기사 {feed.hiddenUnrelated}건은 이 목록에서 접었습니다.
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+    </Panel>
+  );
+}
+
+/**
+ * 저장된 질문 한 건.
+ *
+ * 도움이 됐는지 남기는 것과 기록을 지우는 것 둘 다 쓰기다. `useResource` 를 쓰지 않고
+ * 직접 상태를 든다(기존 쓰기들과 같은 방식). **자동으로 다시 보내지 않는다** — 실패는
+ * 그 자리에 적고 사용자가 다시 누르게 한다.
+ */
+// TODO(자동매매): 피드백은 v1 경로(rag_ans_ 형식)만 받는데 기록은 v2 answerId(rag_)를 준다.
+// v2 피드백 저장을 만들 때까지 버튼을 숨긴다.
+const RAG_FEEDBACK_ENABLED = false;
+
+function HistoryEntry({ item, onChanged }: { item: RagV2HistoryDetail; onChanged: () => void }) {
+  const router = useRouter();
+  const [busy, setBusy] = useState(false);
+  const [sent, setSent] = useState<boolean | null>(null);
+  const [confirming, setConfirming] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function sendFeedback(helpful: boolean) {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.ragFeedback(item.answerId, helpful);
+      setSent(helpful);
+    } catch (cause) {
+      const state = toErrorState<never>(cause);
+      setError(state.kind === 'error' ? state.message : '평가를 남기지 못했습니다.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove() {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api.ragV2DeleteHistory(item.answerId);
+      onChanged();
+    } catch (cause) {
+      const state = toErrorState<never>(cause);
+      setError(state.kind === 'error' ? state.message : '기록을 지우지 못했습니다.');
+      setBusy(false);
+    }
+  }
+
+  return (
+    // 제목 한 줄만 두고 눌러야 열린다. 접힌 상태에 답변 미리보기를 넣었더니 다섯 건이
+    // 화면 한 장을 넘겼다 - 목록은 훑는 것이고, 읽는 것은 펼친 뒤다.
+    <details className="py-3 first:pt-0 last:pb-0">
+      <summary className="cursor-pointer text-[13px] font-medium text-ink">
+        {item.question}
+        <span className="ml-2 text-[11px] font-normal text-faint">
+          {formatKstDateTime(item.createdAt) ?? '시각 미상'}
+        </span>
+      </summary>
+      <p className="mt-3 whitespace-pre-line border-l-2 border-line pl-4 text-[13px] leading-6 text-muted">
+        {renderAnswerText(item.answer ?? '이 기록에는 생성된 설명이 없습니다.')}
+      </p>
+
+      <div className="mt-3 flex flex-wrap items-center gap-2 pl-4">
+        {!RAG_FEEDBACK_ENABLED ? null : sent === null ? (
+          <>
+            <span className="text-[12px] text-faint">도움이 됐나요?</span>
+            <Button
+              disabled={busy}
+              onClick={() => void sendFeedback(true)}
+              className="rounded-full border border-line px-3 py-1 text-[12px] text-muted hover:border-navy hover:text-navy"
+            >
+              도움 됨
+            </Button>
+            <Button
+              disabled={busy}
+              onClick={() => void sendFeedback(false)}
+              className="rounded-full border border-line px-3 py-1 text-[12px] text-muted hover:border-navy hover:text-navy"
+            >
+              아니오
+            </Button>
+          </>
+        ) : (
+          <span className="text-[12px] text-muted">
+            {sent ? '도움이 됐다고 남겼습니다.' : '도움이 되지 않았다고 남겼습니다.'}
+          </span>
+        )}
+
+        {RAG_FEEDBACK_ENABLED && <span aria-hidden className="mx-1 h-4 w-px bg-line" />}
+
+        {confirming ? (
+          <>
+            <span className="text-[12px] text-block">지우면 되돌릴 수 없습니다.</span>
+            <Button
+              disabled={busy}
+              onClick={() => void remove()}
+              className="rounded-full border border-block px-3 py-1 text-[12px] font-semibold text-block"
+            >
+              {busy ? '지우는 중' : '지웁니다'}
+            </Button>
+            <Button
+              disabled={busy}
+              onClick={() => setConfirming(false)}
+              className="rounded-full border border-line px-3 py-1 text-[12px] text-muted"
+            >
+              취소
+            </Button>
+          </>
+        ) : (
+          <>
+            {/*
+             * 이 답변을 학습일지로 넘긴다. 답변 식별자를 함께 실어 두 기록이 서로를
+             * 가리키게 한다 - 지금까지 화면에 연결을 만들 방법이 아예 없었다.
+             */}
+            <Button
+              disabled={busy}
+              onClick={() => {
+                putJournalHandoff({
+                  title: item.question.slice(0, 120),
+                  content: item.answer ?? '',
+                  ragAnswerId: item.answerId,
+                });
+                router.push('/journal');
+              }}
+              className="rounded-full border border-line px-3 py-1 text-[12px] text-muted hover:border-navy hover:text-navy"
+            >
+              학습일지로 남기기
+            </Button>
+            <Button
+              disabled={busy}
+              onClick={() => setConfirming(true)}
+              className="rounded-full border border-line px-3 py-1 text-[12px] text-muted hover:border-block hover:text-block"
+            >
+              기록 지우기
+            </Button>
+          </>
+        )}
+      </div>
+
+      {error ? (
+        <p className="mt-2 border-l-2 border-block bg-block/5 px-3 py-2 text-[13px] leading-6 text-ink">
+          {error}
+        </p>
+      ) : null}
+    </details>
+  );
+}
+
+function FinanceLibrary({ cards }: { cards: RagSourceResponse[] }) {
+  const featured = cards.slice(0, 4);
+  const more = cards.slice(4);
+  return (
+    <Panel
+      contract="GET /api/v1/rag/sources"
+      title="금융 지식 라이브러리"
+      hint="RAG가 실제로 검색하는 금융 개념·상품 위험·성과 검증 자료입니다. 연동 API 문서는 화면에서 제외합니다."
+    >
+      {cards.length === 0 ? (
+        <p className="text-[13px] text-muted">등록된 금융 자료가 없습니다.</p>
+      ) : (
+        <>
+          <ul className="grid gap-3 md:grid-cols-2">
+            {featured.map((card) => <RegistryCard key={card.sourceId} card={card} />)}
+          </ul>
+          {more.length > 0 ? (
+            <details className="mt-4 border-t border-line pt-4">
+              <summary className="cursor-pointer text-[13px] font-medium text-navy">
+                연구 근거 {more.length}개 더 보기
+              </summary>
+              <ul className="mt-3 grid gap-3 md:grid-cols-2">
+                {more.map((card) => <RegistryCard key={card.sourceId} card={card} />)}
+              </ul>
+            </details>
+          ) : null}
+        </>
+      )}
+    </Panel>
+  );
+}
+
+function RegistryCard({ card }: { card: RagSourceResponse }) {
+  const href = safeExternalUrl(card.canonicalUrl);
+  const content = (
+    <>
+      <span className="inline-flex rounded-full bg-navy/5 px-2 py-1 text-[10px] font-semibold text-navy">
+        {card.topic}
+      </span>
+      <span className="mt-2 block text-[13px] font-medium leading-5 text-ink">{card.title}</span>
+      <span className="mt-1 block text-[11px] leading-5 text-faint">{card.institution}</span>
+    </>
+  );
+  return (
+    <li className="rounded-tile border border-line bg-panel px-4 py-3 transition-colors hover:border-navy/40">
+      {href ? (
+        <a href={href} target="_blank" rel="noopener noreferrer" className="block">
+          {content}
+        </a>
+      ) : content}
+    </li>
+  );
+}
+
+function SourceRow({ source }: { source: SourceItem }) {
+  return (
+    <li>
+      <div className="flex flex-wrap items-baseline gap-2">
+        <p className="text-[13px] font-medium leading-5 text-ink">{source.title}</p>
+        <span className="rounded-full border border-line px-1.5 py-0.5 font-mono text-[10px] uppercase text-faint">
+          {CITATION_KIND_LABEL[source.citationKind] ?? source.citationKind}
+        </span>
+      </div>
+      <p className="mt-1 text-[13px] leading-6 text-muted">{source.summary}</p>
+      {source.institution ? <p className="mt-1 text-[11px] text-faint">{source.institution}</p> : null}
+      {source.href ? (
+        <a
+          href={source.href}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="mt-1 inline-block text-[12px] text-navy underline underline-offset-2"
+        >
+          원문 열기
+        </a>
+      ) : null}
+    </li>
+  );
+}

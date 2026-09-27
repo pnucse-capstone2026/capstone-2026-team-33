@@ -1,0 +1,1174 @@
+from __future__ import annotations
+
+import base64
+import binascii
+import json
+import os
+import re
+from typing import Any, cast
+from urllib.parse import urlparse
+
+from google.oauth2 import service_account
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_google_genai import ChatGoogleGenerativeAI
+
+from app.strong_llm.models import RunRequest, StrongLlmAnswer
+from app.strong_llm.prompt import render_discovery_prompt, render_prompt, require_google_grounding
+from app.strong_llm.runtime import ProviderResult
+
+_VERTEX_SCOPE = "https://www.googleapis.com/auth/cloud-platform"
+_NUMERIC_TOKEN = re.compile(
+    r"(?<![\w])[-+]?(?:\d{1,3}(?:,\d{3})*|\d+)(?:\.\d+)?"
+    r"(?:%|bp|bps|USD|KRW|원|달러|년|개월|월|일|주)?(?=$|[^\w]|[가-힣])"
+)
+
+
+class VertexProviderSettings:
+    """서비스계정 JSON은 root .env의 canonical Base64 값에서 읽고 API key·ADC fallback을 금지한다."""
+
+    def __init__(
+        self,
+        *,
+        service_account_info: dict[str, Any],
+        location: str = "global",
+        timeout_seconds: float = 50.0,
+        thinking_level: str = "low",
+        max_output_tokens: int = 4_096,
+    ) -> None:
+        if (
+            not isinstance(service_account_info, dict)
+            or service_account_info.get("type") != "service_account"
+            or not isinstance(service_account_info.get("project_id"), str)
+            or not isinstance(service_account_info.get("client_email"), str)
+            or not isinstance(service_account_info.get("private_key"), str)
+            or not isinstance(service_account_info.get("token_uri"), str)
+            or service_account_info.get("token_uri") != "https://oauth2.googleapis.com/token"
+        ):
+            raise ValueError("STRONG_LLM_VERTEX_SERVICE_ACCOUNT_ENV_INVALID")
+        if location != "global":
+            raise ValueError("STRONG_LLM_VERTEX_LOCATION_INVALID")
+        if not 10.0 <= timeout_seconds <= 55.0:
+            raise ValueError("STRONG_LLM_VERTEX_TIMEOUT_INVALID")
+        if thinking_level not in {"minimal", "low", "medium"}:
+            raise ValueError("STRONG_LLM_VERTEX_THINKING_LEVEL_INVALID")
+        if not 256 <= max_output_tokens <= 32_768:
+            raise ValueError("STRONG_LLM_VERTEX_OUTPUT_CAP_INVALID")
+        self.service_account_info = dict(service_account_info)
+        self.location = location
+        self.timeout_seconds = timeout_seconds
+        self.thinking_level = thinking_level
+        self.max_output_tokens = max_output_tokens
+
+    def for_thinking_level(self, thinking_level: str) -> VertexProviderSettings:
+        return VertexProviderSettings(
+            service_account_info=self.service_account_info,
+            location=self.location,
+            timeout_seconds=self.timeout_seconds,
+            thinking_level=thinking_level,
+            max_output_tokens=self.max_output_tokens,
+        )
+
+    @classmethod
+    def from_env(cls) -> VertexProviderSettings:
+        if os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY"):
+            raise ValueError("STRONG_LLM_API_KEY_FALLBACK_FORBIDDEN")
+        encoded = os.environ.get("MARS_VERTEX_SERVICE_ACCOUNT_JSON_B64", "")
+        if not encoded or len(encoded) > 64 * 1024:
+            raise ValueError("STRONG_LLM_VERTEX_SERVICE_ACCOUNT_ENV_MISSING")
+        service_account_info = _decode_service_account(
+            encoded, "STRONG_LLM_VERTEX_SERVICE_ACCOUNT_ENV_INVALID"
+        )
+        raw_timeout = os.environ.get("STRONG_LLM_VERTEX_TIMEOUT_SECONDS", "50")
+        try:
+            timeout_seconds = float(raw_timeout)
+        except ValueError as error:
+            raise ValueError("STRONG_LLM_VERTEX_TIMEOUT_INVALID") from error
+        thinking_level = os.environ.get("STRONG_LLM_VERTEX_THINKING_LEVEL", "low")
+        raw_output_cap = os.environ.get("RAG_LLM_MAX_OUTPUT_TOKENS", "4096").strip()
+        if re.fullmatch(r"[0-9]{1,5}", raw_output_cap) is None:
+            raise ValueError("STRONG_LLM_VERTEX_OUTPUT_CAP_INVALID")
+        return cls(
+            service_account_info=service_account_info,
+            timeout_seconds=timeout_seconds,
+            thinking_level=thinking_level,
+            max_output_tokens=int(raw_output_cap),
+        )
+
+    @classmethod
+    def from_b64(
+        cls,
+        encoded: str,
+        *,
+        timeout_seconds: float,
+        thinking_level: str,
+        max_output_tokens: int,
+    ) -> VertexProviderSettings:
+        """host가 run마다 넘긴 사용자 자기 서비스 계정. 운영자 비밀과 같은 canonical Base64 모양만 받는다."""
+        if not encoded or len(encoded) > 4_096:
+            raise ValueError("STRONG_LLM_OWNER_VERTEX_CREDENTIAL_INVALID")
+        return cls(
+            service_account_info=_decode_service_account(
+                encoded, "STRONG_LLM_OWNER_VERTEX_CREDENTIAL_INVALID"
+            ),
+            timeout_seconds=timeout_seconds,
+            thinking_level=thinking_level,
+            max_output_tokens=max_output_tokens,
+        )
+
+
+def _decode_service_account(encoded: str, failure: str) -> dict[str, Any]:
+    """오류에는 고정 leaf만 싣는다. 원문·부분 문자열은 예외 메시지에 들어가지 않는다."""
+    try:
+        credential_bytes = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError):
+        raise ValueError(failure) from None
+    if (
+        base64.b64encode(credential_bytes).decode("ascii") != encoded
+        or len(credential_bytes) > 48 * 1024
+    ):
+        raise ValueError(failure)
+    try:
+        service_account_info = json.loads(credential_bytes)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError(failure) from None
+    if not isinstance(service_account_info, dict):
+        raise ValueError(failure)
+    return service_account_info
+
+
+class LangChainVertexProvider:
+    """LangChain은 provider message와 native schema를 관리하며 permit·budget은 host가 강제한다."""
+
+    provider_id = "vertex"
+    supports_google_search = True
+
+    def __init__(self, request: RunRequest, settings: VertexProviderSettings) -> None:
+        credentials = service_account.Credentials.from_service_account_info(  # type: ignore[no-untyped-call]
+            settings.service_account_info,
+            scopes=[_VERTEX_SCOPE],
+        )
+        project = credentials.project_id
+        if not project:
+            raise ValueError("STRONG_LLM_VERTEX_PROJECT_INVALID")
+        common: dict[str, Any] = {
+            "model": request.model_id,
+            "vertexai": True,
+            "project": project,
+            "location": settings.location,
+            "credentials": credentials,
+            "max_retries": 0,
+            # Google grounding은 검색 왕복을 포함하므로 host 60초 deadline 안에서 최대 55초만 기다린다.
+            "timeout": settings.timeout_seconds,
+            # The Spring host uses the same deployment cap when reserving gross
+            # exposure before each provider permit. The provider must honor it.
+            "max_output_tokens": settings.max_output_tokens,
+            # Gemini 3 reasoning token도 output cap을 사용하므로 RAG 종합은 low로 bounded한다.
+            "thinking_level": settings.thinking_level,
+            "temperature": None,
+        }
+        base_model = ChatGoogleGenerativeAI(**common)
+        structured = {
+            "response_mime_type": "application/json",
+            "response_schema": _vertex_response_schema(request.mode),
+        }
+        self._structured = base_model.bind(**structured)
+        # Gemini 3.5 Flash는 두 기능을 각각 지원하지만 실제 Vertex 응답에서 Google Search와
+        # response_schema를 한 호출에 묶으면 query만 남고 groundingChunks/Supports가 비는 경우가
+        # 있다. discovery는 공식 Google Search 형태의 plain-text call로 근거를 확보하고, host가
+        # 관측한 support만 별도의 tool-free structured final에 넘긴다.
+        self._google_discovery = base_model.bind(
+            tools=[{"google_search": {}}],
+            temperature=0.0,
+        )
+        self._tool_model = base_model
+        self._structured_options = structured
+        self._request = request
+        self._discovery: ProviderResult | None = None
+        self._fallback_start_messages: list[BaseMessage] = []
+
+    def invoke_google(self, request: RunRequest, *, include_owner: bool) -> ProviderResult:
+        if include_owner:
+            if self._discovery is None:
+                raise ValueError("STRONG_LLM_GROUNDED_FINAL_STATE_INVALID")
+            prompt = render_prompt(request, request.public_evidence + request.owner_evidence)
+            _assign_grounding_citation_ids(
+                self._discovery["grounding_roots"],
+                {item.citation_id for item in request.public_evidence + request.owner_evidence},
+            )
+            grounding = _grounding_evidence(self._discovery)
+            messages: list[BaseMessage] = [
+                SystemMessage(content=prompt.system),
+                HumanMessage(
+                    content=prompt.user
+                    + "\n\nVerified Google grounding support:\n"
+                    + grounding
+                    + "\nWhen using Google support, cite its assigned citation_id and copy the exact support text into evidenceSpans.quote.",
+                ),
+            ]
+            message = self._structured.invoke(messages)
+            allowed_ids = {
+                item.citation_id for item in request.public_evidence + request.owner_evidence
+            } | {str(item["citation_id"]) for item in self._discovery["grounding_roots"]}
+            result = _provider_result(
+                message,
+                allowed_local_ids=allowed_ids,
+                mode=request.mode,
+            )
+            if request.mode != "JUDGE":
+                result["answer_json"] = _normalize_grounded_answer(
+                    result["answer_json"],
+                    self._discovery["grounding_roots"],
+                    self._discovery["grounding_supports"],
+                )
+            return result
+
+        prompt = render_discovery_prompt(request)
+        prompt = require_google_grounding(prompt)
+        message = self._google_discovery.invoke(
+            [SystemMessage(content=prompt.system), HumanMessage(content=prompt.user)]
+        )
+        result = _grounding_discovery_result(message, request=request)
+        _assign_grounding_citation_ids(
+            result["grounding_roots"],
+            {item.citation_id for item in request.public_evidence},
+        )
+        self._discovery = result
+        return result
+
+    def invoke_fallback(
+        self,
+        request: RunRequest,
+        messages: list[BaseMessage],
+        *,
+        tools_enabled: bool,
+    ) -> ProviderResult:
+        if tools_enabled and request.owner_evidence:
+            raise ValueError("STRONG_LLM_OWNER_PUBLIC_DISCOVERY_FORBIDDEN")
+        prompt = render_prompt(request, request.public_evidence + request.owner_evidence)
+        if messages:
+            history = messages
+        else:
+            # 첫 turn의 정책과 질문도 LangGraph state의 일부다. tool call 뒤 이를 버리면
+            # 모델이 검색 결과만 보고 원래 질문을 잃으므로 exact message 객체를 보존한다.
+            self._fallback_start_messages = [
+                SystemMessage(content=prompt.system),
+                HumanMessage(content=prompt.user),
+            ]
+            history = self._fallback_start_messages
+        runnable = (
+            self._tool_model.bind_tools(_fallback_tools()).bind(**self._structured_options)
+            if tools_enabled
+            else self._structured
+        )
+        # Kotlin host가 발급해 ToolMessage에 넣은 citationId만 새 web evidence로 신뢰한다.
+        # 모델이 임의로 만든 ID는 기존 local allowlist와 이 집합 어디에도 없어 최종 검증 전에 제거된다.
+        host_tool_citation_ids = _tool_result_citation_ids(history)
+        return _provider_result(
+            runnable.invoke(history),
+            allowed_local_ids={
+                item.citation_id for item in request.public_evidence + request.owner_evidence
+            }
+            | host_tool_citation_ids,
+            mode=request.mode,
+        )
+
+    def tool_calls(self, message: AIMessage) -> list[dict[str, object]]:
+        return [dict(call) for call in message.tool_calls]
+
+    def append_tool_result(
+        self,
+        messages: list[BaseMessage],
+        message: AIMessage,
+        call: dict[str, object],
+        result_json: str,
+    ) -> list[BaseMessage]:
+        call_id = str(call.get("id", ""))
+        if not call_id:
+            raise ValueError("STRONG_LLM_TOOL_CALL_ID_INVALID")
+        prefix = messages or self._fallback_start_messages
+        if not prefix:
+            raise ValueError("STRONG_LLM_TOOL_HISTORY_INVALID")
+        return [*prefix, message, ToolMessage(content=result_json, tool_call_id=call_id)]
+
+
+def _vertex_response_schema(mode: str = "EXPLAIN") -> dict[str, object]:
+    """Vertex 지원 subset만 보내고 길이·pattern은 Pydantic과 Kotlin에서 재검증한다.
+
+    JUDGE는 설명이 아니라 후보 점수를 낸다. 두 모드가 같은 schema를 쓰면 판단 turn에서도
+    모델이 `basis`/`sentences`를 채워 보내고, 그것을 `StrongLlmJudgement`로 읽으려다
+    매번 실패한다. prompt는 이미 `_OUTPUT_JUDGE`로 갈라져 있었고 여기만 갈라지지 않았다.
+    """
+
+    if mode == "JUDGE":
+        judge_evidence_span: dict[str, object] = {
+            "type": "object",
+            "properties": {
+                "citationId": {"type": "string"},
+                "quote": {"type": "string"},
+            },
+            "required": ["citationId", "quote"],
+        }
+        return {
+            "type": "object",
+            "properties": {
+                "candidates": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "symbol": {"type": "string"},
+                            "score": {"type": "number"},
+                            "veto": {"type": "boolean"},
+                            "reason": {"type": "string"},
+                            "evidenceSpans": {
+                                "type": "array",
+                                "items": judge_evidence_span,
+                            },
+                        },
+                        "required": ["symbol", "score", "veto", "reason", "evidenceSpans"],
+                    },
+                },
+                "summary": {"type": "string"},
+            },
+            "required": ["candidates", "summary"],
+        }
+
+    citation_ids: dict[str, object] = {"type": "array", "items": {"type": "string"}}
+    evidence_span: dict[str, object] = {
+        "type": "object",
+        "properties": {"citationId": {"type": "string"}, "quote": {"type": "string"}},
+        "required": ["citationId", "quote"],
+    }
+    numeric_span: dict[str, object] = {
+        "type": "object",
+        "properties": {"value": {"type": "string"}, "citationIds": citation_ids},
+        "required": ["value", "citationIds"],
+    }
+    sentence: dict[str, object] = {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string"},
+            "citationIds": citation_ids,
+            "evidenceSpans": {"type": "array", "items": evidence_span},
+            "numericSpans": {"type": "array", "items": numeric_span},
+        },
+        "required": ["text", "citationIds", "evidenceSpans", "numericSpans"],
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "basis": {
+                "type": "string",
+                # 모델이 고를 수 있는 basis에서 빈 답을 없앤다. 근거가 없다는 것은 설명을
+                # 하지 않을 이유가 아니라 인용을 붙이지 않을 이유일 뿐이므로 그 경우는
+                # MODEL_KNOWLEDGE로 답한다. 호스트가 직접 만드는 placeholder JSON은
+                # 이 스키마의 구속을 받지 않으므로 그대로 둔다.
+                "enum": [
+                    "EVIDENCE",
+                    "EVIDENCE_WITH_REASONING",
+                    "MODEL_KNOWLEDGE",
+                ],
+            },
+            "answer": {"type": "string", "nullable": True},
+            "sentences": {"type": "array", "items": sentence},
+            "warnings": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": [
+                        "SINGLE_SOURCE",
+                        "STALE_SOURCE",
+                        "CONFLICTING_SOURCES",
+                        "LOW_RELEVANCE",
+                        "SECONDARY_SOURCE",
+                        "GOOGLE_GROUNDING_ONLY",
+                    ],
+                },
+            },
+        },
+        "required": ["basis", "answer", "sentences", "warnings"],
+    }
+
+
+def _provider_result(
+    message: AIMessage,
+    *,
+    allowed_local_ids: set[str] | None = None,
+    mode: str = "EXPLAIN",
+) -> ProviderResult:
+    if message.tool_calls:
+        tool_usage: dict[str, Any] = dict(message.usage_metadata or {})
+        return {
+            "message": message,
+            "answer_json": json.dumps(
+                {
+                    "basis": "INSUFFICIENT_EVIDENCE",
+                    "answer": None,
+                    "sentences": [],
+                    "warnings": [],
+                },
+                separators=(",", ":"),
+            ),
+            "prompt_tokens": int(tool_usage.get("input_tokens", 0)),
+            "output_tokens": int(tool_usage.get("output_tokens", 0)),
+            "google_queries": [],
+            "google_query_count": 0,
+            "grounding_roots": [],
+            "grounding_supports": [],
+        }
+    raw_text = _message_text(message)
+    try:
+        text = _canonical_answer_json(raw_text)
+    except ValueError:
+        # 구조화 출력이 깨졌다고 해서 모델이 실제로 쓴 설명까지 버릴 이유는 없다. 여기서
+        # 통째로 닫으면 화면에는 "설명 문장이 생성되지 않았습니다"만 남고, 사용자가 얻는
+        # 것은 답이 아니라 빈 칸이다. 본문을 인용 없는 설명으로 되살리고 그 사실을 basis로
+        # 드러낸다. 이 경로는 최후 안전망이며 상시 경로가 아니다.
+        text = _plaintext_answer_json(raw_text, mode=mode)
+    roots, supports, queries = _grounding_projection(message)
+    usage: dict[str, Any] = dict(message.usage_metadata or {})
+    normalized = (
+        text
+        if mode == "JUDGE"
+        else _normalize_grounded_answer(
+            text,
+            roots,
+            supports,
+            allowed_local_ids=allowed_local_ids,
+        )
+    )
+    return {
+        "message": message,
+        "answer_json": normalized,
+        "prompt_tokens": int(usage.get("input_tokens", 0)),
+        "output_tokens": int(usage.get("output_tokens", 0)),
+        "google_queries": queries,
+        "google_query_count": len(queries),
+        "grounding_roots": roots,
+        "grounding_supports": supports,
+    }
+
+
+def _grounding_discovery_result(message: AIMessage, *, request: RunRequest) -> ProviderResult:
+    """검색 turn의 본문은 권한이 없고 provider-observed metadata만 다음 turn으로 전달한다."""
+
+    roots, supports, queries = _grounding_projection(message)
+    if request.mode == "JUDGE":
+        placeholder: dict[str, object] = {
+            "candidates": [
+                {
+                    "symbol": candidate.symbol,
+                    "score": 0.5,
+                    "veto": False,
+                    "reason": "검증된 공개 근거가 없습니다.",
+                    "evidenceSpans": [],
+                }
+                for candidate in request.candidates
+            ],
+            "summary": "검증된 공개 근거가 없습니다.",
+        }
+    else:
+        placeholder = {
+            "basis": "INSUFFICIENT_EVIDENCE",
+            "answer": None,
+            "sentences": [],
+            "warnings": [],
+        }
+    usage: dict[str, Any] = dict(message.usage_metadata or {})
+    return {
+        "message": message,
+        "answer_json": json.dumps(placeholder, ensure_ascii=False, separators=(",", ":")),
+        "prompt_tokens": int(usage.get("input_tokens", 0)),
+        "output_tokens": int(usage.get("output_tokens", 0)),
+        "google_queries": queries,
+        "google_query_count": len(queries),
+        "grounding_roots": roots,
+        "grounding_supports": supports,
+    }
+
+
+def _grounding_projection(
+    message: AIMessage,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], list[str]]:
+    grounding = message.response_metadata.get("grounding_metadata") or {}
+    if not isinstance(grounding, dict):
+        grounding = {}
+    raw_chunks = grounding.get("grounding_chunks") or grounding.get("groundingChunks") or []
+    roots: list[dict[str, object]] = []
+    for index, chunk in enumerate(raw_chunks):
+        if not isinstance(chunk, dict) or not isinstance(chunk.get("web"), dict):
+            continue
+        web = chunk["web"]
+        uri = str(web.get("uri", ""))
+        title = str(web.get("title", ""))
+        parsed = urlparse(uri)
+        raw_domain = web.get("domain")
+        domain = raw_domain.strip().lower() if isinstance(raw_domain, str) else ""
+        # Gemini may return a Google redirect URI, a null domain, and the
+        # actual source hostname as the title.  `str(None)` used to become the
+        # truthy value "None", causing every registered source to be discarded
+        # by the host.  A title is used only when it is exactly hostname-shaped;
+        # arbitrary page titles never become an authority domain.
+        title_domain = title.strip().lower()
+        if not domain and re.fullmatch(
+            r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}",
+            title_domain,
+        ):
+            domain = title_domain
+        if not domain:
+            domain = str(parsed.hostname or "").lower()
+        if parsed.scheme != "https" or not parsed.hostname or not title:
+            continue
+        roots.append(
+            {
+                "result_id": f"google_{index + 1}",
+                "title": title[:500],
+                "uri": uri[:2048],
+                "domain": domain[:253],
+                "chunk_index": index,
+                "citation_id": "",
+            }
+        )
+    raw_supports = grounding.get("grounding_supports") or grounding.get("groundingSupports") or []
+    supports: list[dict[str, object]] = []
+    for support in raw_supports:
+        if not isinstance(support, dict) or not isinstance(support.get("segment"), dict):
+            continue
+        segment = support["segment"]
+        support_text = str(segment.get("text", ""))
+        indices = (
+            support.get("grounding_chunk_indices") or support.get("groundingChunkIndices") or []
+        )
+        if (
+            support_text
+            and isinstance(indices, list)
+            and all(isinstance(value, int) for value in indices)
+        ):
+            supports.append(
+                {
+                    "start_index": _metadata_index(
+                        segment.get("start_index", segment.get("startIndex"))
+                    ),
+                    "end_index": _metadata_index(segment.get("end_index", segment.get("endIndex"))),
+                    "text": support_text[:2048],
+                    "chunk_indices": tuple(indices),
+                }
+            )
+    content_roots, content_supports, content_queries = _content_block_grounding(message)
+    if (not roots or not supports) and content_roots and content_supports:
+        roots = content_roots
+        supports = content_supports
+    raw_queries = grounding.get("web_search_queries") or grounding.get("webSearchQueries") or []
+    queries = list(
+        dict.fromkeys(
+            [str(value) for value in raw_queries if isinstance(value, str)] + content_queries
+        )
+    )
+    return roots, supports, queries
+
+
+def _metadata_index(value: object) -> int:
+    # Google grounding의 optional offset은 SDK에 따라 null일 수 있으며 support text 결속에는 필수가 아니다.
+    return value if isinstance(value, int) and value >= 0 else 0
+
+
+def _content_block_grounding(
+    message: AIMessage,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], list[str]]:
+    """LangChain Gemini 3 표준 citation annotation을 provider-neutral grounding으로 투영한다."""
+
+    roots: list[dict[str, object]] = []
+    supports: list[dict[str, object]] = []
+    queries: list[str] = []
+    root_index_by_url: dict[str, int] = {}
+    for block in message.content_blocks:
+        if not isinstance(block, dict) or block.get("type") != "text":
+            continue
+        annotations = block.get("annotations")
+        if not isinstance(annotations, list):
+            continue
+        for annotation in annotations:
+            if not isinstance(annotation, dict) or annotation.get("type") != "citation":
+                continue
+            url = annotation.get("url")
+            cited_text = annotation.get("cited_text")
+            if (
+                not isinstance(url, str)
+                or not url.startswith("https://")
+                or not isinstance(cited_text, str)
+            ):
+                continue
+            parsed = urlparse(url)
+            if not parsed.hostname or not cited_text.strip():
+                continue
+            if url not in root_index_by_url:
+                index = len(roots)
+                if index >= 5:
+                    continue
+                root_index_by_url[url] = index
+                title = annotation.get("title")
+                roots.append(
+                    {
+                        "result_id": f"google_{index + 1}",
+                        "title": title[:500]
+                        if isinstance(title, str) and title.strip()
+                        else parsed.hostname,
+                        "uri": url[:2048],
+                        "domain": parsed.hostname[:253],
+                        "chunk_index": index,
+                        "citation_id": "",
+                    }
+                )
+            index = root_index_by_url[url]
+            supports.append(
+                {
+                    "start_index": _metadata_index(
+                        annotation.get("start_index", annotation.get("startIndex"))
+                    ),
+                    "end_index": _metadata_index(
+                        annotation.get("end_index", annotation.get("endIndex"))
+                    ),
+                    "text": cited_text[:2048],
+                    "chunk_indices": (index,),
+                }
+            )
+            extras = annotation.get("extras")
+            metadata = extras.get("google_ai_metadata") if isinstance(extras, dict) else None
+            raw_queries = (
+                metadata.get("web_search_queries") or metadata.get("webSearchQueries")
+                if isinstance(metadata, dict)
+                else None
+            )
+            if isinstance(raw_queries, list):
+                queries.extend(str(value) for value in raw_queries if isinstance(value, str))
+    return roots, supports, list(dict.fromkeys(queries))
+
+
+def _exact_text_containment(left: str, right: str) -> bool:
+    """Provider가 구조화 JSON의 넓은 구간을 support로 반환해도 exact 포함 관계만 신뢰한다."""
+
+    left_value = left.strip()
+    right_value = right.strip()
+    return bool(
+        left_value and right_value and (left_value in right_value or right_value in left_value)
+    )
+
+
+def _message_text(message: AIMessage) -> str:
+    if isinstance(message.content, str):
+        return message.content
+    parts = []
+    for part in message.content:
+        if isinstance(part, str):
+            parts.append(part)
+        elif isinstance(part, dict) and part.get("type") == "text":
+            parts.append(str(part.get("text", "")))
+    return "".join(parts)
+
+
+def _canonical_answer_json(value: str) -> str:
+    """Native schema 본문만 canonicalize하고 설명문·복수 JSON·비객체 root는 허용하지 않는다."""
+
+    candidate = value.strip()
+    fenced = re.fullmatch(
+        r"```(?:json)?\s*(\{.*\})\s*```", candidate, flags=re.IGNORECASE | re.DOTALL
+    )
+    if fenced is not None:
+        candidate = fenced.group(1).strip()
+    if not candidate:
+        raise ValueError("STRONG_LLM_PROVIDER_TEXT_MISSING")
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError as error:
+        if candidate.startswith("{"):
+            leaf = (
+                "STRONG_LLM_PROVIDER_JSON_TRUNCATED"
+                if not candidate.endswith("}") or error.pos >= max(0, len(candidate) - 4)
+                else "STRONG_LLM_PROVIDER_JSON_SYNTAX_INVALID"
+            )
+        elif candidate.startswith('"'):
+            leaf = "STRONG_LLM_PROVIDER_JSON_STRING_INVALID"
+        elif "{" in candidate and "}" in candidate:
+            leaf = "STRONG_LLM_PROVIDER_JSON_SURROUNDED_OBJECT"
+        else:
+            leaf = "STRONG_LLM_PROVIDER_NON_JSON_TEXT"
+        raise ValueError(leaf) from error
+    if not isinstance(payload, dict):
+        raise ValueError("STRONG_LLM_PROVIDER_JSON_ROOT_INVALID")
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _split_sentences(text: str) -> list[str]:
+    """평문을 Kotlin의 개행 계약에 맞는 문장 목록으로 나눈다."""
+
+    normalized = re.sub(r"\s+", " ", text).strip()
+    if not normalized:
+        return []
+    parts = [part.strip() for part in re.split(r"(?<=[.!?。])\s+|(?<=[다요])\.\s+", normalized)]
+    return [part for part in parts if part]
+
+
+def _plaintext_answer_json(raw_text: str, *, mode: str) -> str:
+    """구조화 출력이 깨졌을 때 모델 본문을 인용 없는 설명으로 되살린다.
+
+    JUDGE는 점수와 veto가 곧 계약이라 평문으로 복원할 수 있는 것이 없다. 설명 모드만
+    되살리고, 본문이 정말로 비었을 때만 빈 답으로 닫는다.
+    """
+
+    if mode == "JUDGE":
+        raise ValueError("STRONG_LLM_PROVIDER_JUDGE_PLAINTEXT_FORBIDDEN")
+    sentences = _split_sentences(raw_text)
+    if not sentences:
+        raise ValueError("STRONG_LLM_PROVIDER_TEXT_MISSING")
+    payload = {
+        "basis": "MODEL_KNOWLEDGE",
+        "answer": "\n".join(sentences),
+        "sentences": [
+            {"text": sentence, "citationIds": [], "evidenceSpans": [], "numericSpans": []}
+            for sentence in sentences
+        ],
+        "warnings": [],
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _demote_to_model_knowledge(payload: dict[str, object]) -> None:
+    """문장은 그대로 두고 인용만 떼어 근거 없는 설명으로 표시한다."""
+
+    payload["basis"] = "MODEL_KNOWLEDGE"
+    payload["warnings"] = []
+    sentences = payload.get("sentences")
+    if not isinstance(sentences, list) or not sentences:
+        answer = payload.get("answer")
+        texts = _split_sentences(answer) if isinstance(answer, str) else []
+        payload["answer"] = "\n".join(texts) if texts else None
+        payload["sentences"] = [
+            {"text": text, "citationIds": [], "evidenceSpans": [], "numericSpans": []}
+            for text in texts
+        ]
+        return
+    for sentence in sentences:
+        if not isinstance(sentence, dict):
+            continue
+        sentence["citationIds"] = []
+        sentence["evidenceSpans"] = []
+        sentence["numericSpans"] = []
+    texts = [
+        str(sentence["text"])
+        for sentence in sentences
+        if isinstance(sentence, dict) and isinstance(sentence.get("text"), str)
+    ]
+    payload["answer"] = "\n".join(texts) if texts else None
+    if not texts:
+        payload["sentences"] = []
+
+
+def _grounding_evidence(result: ProviderResult) -> str:
+    payload = {
+        "queries": result["google_queries"],
+        "sources": result["grounding_roots"],
+        "supports": result["grounding_supports"],
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _normalize_grounded_answer(
+    answer_json: str,
+    roots: list[dict[str, object]],
+    supports: list[dict[str, object]],
+    *,
+    allowed_local_ids: set[str] | None = None,
+) -> str:
+    """Provider support와 실제 문장 구간이 겹치는 Google 근거만 남는 citation ID에 결속한다."""
+
+    payload = json.loads(answer_json)
+    if not isinstance(payload, dict):
+        raise ValueError("STRONG_LLM_PROVIDER_JSON_ROOT_INVALID")
+    _normalize_answer_sentence_contract(payload, prefer_answer=bool(roots and supports))
+    allowed = (
+        allowed_local_ids
+        if allowed_local_ids is not None
+        else {f"cit_{index}" for index in range(1, 6)}
+    )
+    if not roots or not supports:
+        # Google citation ID는 provider metadata를 받은 뒤 host가 부여한다. 임시/빈 label은
+        # 최종 schema 검증 전에 제거하고, 결속 가능한 근거가 없으면 명시적 부족 상태로 닫는다.
+        _bind_provider_grounding_citations(payload, [], {}, allowed)
+        _align_bound_metadata(payload)
+        if not _has_bound_evidence(payload):
+            # 결속할 근거가 없다. 예전에는 여기서 답을 통째로 비웠지만, 근거가 없다는 것은
+            # 설명이 틀렸다는 뜻이 아니라 인용을 붙일 수 없다는 뜻일 뿐이다. 문장은 그대로
+            # 두고 인용만 떼어 낸 뒤 basis로 근거 없음을 밝힌다.
+            _demote_to_model_knowledge(payload)
+        answer = StrongLlmAnswer.model_validate(payload)
+        if any(
+            citation_id not in allowed
+            for sentence in answer.sentences
+            for citation_id in sentence.citationIds
+        ):
+            raise ValueError("STRONG_LLM_PROVIDER_CITATION_UNBOUND")
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    used_local_ids = _valid_provider_citation_ids(payload, allowed)
+    valid_ids = {f"cit_{index}" for index in range(1, 6)}
+    preassigned = {
+        _chunk_index(root): str(root.get("citation_id", ""))
+        for root in roots
+        if str(root.get("citation_id", "")) in valid_ids
+    }
+    unavailable = set(used_local_ids) | set(preassigned.values())
+    available_ids = [f"cit_{index}" for index in range(1, 6) if f"cit_{index}" not in unavailable]
+    supported_root_indices = list(
+        dict.fromkeys(
+            int(index)
+            for support in supports
+            for index in _chunk_indices(support)
+            if any(_chunk_index(root) == int(index) for root in roots)
+        )
+    )
+    root_by_index: dict[int, str] = dict(preassigned)
+    unassigned_indices = [index for index in supported_root_indices if index not in root_by_index]
+    for chunk_index, citation_id in zip(unassigned_indices, available_ids, strict=False):
+        root = next(item for item in roots if _chunk_index(item) == chunk_index)
+        root["citation_id"] = citation_id
+        root_by_index[chunk_index] = citation_id
+    if not root_by_index:
+        StrongLlmAnswer.model_validate(payload)
+        return answer_json
+    _bind_provider_grounding_citations(payload, supports, root_by_index, allowed)
+    answer = StrongLlmAnswer.model_validate(payload)
+    normalized_sentences: list[dict[str, object]] = []
+    used_google = False
+    for sentence in answer.sentences:
+        supporting = [
+            support
+            for support in supports
+            if _exact_text_containment(sentence.text, str(support["text"]))
+            and any(int(index) in root_by_index for index in _chunk_indices(support))
+        ]
+        spans = [span.model_dump() for span in sentence.evidenceSpans]
+        selected_ids = list(sentence.citationIds)
+        for support in supports:
+            for index in _chunk_indices(support):
+                mapped_id = root_by_index.get(int(index))
+                if mapped_id is None:
+                    continue
+                if any(
+                    span["citationId"] == mapped_id
+                    and _exact_text_containment(span["quote"], str(support["text"]))
+                    for span in spans
+                ):
+                    used_google = True
+                    if mapped_id not in selected_ids:
+                        selected_ids.append(mapped_id)
+        for support in supporting:
+            for index in _chunk_indices(support):
+                mapped_id = root_by_index.get(int(index))
+                if mapped_id is None:
+                    continue
+                if mapped_id not in selected_ids:
+                    selected_ids.append(mapped_id)
+                support_text = str(support["text"]).strip()
+                quote = sentence.text if sentence.text in support_text else support_text
+                spans.append({"citationId": mapped_id, "quote": quote})
+                used_google = True
+        spans = list({(span["citationId"], span["quote"]): span for span in spans}.values())
+        numeric = []
+        unsupported_numeric = False
+        for match in _NUMERIC_TOKEN.finditer(sentence.text):
+            value = match.group(0)
+            citation_ids = list(
+                dict.fromkeys(span["citationId"] for span in spans if value in span["quote"])
+            )
+            if not citation_ids:
+                # 인용이 뒷받침하지 못하는 숫자가 하나 있다고 답 전체를 버리지 않는다.
+                # 그 문장만 인용 없는 설명 문장으로 내리면 숫자가 근거를 가진 척하는 일도
+                # 없고, 사용자가 읽을 문장도 사라지지 않는다.
+                unsupported_numeric = True
+                break
+            numeric.append({"value": value, "citationIds": citation_ids})
+        if unsupported_numeric:
+            normalized_sentences.append(
+                {
+                    "text": sentence.text,
+                    "citationIds": [],
+                    "evidenceSpans": [],
+                    "numericSpans": [],
+                }
+            )
+            continue
+        normalized_sentences.append(
+            {
+                "text": sentence.text,
+                "citationIds": selected_ids,
+                "evidenceSpans": spans[:12],
+                "numericSpans": numeric,
+            }
+        )
+    payload = answer.model_dump()
+    if used_google:
+        payload["basis"] = "EVIDENCE"
+    payload["sentences"] = normalized_sentences
+    if used_google:
+        payload["warnings"] = list(dict.fromkeys([*answer.warnings, "GOOGLE_GROUNDING_ONLY"]))
+    grounded = [item for item in normalized_sentences if item["citationIds"]]
+    if not grounded:
+        # 결속된 인용이 하나도 남지 않았다. 인용 없는 문장만 모인 답은 추론이 아니라
+        # 근거 없는 설명이므로 basis를 그대로 말한다.
+        _demote_to_model_knowledge(payload)
+    elif len(grounded) != len(normalized_sentences):
+        payload["basis"] = "EVIDENCE_WITH_REASONING"
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _align_bound_metadata(payload: dict[str, object]) -> None:
+    """제출된 quote의 ID·숫자 메타데이터만 재구성한다. 원문 일치는 Kotlin이 계속 검증한다."""
+    sentences = payload.get("sentences")
+    if not isinstance(sentences, list):
+        return
+    for sentence in sentences:
+        if not isinstance(sentence, dict) or not isinstance(sentence.get("text"), str):
+            continue
+        spans = sentence.get("evidenceSpans")
+        if not isinstance(spans, list) or any(
+            not isinstance(span, dict)
+            or not isinstance(span.get("citationId"), str)
+            or not isinstance(span.get("quote"), str)
+            for span in spans
+        ):
+            continue
+        bound = list(dict.fromkeys(span["citationId"] for span in spans))
+        sentence["citationIds"] = bound
+        if not bound:
+            sentence["numericSpans"] = []
+            continue
+        numeric: list[dict[str, object]] = []
+        for token in _NUMERIC_TOKEN.findall(sentence["text"]):
+            ids = list(
+                dict.fromkeys(
+                    span["citationId"]
+                    for span in spans
+                    if token in _NUMERIC_TOKEN.findall(span["quote"])
+                )
+            )
+            if not ids:
+                # 뒷받침되지 않는 숫자는 보정하지 않는다. 최종 검증에서 거부해야 한다.
+                break
+            numeric.append({"value": token, "citationIds": ids})
+        else:
+            sentence["numericSpans"] = numeric
+    if payload.get("basis") == "EVIDENCE" and any(
+        isinstance(sentence, dict) and not sentence.get("citationIds") for sentence in sentences
+    ):
+        payload["basis"] = "EVIDENCE_WITH_REASONING"
+
+
+def _has_bound_evidence(payload: dict[str, object]) -> bool:
+    sentences = payload.get("sentences")
+    if not isinstance(sentences, list):
+        return False
+    return any(
+        isinstance(sentence, dict)
+        and isinstance(sentence.get("citationIds"), list)
+        and bool(sentence["citationIds"])
+        and isinstance(sentence.get("evidenceSpans"), list)
+        and bool(sentence["evidenceSpans"])
+        for sentence in sentences
+    )
+
+
+def _normalize_answer_sentence_contract(
+    payload: dict[str, object],
+    *,
+    prefer_answer: bool,
+) -> None:
+    """모델이 중복 필드를 다르게 써도 생성 내용은 유지한 채 Kotlin newline 계약으로 정렬한다."""
+
+    basis = payload.get("basis")
+    answer = payload.get("answer")
+    sentences = payload.get("sentences")
+    if basis == "INSUFFICIENT_EVIDENCE":
+        # Vertex JSON Schema의 nullable string이 빈 문자열을 반환해도 Kotlin의 null-only 계약으로 닫는다.
+        payload["answer"] = None
+        payload["sentences"] = []
+        return
+    if not isinstance(answer, str) or not isinstance(sentences, list):
+        return
+    sentence_texts: list[str] = []
+    for item in sentences:
+        if isinstance(item, dict) and isinstance(item.get("text"), str):
+            sentence_texts.append(cast(str, item["text"]))
+    if len(sentence_texts) != len(sentences) or not sentence_texts:
+        return
+    if answer == "\n".join(sentence_texts):
+        return
+    normalized_answer = " ".join(answer.split())
+    if prefer_answer and normalized_answer and len(normalized_answer.encode("utf-8")) <= 2_048:
+        payload["answer"] = normalized_answer
+        payload["sentences"] = [
+            {
+                "text": normalized_answer,
+                "citationIds": [],
+                "evidenceSpans": [],
+                "numericSpans": [],
+            }
+        ]
+        return
+    payload["answer"] = "\n".join(sentence_texts)
+
+
+def _tool_result_citation_ids(messages: list[BaseMessage]) -> set[str]:
+    """Host tool result의 bounded JSON에서만 citation ID를 받아 provider label과 분리한다."""
+
+    citation_ids: set[str] = set()
+    for message in messages:
+        if not isinstance(message, ToolMessage) or not isinstance(message.content, str):
+            continue
+        try:
+            payload = json.loads(message.content)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        citation_id = payload.get("citationId")
+        if isinstance(citation_id, str) and re.fullmatch(r"cit_[1-5]", citation_id):
+            citation_ids.add(citation_id)
+    return citation_ids
+
+
+def _valid_provider_citation_ids(
+    payload: dict[str, object],
+    allowed_local_ids: set[str],
+) -> list[str]:
+    valid = re.compile(r"^cit_[1-5]$")
+    selected: list[str] = []
+    sentences = payload.get("sentences")
+    if not isinstance(sentences, list):
+        return selected
+    for sentence in sentences:
+        if not isinstance(sentence, dict) or not isinstance(sentence.get("citationIds"), list):
+            continue
+        for citation_id in sentence["citationIds"]:
+            if (
+                isinstance(citation_id, str)
+                and valid.fullmatch(citation_id)
+                and citation_id in allowed_local_ids
+                and citation_id not in selected
+            ):
+                selected.append(citation_id)
+    return selected
+
+
+def _bind_provider_grounding_citations(
+    payload: dict[str, object],
+    supports: list[dict[str, object]],
+    root_by_index: dict[int, str],
+    allowed_local_ids: set[str],
+) -> None:
+    """모델 label 대신 exact support quote와 provider chunk index로 Google citation을 재결속한다."""
+
+    valid = re.compile(r"^cit_[1-5]$")
+    sentences = payload.get("sentences")
+    if not isinstance(sentences, list):
+        return
+    for sentence in sentences:
+        if not isinstance(sentence, dict):
+            continue
+        raw_ids = sentence.get("citationIds")
+        selected_ids = (
+            [
+                value
+                for value in raw_ids
+                if isinstance(value, str) and valid.fullmatch(value) and value in allowed_local_ids
+            ]
+            if isinstance(raw_ids, list)
+            else []
+        )
+        raw_spans = sentence.get("evidenceSpans")
+        normalized_spans: list[dict[str, str]] = []
+        if isinstance(raw_spans, list):
+            for span in raw_spans:
+                if not isinstance(span, dict):
+                    continue
+                quote = span.get("quote")
+                citation_id = span.get("citationId")
+                if not isinstance(quote, str) or not quote:
+                    continue
+                if (
+                    isinstance(citation_id, str)
+                    and valid.fullmatch(citation_id)
+                    and citation_id in allowed_local_ids
+                ):
+                    normalized_spans.append({"citationId": citation_id, "quote": quote})
+                    continue
+                for support in supports:
+                    if not _exact_text_containment(quote, str(support.get("text", ""))):
+                        continue
+                    for index in _chunk_indices(support):
+                        mapped = root_by_index.get(index)
+                        if mapped is not None:
+                            normalized_spans.append({"citationId": mapped, "quote": quote})
+                            if mapped not in selected_ids:
+                                selected_ids.append(mapped)
+        sentence["citationIds"] = selected_ids
+        sentence["evidenceSpans"] = list(
+            {(span["citationId"], span["quote"]): span for span in normalized_spans}.values()
+        )
+        numeric_spans = sentence.get("numericSpans")
+        if isinstance(numeric_spans, list):
+            for numeric in numeric_spans:
+                if not isinstance(numeric, dict) or not isinstance(
+                    numeric.get("citationIds"), list
+                ):
+                    continue
+                numeric["citationIds"] = [
+                    value
+                    for value in numeric["citationIds"]
+                    if isinstance(value, str)
+                    and valid.fullmatch(value)
+                    and value in allowed_local_ids
+                ]
+
+
+def _assign_grounding_citation_ids(
+    roots: list[dict[str, object]],
+    unavailable_ids: set[str],
+) -> None:
+    available = [f"cit_{index}" for index in range(1, 6) if f"cit_{index}" not in unavailable_ids]
+    for root, citation_id in zip(roots, available, strict=False):
+        root["citation_id"] = citation_id
+
+
+def _chunk_indices(value: dict[str, object]) -> tuple[int, ...]:
+    raw = value.get("chunk_indices")
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    return tuple(int(cast(int, item)) for item in raw)
+
+
+def _chunk_index(value: dict[str, object]) -> int:
+    return int(cast(int, value["chunk_index"]))
+
+
+def _fallback_tools() -> list[dict[str, object]]:
+    return [
+        {
+            "name": "capstone_web_search",
+            "description": "Search the bounded public SearXNG index.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "capstone_web_read",
+            "description": "Read a previously registered public resultId.",
+            "parameters": {
+                "type": "object",
+                "properties": {"resultId": {"type": "string"}},
+                "required": ["resultId"],
+                "additionalProperties": False,
+            },
+        },
+    ]
