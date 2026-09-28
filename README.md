@@ -370,5 +370,5 @@ DB 볼륨은 지우지 마세요. 종료는 `./capstone down`만 사용하고 `d
 3. The GDELT Project, [GDELT Data](https://gdeltproject.org/data.html)
 4. Google, [OAuth 2.0 for Web Server Applications](https://developers.google.com/identity/protocols/oauth2/web-server), [Sign in with Google 브랜딩 가이드](https://developers.google.com/identity/branding-guidelines)
 5. Kakao, [카카오 로그인 REST API](https://developers.kakao.com/docs/ko/kakaologin/rest-api), [디자인 가이드](https://developers.kakao.com/docs/ko/kakaologin/design-guide)
-6. Newey, W. K., & West, K. D. (1987). A Simple, Positive Semi-Definite, Heteroskedasticity and Autocorrelation Consistent Covariance Matrix. *Econometrica*, 55(3), 703–708.
+6. Newey, W. K., & West, K. D. (1987). [A Simple, Positive Semi-Definite, Heteroskedasticity and Autocorrelation Consistent Covariance Matrix](https://doi.org/10.2307/1913610). *Econometrica*, 55(3), 703–708.
 7. OWASP, [Password Storage Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html)
