@@ -3,9 +3,14 @@ from __future__ import annotations
 import pathlib as _pub_pathlib
 import unittest as _pub_unittest
 
-_CI_DEFINITIONS = _pub_pathlib.Path(__file__).resolve().parents[2] / ".github"
+_CI_DEFINITIONS = (
+    _pub_pathlib.Path(__file__).resolve().parents[2]
+    / ".github"
+    / "workflows"
+    / "p1-offline-demo-release.yml"
+)
 _needs_ci_definitions = _pub_unittest.skipUnless(
-    _CI_DEFINITIONS.is_dir(), "CI 정의(.github)는 공개본에 포함하지 않는다"
+    _CI_DEFINITIONS.is_file(), "legacy offline-demo workflow is not part of this release"
 )
 
 
@@ -385,19 +390,6 @@ class P1ReleaseWorkflowSecurityTest(unittest.TestCase):
         self.assertIn("MAX_CONNECTIONS = 64", proxy)
         self.assertIn("IDLE_TIMEOUT_SECONDS = 30.0", proxy)
 
-    def test_signed_author_command_documents_all_required_security_arguments(self) -> None:
-        api = (REPOSITORY_ROOT / "docs" / "API_명세서.md").read_text(encoding="utf-8")
-        start = api.index("p1-verify author --approval-id")
-        command = api[start : api.index("p1-verify run", start)]
-        for argument in (
-            "--approval-id",
-            "--output-root",
-            "--kis-token-cap",
-            "--private-key",
-            "--issuer-key-id",
-            "--reason-code",
-        ):
-            self.assertIn(argument, command)
 
 
 if __name__ == "__main__":

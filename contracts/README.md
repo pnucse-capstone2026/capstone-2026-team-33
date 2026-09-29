@@ -878,7 +878,7 @@ pin한다. S1.5는 canonical Parquet이나 bundle을 자동 삭제하지 않는�
 
 2026-07-31부터 active 뉴스 권한은
 `changes/20260731-s1-3g-naver-retirement-gdelt-aggregate-lock.md`와
-`docs/adr/ADR-038-naver-retirement-gdelt-aggregate.md`를 따른다.
+`changes/20260731-s1-3g-naver-retirement-gdelt-aggregate-lock.md`를 따른다.
 2026-08-01 offline 구현은
 `changes/20260801-s1-3g-gdelt-offline-producer.md`에 고정한다.
 

@@ -36,4 +36,4 @@ Email verification, password reset mail, and provider identity transfer between 
 
 - FULL auth OpenAPI: `contracts/openapi/mars-full-auth.v1.openapi.json`
 - Forward migrations: `V212__password_accounts_and_provider_linking.sql`, `V221__password_login_change.sql`
-- API and user flow: `docs/API_명세서.md`
+- API and user flow: service routes and machine-readable contracts in `contracts/`.

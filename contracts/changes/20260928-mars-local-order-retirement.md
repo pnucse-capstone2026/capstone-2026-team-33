@@ -33,5 +33,4 @@ unlinked positions, orders, and runs. This validation did not call KIS. The publ
 release gate keeps `serviceReady=false` until user-specific natural KIS_MOCK order,
 fill/balance reconciliation, and target capacity evidence are complete.
 
-See [the API reference](../../docs/API_명세서.md) and
-[the FULL state and database verification matrix](../../docs/FULL_상태전이_DB_검증표.md).
+The implementation boundary is covered by the service source, migration, and contract tests.

@@ -147,11 +147,6 @@ flowchart TD
 - 사용자는 본인 Vertex 키를 등록·삭제할 수 있습니다. 키는 암호화해 저장하고 다시 표시하지 않습니다. 자동운용 AI 검토와 금융 Agent는 본인 키를 먼저 쓰고, 관리자가 허용한 경우에만 공용 키를 대체 경로로 씁니다.
 - 관리자는 공용 키의 설정 상태와 사용자별 사용량만 확인할 수 있습니다. 사용자 키의 비밀값은 조회할 수 없으며, 사용량은 개인 키·공용 키로 나눠 기록합니다.
 
-| 자동운용 | 주문 검토 |
-|---|---|
-| <img src="docs/screenshots/automation.png" width="420" alt="자동운용 화면"> | <img src="docs/screenshots/order-review.png" width="420" alt="주문 검토 화면"> |
-| **백테스트** | **금융 Agent** |
-| <img src="docs/screenshots/backtest.png" width="420" alt="백테스트 화면"> | <img src="docs/screenshots/agent-answers.png" width="420" alt="금융 Agent 화면"> |
 
 **계정 보안 규칙**
 

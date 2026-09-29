@@ -260,7 +260,6 @@ class BgeFullGenerationAdminPort(Protocol):
 #: 계산되므로 둘을 함께 쓰는 것도 불가능하다.
 #:
 #: 되살리려면 BGE 코퍼스를 적재해 ACTIVE 포인터를 만든 뒤 이 변수를 1 로 둔다.
-#: 절차는 docs/최종_프로젝트_명세서.md 의 임베딩 정책 절에 적어 두었다.
 #: 이름은 `bge_runtime` 이 갖는다. 두 곳에 적으면 갈라진다.
 _BGE_ENABLED_ENV = BGE_ENABLED_ENV
 

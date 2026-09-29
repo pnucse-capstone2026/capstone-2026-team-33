@@ -22,7 +22,7 @@
 - JSON Schema, REST/gRPC API, DB/Flyway, production 코드, provider 호출 변경: 없음
 - production S1.4, S1.4R, S1.4X 변경: 없음
 - 다른 팀원 workspace 변경: 없음
-- `docs/최종_프로젝트_명세서.md` 변경: 없음
+- 공개 프로젝트 안내 변경: 없음
 
 따라서 이번 변경은 wire-compatible 문서 정합화이며 P2 endpoint나 주문 기능을 활성화하지 않는다.
 향후 P2를 실제 구현하거나 schema를 추가할 때는 별도 `contracts/changes/` 기록, bilingual Issue/PR,
@@ -53,7 +53,7 @@ order authority; deterministic hard guards and a verified instrument master deci
 - No JSON Schema, REST/gRPC API, database, Flyway, production-code, or provider-call change.
 - No production S1.4, S1.4R, or S1.4X change.
 - No change to another team's workspace.
-- No change to `docs/최종_프로젝트_명세서.md`.
+- No change to the public project overview.
 
 This is a wire-compatible documentation clarification and does not activate a P2 endpoint or order
 feature. Any future P2 implementation or schema addition requires a separate `contracts/changes/`

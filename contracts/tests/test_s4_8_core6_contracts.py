@@ -444,16 +444,6 @@ class S48Core6ContractTest(unittest.TestCase):
         self.assertNotIn("팀원 B", change)
         self.assertNotIn("team member B", change)
 
-    def test_active_status_ledger_keeps_gdelt_decision_owned_and_offline_only(self) -> None:
-        ledger = (ROOT / "docs/README.md").read_text(encoding="utf-8")
-
-        self.assertIn("| S1.3G | `OFFLINE_ONLY` |", ledger)
-        self.assertIn(
-            "Decision Platform existing GDELT offline aggregate producer unchanged", ledger
-        )
-        self.assertIn("HTTP transport/executor/outbound 0", ledger)
-        self.assertNotIn("| S1.3G | `EXTERNAL_OWNER_HANDOFF` |", ledger)
-        self.assertNotIn("GDELT producer는 팀원 B", ledger)
 
 
 if __name__ == "__main__":
