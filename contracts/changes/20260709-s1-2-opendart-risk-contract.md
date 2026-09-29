@@ -36,7 +36,7 @@ Optional additive 변경이므로 breaking change 없음. `riskItems`가 없는 
 
 ## 서비스 경계 문서 계약
 
-`docs/API_명세서.md` 13.5.1에 `MarketDataService.GetDisclosureEvents`의 request/response 문서 계약을 추가했다. 실제 gRPC proto 파일은 아직 없으며, 추가 시 `contracts/proto/`에 넣고 이 절차를 다시 따른다.
+기존 공개 API 설명에 `MarketDataService.GetDisclosureEvents`의 request/response 계약을 추가했다. 실제 gRPC proto 파일은 아직 없으며, 추가 시 `contracts/proto/`에 넣고 이 절차를 다시 따른다.
 
 ## 근거 문서
 

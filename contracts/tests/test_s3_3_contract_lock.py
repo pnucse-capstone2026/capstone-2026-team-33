@@ -209,7 +209,7 @@ class S33FillContractTest(unittest.TestCase):
         contracts_readme = (ROOT / "contracts/README.md").read_text(
             encoding="utf-8"
         )
-        api = (ROOT / "docs/API_명세서.md").read_text(encoding="utf-8")
+        fill_contract = (ROOT / "contracts/catalogs/s3-3-fill-contract.v1.json").read_text(encoding="utf-8")
         root_readme = (ROOT / "README.md").read_text(encoding="utf-8")
         for document in (change, contracts_readme):
             self.assertIn(digest, document)
@@ -222,7 +222,7 @@ class S33FillContractTest(unittest.TestCase):
             "GET /api/v1/brokerage/paper/accounts/{accountId}/fills",
         ):
             self.assertIn(route, change)
-            self.assertIn(route, api)
+            self.assertIn(route, fill_contract)
         self.assertIn("decision_fill_writer", root_readme)
         self.assertIn("V6/V9/V14", root_readme)
 

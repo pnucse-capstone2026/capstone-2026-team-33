@@ -123,8 +123,6 @@ class S47dRagV2ContractTest(unittest.TestCase):
     def test_superseded_processing_mode_is_absent_from_active_runtime_and_current_docs(self) -> None:
         active_paths = (
             ROOT / "CONTRIBUTING.md",
-            ROOT / "docs/API_명세서.md",
-            ROOT / "docs/최종_프로젝트_명세서.md",
             ROOT / "contracts/README.md",
             ROOT / "contracts/catalogs/s4-rag-v2-contract.v1.json",
             ROOT / "contracts/generate_s4_7d_rag_v2_contracts.py",

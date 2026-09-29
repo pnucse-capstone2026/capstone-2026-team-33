@@ -1,8 +1,8 @@
-"""KIS OpenAPI XLSX의 `API 목록` sheet에서 docs/KIS_API_카탈로그.md를 생성한다.
+"""KIS OpenAPI XLSX의 `API 목록` sheet에서 /tmp/KIS_API_카탈로그.md를 생성한다.
 
 사용법:
     uv run --with openpyxl python scripts/generate_kis_api_catalog.py \
-        <로컬 XLSX 경로> docs/KIS_API_카탈로그.md
+        <로컬 XLSX 경로> /tmp/KIS_API_카탈로그.md
 
 XLSX 원본은 커밋하지 않는 로컬 자료이므로 경로를 인자로 받는다. 생성된
 마크다운만 커밋하며, 카탈로그 문서는 직접 수정하지 않고 이 스크립트로

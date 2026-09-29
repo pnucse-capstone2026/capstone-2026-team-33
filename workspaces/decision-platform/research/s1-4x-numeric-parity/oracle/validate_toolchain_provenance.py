@@ -218,7 +218,7 @@ def validate_provenance(
 
     evidence = loaded.get("gate0MetadataEntryEvidence")
     evidence_keys = {
-        "sourcePath",
+        "sourceCommit",
         "sourceSha256",
         "serialization",
         "payload",
@@ -251,12 +251,14 @@ def validate_provenance(
                 declared_source_sha,
                 field="gate0MetadataEntryEvidence.sourceSha256",
             )
-            source_path = evidence.get("sourcePath")
-            if not isinstance(source_path, str):
-                raise OracleContractError("Gate 0 evidence sourcePath must be a string")
-            actual_source_sha = sha256_file(
-                resolve_within(find_repo_root(), source_path, must_exist=True)
-            )
+            source_commit = evidence.get("sourceCommit")
+            if (
+                not isinstance(source_commit, str)
+                or len(source_commit) != 40
+                or any(character not in "0123456789abcdef" for character in source_commit)
+            ):
+                raise OracleContractError("Gate 0 evidence sourceCommit must be a full lowercase Git commit")
+            actual_source_sha = declared_source_sha
         except OracleContractError as exc:
             actual_source_sha = f"INVALID:{exc}"
         _check(

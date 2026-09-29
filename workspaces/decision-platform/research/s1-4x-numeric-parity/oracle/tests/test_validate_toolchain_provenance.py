@@ -152,3 +152,15 @@ def test_contract_hash_and_runtime_path_sha_version_mismatch_fail() -> None:
         "runtime.stack.sha256",
         "runtime.stack.numeric-version",
     } <= failed_ids
+
+
+def test_historical_source_commit_must_be_full_git_sha(tmp_path: Path) -> None:
+    contract = copy.deepcopy(strict_json_load(_contract_path()))
+    contract["gate0MetadataEntryEvidence"]["sourceCommit"] = "not-a-commit"
+    path = tmp_path / "contract.json"
+    atomic_write_json(path, contract)
+
+    report = _validate(path)
+
+    assert report["status"] == "FAIL"
+    assert any(check["id"] == "evidence.sourceSha256" and check["status"] == "FAIL" for check in report["checks"])
