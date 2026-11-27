@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { renderAnswerText } from './answerText';
 import { useRouter } from 'next/navigation';
 import { AsyncBoundary } from '@/shared/ui/AsyncBoundary';
@@ -55,6 +55,7 @@ export function RagGuideView() {
   const [answerState, setAnswerState] = useState<ViewState<RagAnswerView> | null>(null);
   const [pending, setPending] = useState(false);
   const [consentGranted, setConsentGranted] = useState<boolean | null>(null);
+  const consentRevision = useRef(0);
   const [consentPending, setConsentPending] = useState(false);
   const [consentError, setConsentError] = useState<string | null>(null);
   const registry = useResource(loadRegistry, []);
@@ -85,7 +86,10 @@ export function RagGuideView() {
     try {
       await recordConsent(action);
       setConsentGranted(action === 'GRANT');
-      if (action === 'REVOKE') setAnswerState(null);
+      if (action === 'REVOKE') {
+        consentRevision.current += 1;
+        setAnswerState(null);
+      }
     } catch (cause) {
       const state = toErrorState<never>(cause);
       setConsentError(
@@ -100,14 +104,18 @@ export function RagGuideView() {
 
   async function submit(text: string) {
     const trimmed = text.trim();
-    if (trimmed.length === 0 || pending) return;
+    if (trimmed.length === 0 || pending || consentPending || consentGranted !== true) return;
+    const revision = consentRevision.current;
     setPending(true);
     setAnswerState({ kind: 'loading' });
     try {
-      setAnswerState(await askRag(trimmed, answerMode));
-      history.reload();
+      const answer = await askRag(trimmed, answerMode);
+      if (revision === consentRevision.current) {
+        setAnswerState(answer);
+        history.reload();
+      }
     } catch (cause) {
-      setAnswerState(toErrorState<RagAnswerView>(cause));
+      if (revision === consentRevision.current) setAnswerState(toErrorState<RagAnswerView>(cause));
     } finally {
       setPending(false);
     }
@@ -196,7 +204,7 @@ export function RagGuideView() {
             </div>
             <Button
               onClick={() => void submit(question)}
-              disabled={pending || consentGranted !== true || question.trim().length === 0}
+              disabled={pending || consentPending || consentGranted !== true || question.trim().length === 0}
               variant="primary"
             >
               {pending ? '찾는 중' : '물어보기'}
@@ -208,6 +216,7 @@ export function RagGuideView() {
                 key={example}
                 variant="secondary"
                 size="sm"
+                disabled={pending || consentPending || consentGranted !== true}
                 onClick={() => {
                   setQuestion(example);
                   void submit(example);

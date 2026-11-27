@@ -71,3 +71,48 @@ test('live Compose control screens keep their buttons visible', async ({ page })
   expect(failed).toEqual([]);
   expect(consoleErrors).toEqual([]);
 });
+
+
+test('personal stop remains available when automation and stop status cannot be read', async ({ page }) => {
+  test.skip(!passwordFile, 'P1_USER_PASSWORD_FILE must point to the local demo password file.');
+  await page.goto('/');
+  await page.getByLabel('아이디').fill('demo-user');
+  await page.getByLabel('비밀번호').fill(readFileSync(passwordFile!, 'utf8').trimEnd());
+  await page.getByRole('button', { name: '로그인' }).click();
+  await expect(page.getByRole('heading', { name: '오늘 상태' })).toBeVisible();
+
+  const requestId = 'req_fixture_0000000000000000000000000000';
+  const unavailable = {
+    status: 503,
+    json: { success: false, requestId, data: null, error: { code: 'INTERNAL_ERROR', message: 'QA read unavailable' } },
+  };
+  await page.route('**/api/v3/automation/status', (route) => route.fulfill(unavailable));
+  let rejectStop = true;
+  await page.route('**/api/v2/risk/kill-switch', (route) => {
+    if (route.request().method() === 'GET' || rejectStop) return route.fulfill(unavailable);
+    expect(route.request().postDataJSON()).toEqual({ active: true });
+    return route.fulfill({
+      json: {
+        success: true,
+        requestId,
+        data: {
+          active: true, globalActive: false, effectiveActive: true,
+          reasonClass: 'MANUAL', changedAt: '2026-11-27T12:00:00Z',
+        },
+        error: null,
+      },
+    });
+  });
+
+  await page.goto('/automation');
+  const stop = page.getByRole('button', { name: '내 주문 즉시 중지' });
+  await expect(page.getByText('불러오기 실패 · INTERNAL_ERROR').first()).toBeVisible();
+  await expect(page.getByRole('button', { name: '내 주문 중지 해제' })).toHaveCount(0);
+  await stop.click();
+  await expect(page.locator('[data-contract="risk/owner-kill-switch"]').getByRole('alert')).toBeVisible();
+  await expect(page.getByText('내 주문 중지를 적용했습니다.')).toHaveCount(0);
+  rejectStop = false;
+  await stop.click();
+  await expect(page.getByText('내 주문 중지를 적용했습니다.')).toBeVisible();
+  await expect(page.getByRole('button', { name: '내 주문 중지 해제' })).toHaveCount(0);
+});

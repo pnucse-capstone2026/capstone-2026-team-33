@@ -331,5 +331,25 @@ def isolated_postgres_cluster() -> Iterator[PostgresTestCluster]:
     yield from _start_postgres_cluster()
 
 
+@pytest.fixture
+def ordinary_owner_postgres_cluster(
+    isolated_postgres_cluster: PostgresTestCluster,
+) -> PostgresTestCluster:
+    # These synthetic owner-isolation fixtures model an ordinary USER and a separate ADMIN.
+    # The migration tests use the unmodified cluster and retain the V213 operator consolidation.
+    with psycopg.connect(isolated_postgres_cluster["admin_dsn"]) as connection:
+        connection.execute(
+            "UPDATE users SET role='USER', security_version=1 WHERE user_id='usr_demo_user'"
+        )
+        connection.execute(
+            """
+            INSERT INTO users (user_id, username, role, password_hash)
+            VALUES ('usr_demo_admin', 'python-fixture-admin', 'ADMIN', 'test-only-hash')
+            ON CONFLICT (user_id) DO NOTHING
+            """
+        )
+    return isolated_postgres_cluster
+
+
 def _migration_version(path: Path) -> int:
     return int(path.name.split("__", maxsplit=1)[0][1:])

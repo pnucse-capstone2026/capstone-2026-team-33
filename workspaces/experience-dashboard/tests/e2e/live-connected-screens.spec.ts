@@ -93,8 +93,9 @@ test('newly connected screens render against the live Spring API', async ({ page
       .or(page.getByRole('button', { name: '내 주문 중지 해제' }))
 ,
   ).toHaveCount(1);
-  // v3 실행 목록의 판단 근거 토글
-  await expect(page.getByRole('button', { name: '판단 근거 보기' }).first()).toBeVisible();
+  const evidence = page.getByRole('button', { name: '판단 근거 보기' }).first();
+  const noRuns = page.getByText('기록된 자동운용 실행이 없습니다.', { exact: true });
+  await expect(evidence.or(noRuns).first()).toBeVisible();
 
   // ── 주문 검토: 관문 여섯과 최근 체결 ────────────────────────────────────────
   await page.getByRole('link', { name: /최근 주문 판정 보기/ }).click();

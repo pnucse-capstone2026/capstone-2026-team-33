@@ -7,7 +7,6 @@ import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.support.StaticListableBeanFactory
 import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate
 import org.springframework.mock.env.MockEnvironment
-import java.util.Base64
 
 /**
  * FULL 은 사용자 자기 Vertex 서비스 계정만 받는다. 저장소에 닿기 전에 모양을 닫으므로 DB 없이 판정한다:
@@ -17,14 +16,7 @@ class StrongLlmSettingsFullProductRuleTest {
     private val noDatabase = StaticListableBeanFactory().getBeanProvider(NamedParameterJdbcTemplate::class.java)
     private val full = MockEnvironment().apply { setActiveProfiles("mars-full") }
     private val local = MockEnvironment()
-    private val sa =
-        Base64.getEncoder().encodeToString(
-            (
-                """{"type":"service_account","project_id":"p","private_key_id":"abcd1234",""" +
-                    """"private_key":"-----BEGIN PRIVATE KEY-----\nA\n-----END PRIVATE KEY-----\n",""" +
-                    """"client_email":"a@p.iam.gserviceaccount.com","token_uri":"https://oauth2.googleapis.com/token"}"""
-            ).toByteArray(),
-        )
+    private val sa by lazy { syntheticVertexServiceAccountB64() }
 
     private fun service(environment: MockEnvironment) =
         StrongLlmSettingsService(noDatabase, mockk<ActorRlsScopePort>(relaxed = true), mockk(relaxed = true), environment)

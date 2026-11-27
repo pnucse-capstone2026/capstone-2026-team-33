@@ -391,7 +391,7 @@ def test_psycopg_owner_voyage_repository_completes_usage_and_staging_in_one_func
 
 
 def test_owner_voyage_postgres_attempt_commits_usage_ticket_and_vector_atomically(
-    isolated_postgres_cluster: dict[str, str],
+    ordinary_owner_postgres_cluster: dict[str, str],
     tmp_path: Path,
 ) -> None:
     module = importlib.import_module("app.rag.rag_v2_owner_voyage_import")
@@ -431,21 +431,21 @@ def test_owner_voyage_postgres_attempt_commits_usage_ticket_and_vector_atomicall
         token_counter=_TokenCounter(counts),
     )
     _grant_external_consent_and_issue_voyage_ticket(
-        isolated_postgres_cluster["app_dsn"],
-        isolated_postgres_cluster["identity_dsn"],
+        ordinary_owner_postgres_cluster["app_dsn"],
+        ordinary_owner_postgres_cluster["identity_dsn"],
         owner_user_id="usr_demo_user",
         event_character="a",
         ticket_ids=(ticket_id, "rti_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
     )
     bge_race_ticket = "rti_cccccccccccccccccccccccccccccccc"
     _issue_profile_ticket(
-        isolated_postgres_cluster["app_dsn"],
-        isolated_postgres_cluster["identity_dsn"],
+        ordinary_owner_postgres_cluster["app_dsn"],
+        ordinary_owner_postgres_cluster["identity_dsn"],
         owner_user_id="usr_demo_user",
         ticket_id=bge_race_ticket,
         embedding_profile_id="bge_m3_local_1024_v1",
     )
-    with psycopg.connect(isolated_postgres_cluster["admin_dsn"]) as connection:
+    with psycopg.connect(ordinary_owner_postgres_cluster["admin_dsn"]) as connection:
         assert connection.execute(
             """
             SELECT action, public_consent_event_id, policy_digest, processor_set_digest
@@ -461,7 +461,7 @@ def test_owner_voyage_postgres_attempt_commits_usage_ticket_and_vector_atomicall
             "3" * 64,
         )
     repository = module.PsycopgOwnerVoyageRepository(
-        database_dsn=isolated_postgres_cluster["rag_writer_dsn"],
+        database_dsn=ordinary_owner_postgres_cluster["rag_writer_dsn"],
     )
     missing_text = "safe document without an issued ticket"
     missing_plan = module.build_owner_voyage_import_plan(
@@ -478,7 +478,7 @@ def test_owner_voyage_postgres_attempt_commits_usage_ticket_and_vector_atomicall
     )
     with pytest.raises(module.OwnerVoyageImportError, match="OWNER_VOYAGE_ATTEMPT_REJECTED"):
         missing_ticket_lease.claim_attempt(now=datetime(2026, 8, 13, tzinfo=UTC))
-    with psycopg.connect(isolated_postgres_cluster["admin_dsn"]) as connection:
+    with psycopg.connect(ordinary_owner_postgres_cluster["admin_dsn"]) as connection:
         assert connection.execute(
             "SELECT count(*) FROM rag_v2_owner_voyage_import_attempts"
         ).fetchone() == (0,)
@@ -493,7 +493,7 @@ def test_owner_voyage_postgres_attempt_commits_usage_ticket_and_vector_atomicall
 
     with pytest.raises(OwnerBgeStagingError, match="OWNER_BGE_STAGE_REJECTED"):
         PsycopgRagV2OwnerBgeStagingRepository(
-            database_dsn=isolated_postgres_cluster["rag_writer_dsn"],
+            database_dsn=ordinary_owner_postgres_cluster["rag_writer_dsn"],
         ).stage(
             owner_user_id="usr_demo_user",
             import_ticket_id=bge_race_ticket,
@@ -538,7 +538,7 @@ def test_owner_voyage_postgres_attempt_commits_usage_ticket_and_vector_atomicall
     assert receipt.document_count == 1
     assert receipt.chunk_count == plan.batch.chunk_count
     assert receipt.embedding_profile_id == "voyage_context_4_1024_v1"
-    with psycopg.connect(isolated_postgres_cluster["admin_dsn"]) as connection:
+    with psycopg.connect(ordinary_owner_postgres_cluster["admin_dsn"]) as connection:
         assert connection.execute(
             """
             SELECT state, document_count, chunk_count, expected_input_tokens,
@@ -595,20 +595,20 @@ def test_owner_voyage_postgres_attempt_commits_usage_ticket_and_vector_atomicall
 
 
 def test_staged_bge_library_rejects_voyage_reservation_before_provider(
-    isolated_postgres_cluster: dict[str, str],
+    ordinary_owner_postgres_cluster: dict[str, str],
     tmp_path: Path,
 ) -> None:
     module = importlib.import_module("app.rag.rag_v2_owner_voyage_import")
     bge_ticket = "rti_dddddddddddddddddddddddddddddddd"
     _issue_profile_ticket(
-        isolated_postgres_cluster["app_dsn"],
-        isolated_postgres_cluster["identity_dsn"],
+        ordinary_owner_postgres_cluster["app_dsn"],
+        ordinary_owner_postgres_cluster["identity_dsn"],
         owner_user_id="usr_demo_admin",
         ticket_id=bge_ticket,
         embedding_profile_id="bge_m3_local_1024_v1",
     )
     PsycopgRagV2OwnerBgeStagingRepository(
-        database_dsn=isolated_postgres_cluster["rag_writer_dsn"],
+        database_dsn=ordinary_owner_postgres_cluster["rag_writer_dsn"],
     ).stage(
         owner_user_id="usr_demo_admin",
         import_ticket_id=bge_ticket,
@@ -620,8 +620,8 @@ def test_staged_bge_library_rejects_voyage_reservation_before_provider(
     )
     voyage_ticket = "rti_eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
     _grant_external_consent_and_issue_voyage_ticket(
-        isolated_postgres_cluster["app_dsn"],
-        isolated_postgres_cluster["identity_dsn"],
+        ordinary_owner_postgres_cluster["app_dsn"],
+        ordinary_owner_postgres_cluster["identity_dsn"],
         owner_user_id="usr_demo_admin",
         event_character="b",
         ticket_ids=(voyage_ticket,),
@@ -634,7 +634,7 @@ def test_staged_bge_library_rejects_voyage_reservation_before_provider(
     )
     lease = module.OwnerVoyageAttemptLease(
         repository=module.PsycopgOwnerVoyageRepository(
-            database_dsn=isolated_postgres_cluster["rag_writer_dsn"],
+            database_dsn=ordinary_owner_postgres_cluster["rag_writer_dsn"],
         ),
         plan=plan,
         packet_sha256="4" * 64,
@@ -644,7 +644,7 @@ def test_staged_bge_library_rejects_voyage_reservation_before_provider(
 
     with pytest.raises(module.OwnerVoyageImportError, match="OWNER_VOYAGE_ATTEMPT_REJECTED"):
         lease.claim_attempt(now=datetime(2026, 8, 13, tzinfo=UTC))
-    with psycopg.connect(isolated_postgres_cluster["admin_dsn"]) as connection:
+    with psycopg.connect(ordinary_owner_postgres_cluster["admin_dsn"]) as connection:
         assert connection.execute(
             """
             SELECT count(*)
@@ -655,19 +655,19 @@ def test_staged_bge_library_rejects_voyage_reservation_before_provider(
 
 
 def test_active_owner_overlay_delete_rebuild_counts_only_per_document_staging_generations(
-    isolated_postgres_cluster: dict[str, str],
+    ordinary_owner_postgres_cluster: dict[str, str],
     tmp_path: Path,
 ) -> None:
-    _seed_minimal_voyage_public_pointer(isolated_postgres_cluster["admin_dsn"])
+    _seed_minimal_voyage_public_pointer(ordinary_owner_postgres_cluster["admin_dsn"])
     staging = PsycopgRagV2OwnerBgeStagingRepository(
-        database_dsn=isolated_postgres_cluster["rag_writer_dsn"],
+        database_dsn=ordinary_owner_postgres_cluster["rag_writer_dsn"],
     )
     documents: list[str] = []
     for ordinal, identity in enumerate(("survivor_a", "survivor_b"), 1):
         ticket_id = f"rti_{ordinal + 20:032x}"
         _issue_profile_ticket(
-            isolated_postgres_cluster["app_dsn"],
-            isolated_postgres_cluster["identity_dsn"],
+            ordinary_owner_postgres_cluster["app_dsn"],
+            ordinary_owner_postgres_cluster["identity_dsn"],
             owner_user_id="usr_demo_user",
             ticket_id=ticket_id,
             embedding_profile_id="bge_m3_local_1024_v1",
@@ -685,21 +685,21 @@ def test_active_owner_overlay_delete_rebuild_counts_only_per_document_staging_ge
         documents.append(materialized.document.document_id)
 
     overlay = PsycopgRagV2OwnerOverlayRepository(
-        database_dsn=isolated_postgres_cluster["rag_admin_dsn"],
+        database_dsn=ordinary_owner_postgres_cluster["rag_admin_dsn"],
     ).prepare_and_activate(owner_user_id="usr_demo_user")
     assert overlay.source_count == 2
     assert overlay.chunk_count == 2
 
     first_delete_ticket = "rtd_21212121212121212121212121212121"
     _issue_delete_ticket(
-        isolated_postgres_cluster["app_dsn"],
-        isolated_postgres_cluster["identity_dsn"],
+        ordinary_owner_postgres_cluster["app_dsn"],
+        ordinary_owner_postgres_cluster["identity_dsn"],
         owner_user_id="usr_demo_user",
         document_id=documents[0],
         ticket_id=first_delete_ticket,
     )
     deletion = PsycopgRagV2OwnerBgeDeletionRepository(
-        database_dsn=isolated_postgres_cluster["rag_admin_dsn"],
+        database_dsn=ordinary_owner_postgres_cluster["rag_admin_dsn"],
     )
     assert (
         deletion.delete(
@@ -710,7 +710,7 @@ def test_active_owner_overlay_delete_rebuild_counts_only_per_document_staging_ge
         == "DELETED"
     )
 
-    with psycopg.connect(isolated_postgres_cluster["admin_dsn"]) as connection:
+    with psycopg.connect(ordinary_owner_postgres_cluster["admin_dsn"]) as connection:
         assert connection.execute(
             """
             SELECT generation.actual_source_count, generation.actual_chunk_count,
@@ -728,8 +728,8 @@ def test_active_owner_overlay_delete_rebuild_counts_only_per_document_staging_ge
 
     second_delete_ticket = "rtd_22222222222222222222222222222222"
     _issue_delete_ticket(
-        isolated_postgres_cluster["app_dsn"],
-        isolated_postgres_cluster["identity_dsn"],
+        ordinary_owner_postgres_cluster["app_dsn"],
+        ordinary_owner_postgres_cluster["identity_dsn"],
         owner_user_id="usr_demo_user",
         document_id=documents[1],
         ticket_id=second_delete_ticket,
@@ -743,7 +743,7 @@ def test_active_owner_overlay_delete_rebuild_counts_only_per_document_staging_ge
         == "DELETED"
     )
 
-    with psycopg.connect(isolated_postgres_cluster["admin_dsn"]) as connection:
+    with psycopg.connect(ordinary_owner_postgres_cluster["admin_dsn"]) as connection:
         assert connection.execute(
             """
             SELECT bundle.owner_embedding_profile_id,

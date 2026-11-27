@@ -335,6 +335,7 @@ services:
       DECISION_SOURCE_WRITER_OFFLINE_TARGET: "local"
       SERVER_ADDRESS: 0.0.0.0
       SERVER_PORT: "8080"
+      P1_DASHBOARD_PORT: "${P1_DASHBOARD_PORT:-3000}"
       # PublicSurfaceGate rejects a public mode unless the matching Spring profile is active.
       SPRING_PROFILES_ACTIVE: "${SPRING_PROFILES_ACTIVE:-}"
       MARS_PUBLIC_SURFACE_MODE: "${MARS_PUBLIC_SURFACE_MODE:-LOCAL}"

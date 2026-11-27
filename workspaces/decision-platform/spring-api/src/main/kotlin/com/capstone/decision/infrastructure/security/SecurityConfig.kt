@@ -81,6 +81,9 @@ class SecurityConfig {
     @Value("\${mars.social-login.public-origin:}")
     private var publicOrigin: String = ""
 
+    @Value("\${P1_DASHBOARD_PORT:3000}")
+    private var dashboardPort: Int = 3000
+
     @Bean
     fun passwordEncoder(): PasswordEncoder = BCryptPasswordEncoder(12)
 
@@ -416,7 +419,7 @@ class SecurityConfig {
         val configuration =
             CorsConfiguration().apply {
                 allowedOrigins =
-                    listOf("http://localhost:3000", "http://127.0.0.1:3000") +
+                    listOf("http://localhost:$dashboardPort", "http://127.0.0.1:$dashboardPort") +
                     listOf(publicOrigin).filter { it.isNotBlank() }
                 allowedMethods = listOf("GET", "POST", "PUT", "PATCH", "DELETE")
                 allowedHeaders =

@@ -17,3 +17,6 @@ contracts/proto/*.pb binary
 deploy/p1/seed/**/*.part-* binary
 deploy/p1/seed/**/*.parquet binary
 deploy/p1/seed/**/*.safetensors binary
+
+# The preview validates the received CSV byte for byte.
+workspaces/return-engine/data/stock/005930.KS.csv binary

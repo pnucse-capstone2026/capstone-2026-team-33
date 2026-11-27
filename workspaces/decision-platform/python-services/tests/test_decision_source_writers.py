@@ -88,25 +88,25 @@ def test_quote_fixture_accepts_previous_close_without_current_price(tmp_path: Pa
 
 
 def test_kis_mock_fixture_is_concurrently_idempotent_and_owner_scoped(
-    postgres_cluster: PostgresTestCluster,
+    ordinary_owner_postgres_cluster: PostgresTestCluster,
 ) -> None:
-    _reset_source_rows(postgres_cluster)
+    _reset_source_rows(ordinary_owner_postgres_cluster)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(
             executor.map(
                 lambda _: append_kis_mock_portfolio_fixture(
                     PORTFOLIO_FIXTURE,
-                    database_dsn=postgres_cluster["portfolio_writer_dsn"],
+                    database_dsn=ordinary_owner_postgres_cluster["portfolio_writer_dsn"],
                 ),
                 range(2),
             )
         )
 
     assert sorted(results) == [0, 1]
-    with psycopg.connect(postgres_cluster["app_dsn"]) as connection:
+    with psycopg.connect(ordinary_owner_postgres_cluster["app_dsn"]) as connection:
         open_actor_rls_scope(
-            identity_dsn=postgres_cluster["identity_dsn"],
+            identity_dsn=ordinary_owner_postgres_cluster["identity_dsn"],
             connection=connection,
             actor_user_id="usr_demo_user",
             actor_role="USER",
@@ -143,30 +143,30 @@ def test_kis_mock_fixture_is_concurrently_idempotent_and_owner_scoped(
 
 
 def test_deterministic_fixture_appends_complete_zero_and_previous_session_metrics(
-    postgres_cluster: PostgresTestCluster,
+    ordinary_owner_postgres_cluster: PostgresTestCluster,
 ) -> None:
-    _reset_source_rows(postgres_cluster)
+    _reset_source_rows(ordinary_owner_postgres_cluster)
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         results = list(
             executor.map(
                 lambda _: append_deterministic_metric_fixture(
                     DETERMINISTIC_FIXTURE,
-                    database_dsn=postgres_cluster["risk_writer_dsn"],
+                    database_dsn=ordinary_owner_postgres_cluster["risk_writer_dsn"],
                 ),
                 range(2),
             )
         )
     replay = append_deterministic_metric_fixture(
         DETERMINISTIC_FIXTURE,
-        database_dsn=postgres_cluster["risk_writer_dsn"],
+        database_dsn=ordinary_owner_postgres_cluster["risk_writer_dsn"],
     )
 
     assert sorted(results) == [0, 2]
     assert replay == 0
-    with psycopg.connect(postgres_cluster["app_dsn"]) as connection:
+    with psycopg.connect(ordinary_owner_postgres_cluster["app_dsn"]) as connection:
         open_actor_rls_scope(
-            identity_dsn=postgres_cluster["identity_dsn"],
+            identity_dsn=ordinary_owner_postgres_cluster["identity_dsn"],
             connection=connection,
             actor_user_id="usr_demo_user",
             actor_role="USER",

@@ -35,6 +35,7 @@ import java.util.concurrent.TimeUnit
         "spring.autoconfigure.exclude=org.springframework.boot.jdbc.autoconfigure.DataSourceAutoConfiguration,org.springframework.boot.hibernate.autoconfigure.HibernateJpaAutoConfiguration,org.springframework.boot.data.jpa.autoconfigure.DataJpaRepositoriesAutoConfiguration,org.springframework.boot.kafka.autoconfigure.KafkaAutoConfiguration",
         "app.identity.enabled=false",
         "app.http.max-request-body-bytes=2048",
+        "P1_DASHBOARD_PORT=13083",
     ],
 )
 @Import(TestOnlyAdminController::class, TestAuthRepositoryConfiguration::class)
@@ -145,7 +146,7 @@ class CommonApiContractIntegrationTest(
     fun `cors preflight allows dashboard origin and request headers`() {
         mockMvc
             .options("/api/v1/system/health") {
-                header("Origin", "http://localhost:3000")
+                header("Origin", "http://localhost:13083")
                 header("Access-Control-Request-Method", "GET")
                 header(
                     "Access-Control-Request-Headers",
@@ -153,7 +154,7 @@ class CommonApiContractIntegrationTest(
                 )
             }.andExpect {
                 status { isOk() }
-                header { string("Access-Control-Allow-Origin", "http://localhost:3000") }
+                header { string("Access-Control-Allow-Origin", "http://localhost:13083") }
                 header {
                     string(
                         "Access-Control-Allow-Headers",
@@ -166,26 +167,40 @@ class CommonApiContractIntegrationTest(
         mockMvc
             .get("/api/v1/system/health") {
                 bearer(token)
-                header("Origin", "http://localhost:3000")
+                header("Origin", "http://localhost:13083")
                 header("X-Request-Id", "req-cors-health")
             }.andExpect {
                 status { isOk() }
-                header { string("Access-Control-Allow-Origin", "http://localhost:3000") }
+                header { string("Access-Control-Allow-Origin", "http://localhost:13083") }
                 header { string("Access-Control-Expose-Headers", "X-Request-Id") }
             }
     }
 
     @Test
-    fun `cors allows documented numeric loopback dashboard origin`() {
+    fun `cors allows configured numeric loopback dashboard origin`() {
         mockMvc
             .options("/api/v1/system/health") {
-                header("Origin", "http://127.0.0.1:3000")
+                header("Origin", "http://127.0.0.1:13083")
                 header("Access-Control-Request-Method", "GET")
                 header("Access-Control-Request-Headers", "Authorization,Content-Type,X-Request-Id")
             }.andExpect {
                 status { isOk() }
-                header { string("Access-Control-Allow-Origin", "http://127.0.0.1:3000") }
+                header { string("Access-Control-Allow-Origin", "http://127.0.0.1:13083") }
             }
+    }
+
+    @Test
+    fun `cors rejects unconfigured dashboard origins`() {
+        for (origin in listOf("http://127.0.0.1:3000", "http://dashboard.example:13083")) {
+            mockMvc
+                .options("/api/v1/system/health") {
+                    header("Origin", origin)
+                    header("Access-Control-Request-Method", "GET")
+                }.andExpect {
+                    status { isForbidden() }
+                    header { doesNotExist("Access-Control-Allow-Origin") }
+                }
+        }
     }
 
     @Test

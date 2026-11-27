@@ -9,7 +9,7 @@ COPY workspaces/decision-platform/spring-api/settings.gradle.kts workspaces/deci
 COPY workspaces/decision-platform/spring-api/gradle.properties workspaces/decision-platform/spring-api/gradle.properties
 COPY contracts contracts
 COPY workspaces/decision-platform/spring-api/src workspaces/decision-platform/spring-api/src
-RUN --mount=type=cache,target=/root/.gradle \
+RUN --mount=type=cache,target=/root/.gradle,sharing=locked \
     workspaces/decision-platform/spring-api/gradlew \
       -p workspaces/decision-platform/spring-api --no-daemon --max-workers=2 \
       -Pkotlin.compiler.execution.strategy=in-process bootJar

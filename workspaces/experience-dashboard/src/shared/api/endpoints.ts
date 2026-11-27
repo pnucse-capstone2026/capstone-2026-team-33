@@ -58,7 +58,6 @@ import type {
   SignalV3Runtime,
   SystemHealthResponse,
 } from './wire';
-import { findCachedRagAnswer } from '@/features/rag-source/cachedAnswers';
 
 /**
  * Dashboard가 호출하는 endpoint 목록.
@@ -378,41 +377,11 @@ export const api = {
     return apiFetchBare<void>('/api/v2/rag/consents', { method: 'POST', body: request });
   },
 
-  /**
-   * 설명 생성은 외부 provider 를 거치므로 네트워크나 일일 상한으로 그 자리에서 닫힐 수
-   * 있다. 시연 중에 그러면 화면이 비어 버리므로, 같은 질문의 저장된 답이 있으면 그것을
-   * 대신 내보낸다. 저장된 답은 이 시스템이 실제로 낸 응답이고, 모르는 질문에는 아무것도
-   * 돌려주지 않는다.
-   */
-  async ragV2Ask(request: RagAskRequest): Promise<RagV2Answer> {
-    const cached = findCachedRagAnswer(request.question);
-    const fromCache = (requestId: string): RagV2Answer =>
-      ({
-        requestId,
-        answerId: null,
-        generationStatus: 'ANSWERED',
-        answer: cached!.answer,
-        citationCoverage: cached!.citationCoverage,
-        citations: cached!.citations,
-        retrievalFailure: false,
-        guardrailFlags: cached!.guardrailFlags,
-      }) as unknown as RagV2Answer;
-
-    try {
-      const answer = await apiFetchBare<RagV2Answer>('/api/v2/rag/ask', {
-        method: 'POST',
-        body: request,
-      });
-      if (cached && !answer.answer) {
-        return fromCache(answer.requestId);
-      }
-      return answer;
-    } catch (error) {
-      if (cached) {
-        return fromCache(newIdempotencyKey('rag-ask'));
-      }
-      throw error;
-    }
+  ragV2Ask(request: RagAskRequest): Promise<RagV2Answer> {
+    return apiFetchBare<RagV2Answer>('/api/v2/rag/ask', {
+      method: 'POST',
+      body: request,
+    });
   },
 
   ragV2WorldNews(query = '', limit = 20): Promise<WorldNewsPage> {

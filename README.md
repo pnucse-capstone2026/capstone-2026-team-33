@@ -247,11 +247,11 @@ Google·Kakao 콘솔에는 `<MARS_PUBLIC_ORIGIN>/api/v1/auth/oidc/callback/googl
 #### 실행
 
 ```bash
-./capstone up --mock
+./capstone up
 ```
 
-- 첫 실행 때 비밀값을 생성하고 이미지를 빌드한 뒤 DB 마이그레이션까지 적용합니다. `--mock`을 빼면 자동매매가 꺼진 채로 뜹니다.
-- 출력에 `CAPSTONE_UP=PASS`와 `CAPSTONE_AUTOMATION_RECONCILED=ARMED`가 모두 보이면 기동이 끝난 것입니다.
+- 첫 실행 때 비밀값을 생성하고 이미지 빌드와 DB 마이그레이션을 진행합니다. `CAPSTONE_UP=PASS`가 표시되면 웹과 API를 열 수 있습니다. 이 실행은 KIS 키 없이 시작하며 자동운용은 꺼져 있습니다.
+- KIS 모의계좌를 쓰려면 별도로 계좌 설정과 인증을 마친 뒤 `./capstone up --mock`을 실행합니다. `CAPSTONE_AUTOMATION_RECONCILED=ARMED`는 자동운용 준비 상태입니다.
 - 첫 로그인 비밀번호는 `deploy/p1/.state-app/secrets/demo-user.password`에 있습니다. 바꾸려면 `./capstone credential rotate user /절대경로/새비밀번호파일`을 실행합니다. `demo-user`는 운영자 서명 번들로 관리되어 화면에서는 바꿀 수 없습니다.
 - 이메일로 가입한 계정은 **설정 → 로그인 방법 → 비밀번호 변경**에서 현재 비밀번호를 확인하고 바꿉니다. 바꾸면 다른 기기의 로그인은 모두 해제됩니다.
 

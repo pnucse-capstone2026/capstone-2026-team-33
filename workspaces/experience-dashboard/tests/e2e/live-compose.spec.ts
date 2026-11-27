@@ -52,8 +52,14 @@ test('live Compose login and primary screens use the Spring API', async ({ page 
   await page.getByRole('tab', { name: '백테스트 리포트' }).click();
   await expect(page.getByRole('heading', { name: '백테스트 리포트' })).toBeVisible();
   await expect(page.getByRole('heading', { name: 'Baseline / Guide / Strict 비교' })).toBeVisible();
-  await expect(page.getByText('이 기간 최고 관측값')).toBeVisible();
-  await expect(page.getByText(/비용 반영 수익률입니다. 세 시나리오를 같은 DB 입력과 조건으로 계산했습니다./)).toBeVisible();
+  const bestObservation = page.getByText('이 기간 최고 관측값');
+  const baseline = page.getByRole('row', { name: /^Baseline/ });
+  await expect(baseline).toBeVisible();
+  if (await bestObservation.isVisible()) {
+    await expect(page.getByText(/비용 반영 수익률입니다. 세 시나리오를 같은 DB 입력과 조건으로 계산했습니다./)).toBeVisible();
+  } else {
+    await expect(baseline.getByRole('cell', { name: '값 없음' })).toHaveCount(3);
+  }
   await expect(page.getByText('demo_s8_fake_e2e_0001')).toHaveCount(0);
 
   await navRail.getByRole('link', { name: /^자동운용/ }).click();
@@ -119,10 +125,10 @@ test('RAG v2 screen gates the question behind consent and renders citations', as
   // "이력 0 건"으로 잘못 읽는다.
   await expect(page.locator('[data-loading="true"]')).toHaveCount(0, { timeout: 20_000 });
   const historyPanel = page.locator('section', { has: page.getByRole('heading', { name: '최근 질문' }) });
-  if ((await historyPanel.count()) === 0) {
-    await expect(page.getByText('아직 저장된 질문이 없습니다.')).toBeVisible();
-  } else {
-    const savedQuestion = historyPanel.locator('details').first();
+  const savedQuestion = historyPanel.locator('details').first();
+  const emptyHistory = historyPanel.getByText('아직 저장된 질문이 없습니다.');
+  await expect(savedQuestion.or(emptyHistory).first()).toBeVisible();
+  if (await savedQuestion.isVisible()) {
     await expect(savedQuestion).toBeVisible();
     await savedQuestion.locator('summary').click();
     await expect(savedQuestion.locator('p').first()).toBeVisible();
@@ -164,4 +170,52 @@ test('RAG v2 screen gates the question behind consent and renders citations', as
       .filter((response) => !KIS_METERED.test(new URL(response.url()).pathname))
       .map((response) => response.url()),
   ).toEqual([]);
+});
+
+test('a delayed RAG answer stays hidden after consent is revoked', async ({ page }) => {
+  test.skip(!passwordFile, 'P1_USER_PASSWORD_FILE must point to the local demo password file.');
+  await page.goto('/');
+  await page.getByLabel('아이디').fill('demo-user');
+  await page.getByLabel('비밀번호').fill(readFileSync(passwordFile!, 'utf8').trimEnd());
+  await page.getByRole('button', { name: '로그인' }).click();
+  await expect(page.getByRole('heading', { name: '오늘 상태' })).toBeVisible();
+
+  await page.route('**/api/v2/rag/consent', (route) => route.fulfill({ json: { effective: true } }));
+  await page.route('**/api/v2/rag/consents', (route) => route.fulfill({ status: 204 }));
+  let releaseAnswer!: () => void;
+  const answerGate = new Promise<void>((resolve) => { releaseAnswer = resolve; });
+  await page.route('**/api/v2/rag/ask', async (route) => {
+    await answerGate;
+    await route.fulfill({
+      json: {
+        requestId: 'req_fixture_0000000000000000000000000000',
+        answerId: null,
+        generationStatus: 'ANSWERED',
+        answer: 'Delayed fixture answer',
+        citationCoverage: 0,
+        citations: [],
+        retrievalFailure: false,
+        guardrailFlags: [],
+      },
+    });
+  });
+
+  await page.goto('/rag');
+  await page.getByLabel('질문').fill('회귀 테스트 질문');
+  try {
+    await Promise.all([
+      page.waitForRequest('**/api/v2/rag/ask'),
+      page.getByRole('button', { name: '물어보기' }).click(),
+    ]);
+    await page.getByRole('button', { name: '철회' }).click();
+    await expect(page.getByText('동의 필요', { exact: true })).toBeVisible();
+
+    const response = page.waitForResponse('**/api/v2/rag/ask');
+    releaseAnswer();
+    await response;
+    await expect(page.getByRole('button', { name: '물어보기' })).toBeDisabled();
+    await expect(page.getByText('Delayed fixture answer', { exact: true })).toHaveCount(0);
+  } finally {
+    releaseAnswer();
+  }
 });
