@@ -1,6 +1,7 @@
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { expect, test } from '@playwright/test';
+import type { OwnerPerformanceReport } from '../../src/shared/api/wire';
 
 const routes = [
   { route: '/', heading: '오늘 상태', apis: ['/api/v1/risk/portfolio', '/api/v3/automation/status'], db: ['read_portfolio_risk_snapshot', 'p1_read_automation_status_v3'] },
@@ -94,6 +95,11 @@ test('provider-free full 12-screen QA matrix', async ({ page, browser }) => {
     };
     try {
       await page.setViewportSize({ width: 1440, height: 1000 });
+      const performanceResponse = item.route === '/report'
+        ? page.waitForResponse((response) =>
+            new URL(response.url()).pathname === '/api/v1/dashboard/performance-reports/latest',
+          ).catch(() => null)
+        : null;
       await page.goto(item.route);
       // networkidle 은 유휴가 오지 않으면 영원히 기다린다. 앞선 spec 이 남긴 연결이나
       // 폴링 하나로 300 초 타임아웃이 나고, 그러면 브라우저가 닫혀 **이후 화면 전부가**
@@ -146,11 +152,21 @@ test('provider-free full 12-screen QA matrix', async ({ page, browser }) => {
         entry.apiValueMatch = newsVisible && timeShown && explains ? 'PASS' : 'FAIL';
       }
       if (item.route === '/report') {
-        entry.apiValueMatch =
-          (await page.getByText('누적 성과 보고서').isVisible()) &&
-          (await page.getByText(/두 기준을 모두 통과한 후보 없음/).isVisible())
-            ? 'PASS'
-            : 'FAIL';
+        entry.apiValueMatch = 'FAIL';
+        const response = await performanceResponse;
+        const result = await response?.json();
+        if (response?.status() === 404 && result?.error?.code === 'NOT_FOUND') {
+          await expect(page.getByText('생성된 누적 성과 보고서가 없습니다')).toBeVisible();
+        } else {
+          expect(response?.status()).toBe(200);
+          const report = (result.data as OwnerPerformanceReport).report;
+          const panel = page.locator('[data-contract="owner-performance-report.v1"]');
+          await expect(panel.getByRole('heading', { name: '누적 성과 보고서' })).toBeVisible();
+          await expect(panel).toContainText(`현재 ${report.modelAdoption.currentModel}`);
+          await expect(panel.getByText(/두 기준을 모두 통과한 후보 없음/))
+            .toHaveCount(report.modelAdoption.candidateId === null ? 1 : 0);
+        }
+        entry.apiValueMatch = 'PASS';
       }
       if (item.apis.length > 0 && faultInjectionBuild) {
         const failureContext = await browser.newContext({ viewport: { width: 390, height: 844 } });

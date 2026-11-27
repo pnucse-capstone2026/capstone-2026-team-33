@@ -55,11 +55,11 @@ export function OverviewView() {
         status: status.data,
         positions: positions?.data ?? null,
         // 종목명이 없으면 코드로 표시된다. 빈 목록이 화면을 죽이지는 않는다.
-        managedPositions: managedPositions?.data ?? { items: [] },
+        managedPositions: managedPositions?.data ?? null,
         latestRisk: latestRisk?.data ?? null,
         balance,
         instruments: instruments?.data ?? { items: [] },
-        runs: runs?.data ?? { items: [], nextCursor: null },
+        runs: runs?.data ?? null,
       },
       risk.data.asOf,
       15,
@@ -286,11 +286,11 @@ interface OverviewData {
   status: AutomationStatusV3;
   /** null 이면 실현손익 요약을 확인하지 못한 것이다. 0원으로 꾸미지 않는다. */
   positions: AutomationPositionPageV2 | null;
-  managedPositions: AutomationPositionPageV3;
+  managedPositions: AutomationPositionPageV3 | null;
   latestRisk: RecentRiskResult | null;
   balance: MockBalance | null;
   instruments: InstrumentDisplayCatalog;
-  runs: AutomationRunPageV3;
+  runs: AutomationRunPageV3 | null;
 }
 
 function LiveSummary({ data }: { data: OverviewData }) {
@@ -300,13 +300,13 @@ function LiveSummary({ data }: { data: OverviewData }) {
    * 첫 화면에는 어제까지의 보유 종목만 있었다.
    */
   const pendingRun =
-    data.runs.items.find(
+    data.runs?.items.find(
       (run) => run.state === 'ORDER_SUBMITTED' || run.state === 'PENDING_RECONCILIATION',
     ) ?? null;
   const latest = data.latestRisk;
   const balance = data.balance;
   const managedQuantities = new Map<string, number>();
-  for (const position of data.managedPositions.items) {
+  for (const position of data.managedPositions?.items ?? []) {
     if (position.accountId === data.status.accountId && position.botOwned &&
       (position.status === 'OPEN' || position.status === 'EXIT_PENDING')) {
       managedQuantities.set(position.symbol, (managedQuantities.get(position.symbol) ?? 0) + position.quantity);
@@ -348,8 +348,9 @@ function LiveSummary({ data }: { data: OverviewData }) {
 
             <ul className="mt-5 divide-y divide-line/60 border-t border-line">
               {balance.positions.map((position) => {
-                const ownership = holdingOwnership(position.quantity, managedQuantities.get(position.symbol) ?? 0);
-                const managed = ownership.managed > 0;
+                const botQuantity = data.managedPositions ? managedQuantities.get(position.symbol) ?? 0 : null;
+                const ownership = holdingOwnership(position.quantity, botQuantity);
+                const managed = (ownership?.managed ?? 0) > 0;
                 return (
                   <li
                     key={position.symbol}
@@ -362,7 +363,8 @@ function LiveSummary({ data }: { data: OverviewData }) {
                           managed ? 'bg-navy/10 text-navy' : 'bg-subtle text-muted'
                         }`}
                       >
-                        {ownership.mismatch ? '보유 수량 대사 필요' :
+                        {!ownership ? '자동운용 보유 여부 확인 불가' :
+                          ownership.mismatch ? '보유 수량 대사 필요' :
                           managed && ownership.manual > 0 ? `자동매매 ${ownership.managed}주 · 직접 보유 ${ownership.manual}주` :
                           managed ? '자동매매 관리' : '직접 보유 · 매매 제외'}
                       </span>
@@ -389,6 +391,7 @@ function LiveSummary({ data }: { data: OverviewData }) {
       </Panel>
 
       <Panel title="자동매매 운용 상태" hint="현재 제어 상태와 저장된 운용 정책을 그대로 표시합니다.">
+        {!data.runs ? <p role="status" className="mb-5 text-sm text-muted">최근 주문 진행 상태를 불러오지 못했습니다.</p> : null}
         {pendingRun ? (
           <div className="mb-5 border-l-2 border-hold pl-4">
             <p className="text-[12px] font-medium text-ink">진행 중인 주문</p>
@@ -455,7 +458,9 @@ function LiveSummary({ data }: { data: OverviewData }) {
           </div>
         ) : null}
 
-        {data.managedPositions.items.length > 0 ? (
+        {!data.managedPositions ? (
+          <p className="mt-4 text-[13px] text-muted">자동운용 포지션을 불러오지 못했습니다.</p>
+        ) : data.managedPositions.items.length > 0 ? (
           <ul className="mt-5 divide-y divide-line/60 border-t border-line">
             {data.managedPositions.items.map((position) => (
               <li key={position.positionId} className="grid gap-2 py-3 text-[13px] lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">

@@ -15,7 +15,10 @@ def test_repo_hygiene_supplies_required_collector_and_disclosure_reader_password
     """Compose 검증도 collector/reader 필수 비밀번호를 주입해 실제 CI 경계를 재현한다."""
 
     compose = (REPO_ROOT / "infra/docker-compose.infra.yml").read_text(encoding="utf-8")
-    workflow = (REPO_ROOT / ".github/workflows/repo-hygiene.yml").read_text(encoding="utf-8")
+    workflow_path = REPO_ROOT / ".github/workflows/repo-hygiene.yml"
+    if not workflow_path.is_file() and (REPO_ROOT / ".github/workflows/public-content-policy.yml").is_file():
+        pytest.skip("Development workflow is not part of the team submission")
+    workflow = workflow_path.read_text(encoding="utf-8")
 
     assert "${POSTGRES_COLLECTOR_PASSWORD:?POSTGRES_COLLECTOR_PASSWORD is required}" in compose
     assert (

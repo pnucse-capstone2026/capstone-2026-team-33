@@ -6,6 +6,7 @@ import { Numeric } from '@/shared/ui/Numeric';
 import { DecisionRail } from '@/shared/ui/Decision';
 import { useResource } from '@/shared/lib/useResource';
 import { api } from '@/shared/api/endpoints';
+import { ApiFailure } from '@/shared/api/envelope';
 import { empty, ready } from '@/shared/lib/viewState';
 import type { OwnerPerformanceReport } from '@/shared/api/wire';
 import { useLatestRun } from '@/shared/api/latestRun';
@@ -37,8 +38,15 @@ export function ReportView() {
     runId !== null,
   );
   const performance = useResource<OwnerPerformanceReport>(async () => {
-    const { data } = await api.dashboardPerformanceReport();
-    return ready(data, data.report.generatedAt);
+    try {
+      const { data } = await api.dashboardPerformanceReport();
+      return ready(data, data.report.generatedAt);
+    } catch (error) {
+      if (error instanceof ApiFailure && error.code === 'NOT_FOUND') {
+        return empty('생성된 누적 성과 보고서가 없습니다', '보고서가 생성되면 여기에 표시됩니다.');
+      }
+      throw error;
+    }
   }, []);
 
   return (

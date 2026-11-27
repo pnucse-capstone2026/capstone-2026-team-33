@@ -8,7 +8,7 @@ COPY workspaces/decision-platform/spring-api/gradle workspaces/decision-platform
 COPY workspaces/decision-platform/spring-api/settings.gradle.kts workspaces/decision-platform/spring-api/build.gradle.kts workspaces/decision-platform/spring-api/
 COPY contracts contracts
 COPY workspaces/decision-platform/spring-api/src workspaces/decision-platform/spring-api/src
-RUN --mount=type=cache,target=/root/.gradle \
+RUN --mount=type=cache,target=/root/.gradle,sharing=locked \
     workspaces/decision-platform/spring-api/gradlew \
       -p workspaces/decision-platform/spring-api --no-daemon bootJar
 

@@ -73,10 +73,10 @@ def test_owner_staging_payload_excludes_local_path_but_keeps_transient_db_input(
 
 
 def test_ticket_bound_writer_stages_owner_bge_generation_with_no_raw_table_grant(
-    isolated_postgres_cluster: dict[str, str],
+    ordinary_owner_postgres_cluster: dict[str, str],
     tmp_path: Path,
 ) -> None:
-    cluster = isolated_postgres_cluster
+    cluster = ordinary_owner_postgres_cluster
     ticket_id = "rti_11111111111111111111111111111111"
     _issue_ticket(
         cluster["app_dsn"],
@@ -185,10 +185,10 @@ def test_ticket_bound_writer_stages_owner_bge_generation_with_no_raw_table_grant
 
 
 def test_writer_rejects_other_owner_before_materializing(
-    isolated_postgres_cluster: dict[str, str],
+    ordinary_owner_postgres_cluster: dict[str, str],
     tmp_path: Path,
 ) -> None:
-    cluster = isolated_postgres_cluster
+    cluster = ordinary_owner_postgres_cluster
     ticket_id = "rti_22222222222222222222222222222222"
     _issue_ticket(
         cluster["app_dsn"],

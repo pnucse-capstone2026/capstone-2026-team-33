@@ -22,6 +22,9 @@ test('overview renders the complete stored KIS balance without account-specific 
   assert.match(overview, /balance\.positions\.map/);
   assert.match(overview, /자동매매 관리/);
   assert.match(overview, /직접 보유 · 매매 제외/);
+  assert.match(overview, /managedPositions: managedPositions\?\.data \?\? null/);
+  assert.match(overview, /!ownership \? '자동운용 보유 여부 확인 불가'/);
+  assert.match(overview, /최근 주문 진행 상태를 불러오지 못했습니다/);
   assert.match(overview, /policy\.capitalLimitKrw - stockValue/);
   assert.match(overview, /직접 보유 종목도 운용 한도와 위험 계산에는 포함/);
   assert.doesNotMatch(overview, /000660|006400|549_?000/);

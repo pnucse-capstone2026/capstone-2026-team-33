@@ -525,8 +525,8 @@ class InfrastructureSecurityIntegrationTest {
             ).use { connection ->
                 connection.createStatement().use { statement ->
                     assertEquals(
-                        "2",
-                        queryScalar(statement, "select count(*)::text from read_demo_credentials()"),
+                        "demo-user",
+                        queryScalar(statement, "select string_agg(username, ',' order by username) from read_demo_credentials()"),
                     )
                     val denied = assertThrows<SQLException> { statement.executeQuery("select * from users") }
                     assertEquals("42501", denied.sqlState)
@@ -541,7 +541,7 @@ class InfrastructureSecurityIntegrationTest {
                         queryScalar(
                             statement,
                             "select session_handle from authenticate_demo_actor_session_v1(" +
-                                "'demo-admin','${SpringApiIntegrationTestBase.TEST_ADMIN_PASSWORD}',3600)",
+                                "'demo-user','${SpringApiIntegrationTestBase.TEST_USER_PASSWORD}',3600)",
                         )
                     val callerSelectedActor =
                         assertThrows<SQLException> {
@@ -762,7 +762,7 @@ class InfrastructureSecurityIntegrationTest {
                             }
                         }
                         assertEquals(emptyList<String>(), execute("LIST_ASYNC_JOBS"))
-                        assertEquals(listOf("usr_demo_admin"), execute("READ_ASYNC_JOB"))
+                        assertEquals(listOf("usr_demo_user"), execute("READ_ASYNC_JOB"))
                         assertEquals(emptyList<String>(), execute("READ_ASYNC_JOB"))
                     }
                 val selectedActor =
@@ -821,7 +821,7 @@ class InfrastructureSecurityIntegrationTest {
             queryScalar(
                 statement,
                 "select session_handle from authenticate_demo_actor_session_v1(" +
-                    "'demo-admin','${SpringApiIntegrationTestBase.TEST_ADMIN_PASSWORD}',3600)",
+                    "'demo-user','${SpringApiIntegrationTestBase.TEST_USER_PASSWORD}',3600)",
             )
 
         fun registrationFailure(sessionHandle: String): SQLException =
@@ -852,22 +852,37 @@ class InfrastructureSecurityIntegrationTest {
 
         val stale = createSession()
         DriverManager.getConnection(postgres.jdbcUrl, postgres.username, adminPassword).use { admin ->
-            admin.createStatement().use { it.executeUpdate("update users set security_version=2 where user_id='usr_demo_admin'") }
+            admin.createStatement().use { it.executeUpdate("update users set security_version=security_version+1 where user_id='usr_demo_user'") }
         }
         try {
             assertEquals("42501", registrationFailure(stale).sqlState)
         } finally {
             DriverManager.getConnection(postgres.jdbcUrl, postgres.username, adminPassword).use { admin ->
-                admin.createStatement().use { it.executeUpdate("update users set security_version=1 where user_id='usr_demo_admin'") }
+                admin.createStatement().use { it.executeUpdate("update users set security_version=security_version-1 where user_id='usr_demo_user'") }
             }
         }
 
-        val userSession =
-            queryScalar(
-                statement,
-                "select session_handle from authenticate_demo_actor_session_v1(" +
-                    "'demo-user','${SpringApiIntegrationTestBase.TEST_USER_PASSWORD}',3600)",
-            )
+        val userSession = "sid1_" + "c".repeat(64)
+        DriverManager.getConnection(postgres.jdbcUrl, postgres.username, adminPassword).use { admin ->
+            admin.createStatement().use { fixture ->
+                fixture.executeUpdate(
+                    """
+                    insert into users(user_id,username,password_hash,role,status,security_version)
+                    values ('usr_security_fixture','security-fixture',
+                      concat(chr(36),'2b',chr(36),'12',chr(36),repeat('a',53)),
+                      'USER','ACTIVE',1)
+                    """.trimIndent(),
+                )
+                fixture.executeUpdate(
+                    """
+                    insert into actor_auth_session(
+                      session_hash,actor_user_id,actor_role,actor_security_version,issued_at,expires_at
+                    ) values ('sha256:'||encode(digest('$userSession','sha256'),'hex'),
+                      'usr_security_fixture','USER',1,now(),now()+interval '1 hour')
+                    """.trimIndent(),
+                )
+            }
+        }
         assertEquals("42501", registrationFailure(userSession).sqlState)
     }
 

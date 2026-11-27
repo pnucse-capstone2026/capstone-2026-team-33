@@ -10,7 +10,7 @@ export function Numeric({ value, format, missingReason, className = '' }: Numeri
   if (value === null || !Number.isFinite(value)) {
     return (
       <span
-        className={`hatch inline-flex items-center rounded-full border border-line px-2.5 py-0.5 text-[12px] text-faint ${className}`}
+        className={`hatch relative inline-flex items-center rounded-full border border-line px-2.5 py-0.5 text-[12px] text-faint ${className}`}
         title={missingReason ?? '검증된 근거가 없어 값을 표시하지 않습니다.'}
       >
         <span aria-hidden>—</span>

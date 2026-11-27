@@ -24,7 +24,7 @@ def test_worker_dsn_requires_the_exact_login_role() -> None:
 
 
 def test_worker_commit_is_atomic_idempotent_and_least_privileged(
-    isolated_postgres_cluster: dict[str, str],
+    ordinary_owner_postgres_cluster: dict[str, str],
 ) -> None:
     job_id = "job_worker_fixture_00000001"
     event_id = "evt_worker_fixture_00000001"
@@ -48,7 +48,7 @@ def test_worker_commit_is_atomic_idempotent_and_least_privileged(
     canonical_binding = "".join(f"{len(value.encode())}:{value}\n" for value in binding_values)
     payload_hash = "sha256:" + hashlib.sha256(canonical_binding.encode()).hexdigest()
     capability_token = "cap2_" + "a" * 64 + "." + "b" * 86
-    with psycopg.connect(isolated_postgres_cluster["identity_dsn"], autocommit=True) as identity:
+    with psycopg.connect(ordinary_owner_postgres_cluster["identity_dsn"], autocommit=True) as identity:
         capability = identity.execute(
             """
             SELECT register_actor_request_capability_v2(
@@ -72,7 +72,7 @@ def test_worker_commit_is_atomic_idempotent_and_least_privileged(
             ),
         ).fetchone()
         assert capability == (True,)
-    with psycopg.connect(isolated_postgres_cluster["app_dsn"], autocommit=True) as app:
+    with psycopg.connect(ordinary_owner_postgres_cluster["app_dsn"], autocommit=True) as app:
         assert app.execute(
             "SELECT create_async_request_authorized(%s,%s,%s,%s,%s,%s,%s,%s)",
             (
@@ -98,7 +98,7 @@ def test_worker_commit_is_atomic_idempotent_and_least_privileged(
             (event_id, claimed_event[1], payload_hash),
         ).fetchone() == (True,)
 
-    with psycopg.connect(isolated_postgres_cluster["worker_dsn"], autocommit=True) as worker:
+    with psycopg.connect(ordinary_owner_postgres_cluster["worker_dsn"], autocommit=True) as worker:
         claimed_job = worker.execute(
             "SELECT claim_token FROM claim_async_job_by_event(%s,%s,%s,%s,%s,%s)",
             (
@@ -125,7 +125,7 @@ def test_worker_commit_is_atomic_idempotent_and_least_privileged(
         transport="DB",
         partition_key=claimed_event[3],
     )
-    repository = PostgresAsyncWorkRepository(isolated_postgres_cluster["worker_dsn"], b"p" * 64)
+    repository = PostgresAsyncWorkRepository(ordinary_owner_postgres_cluster["worker_dsn"], b"p" * 64)
     first = AsyncWorkProcessor(repository).process(work)
     assert first.outcome == "COMPLETED"
     assert AsyncWorkProcessor(repository).process(work).outcome == "DUPLICATE"
@@ -142,7 +142,7 @@ def test_worker_commit_is_atomic_idempotent_and_least_privileged(
     assert conflict.outcome == "FAILED"
     assert conflict.failure_code == "POISON_RECEIPT_UNAVAILABLE"
 
-    with psycopg.connect(isolated_postgres_cluster["admin_dsn"]) as admin:
+    with psycopg.connect(ordinary_owner_postgres_cluster["admin_dsn"]) as admin:
         assert admin.execute(
             "SELECT status FROM async_job WHERE job_id=%s", (job_id,)
         ).fetchone() == ("COMPLETED",)
@@ -161,7 +161,7 @@ def test_worker_commit_is_atomic_idempotent_and_least_privileged(
             (event_id,),
         ).fetchone() == (0,)
 
-    with psycopg.connect(isolated_postgres_cluster["worker_dsn"]) as worker:
+    with psycopg.connect(ordinary_owner_postgres_cluster["worker_dsn"]) as worker:
         for table in ("principles", "orders", "users", "flyway_schema_history"):
             with pytest.raises(psycopg.errors.InsufficientPrivilege):
                 worker.execute(f"SELECT * FROM {table} LIMIT 1")

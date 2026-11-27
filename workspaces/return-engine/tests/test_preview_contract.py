@@ -3,7 +3,12 @@ from pathlib import Path
 
 import pytest
 
-from preview_contract import load_and_verify_preview, verify_received_file
+from preview_contract import RECEIVED_CSV_SHA256, load_and_verify_preview, verify_received_file
+
+
+def test_checkout_preserves_received_csv_bytes() -> None:
+    received = Path(__file__).resolve().parents[1] / "data" / "stock" / "005930.KS.csv"
+    assert verify_received_file(received, RECEIVED_CSV_SHA256, "received CSV") == RECEIVED_CSV_SHA256
 
 
 def test_received_hash_mismatch_fails_closed(tmp_path: Path) -> None:

@@ -406,10 +406,22 @@ DECISION_RISK_WRITER_DATABASE_DSN=postgresql://decision_risk_writer:%s@postgres:
   fi
   # RAG v2 로컬 루트는 비어 있어도 된다. 마운트만 항상 성립하게 두고, 실제 leaf가 없으면
   # RAG v2를 켰을 때 entrypoint가 닫는다. 운영자가 다른 경로를 쓰려면 이 값을 바꾼다.
-  install -d -m 0700 "$STATE_DIR/rag-v2-root"
+  local rag_runtime_root=$STATE_DIR/rag-v2-root
+  [[ ! -L $rag_runtime_root ]] || die RAG_RUNTIME_DIR_BOUNDARY
+  # The seed container owns the existing mount after first startup.
+  if [[ ! -d $rag_runtime_root ]]; then
+    install -d -m 0700 "$rag_runtime_root"
+  fi
   if ! grep -q '^P1_RAG_RUNTIME_DIR=' "$RUNTIME_ENV"; then
     printf 'P1_RAG_RUNTIME_DIR=%s\n' "$STATE_DIR/rag-v2-root" | append_state runtime.env 0600
   fi
+  # Recover owner-only permissions on state already created by the older initializer.
+  local approval_path
+  for approval_path in "$SECRETS_DIR/kis-mock-approval-private.pem" "$SECRETS_DIR/p1-provider-claim.dsn"; do
+    if [[ ! -L $approval_path && -f $approval_path && -O $approval_path && $(stat -c '%a:%h' "$approval_path") == 640:1 ]]; then
+      chmod 0600 -- "$approval_path"
+    fi
+  done
   local approval_files=0 approval_file
   for approval_file in kis-mock-approval-private.pem kis-mock-approval-public.pem kis-mock-approval-trust-policy.json p1-provider-claim.dsn; do
     [[ ! -e $SECRETS_DIR/$approval_file ]] || approval_files=$((approval_files + 1))
@@ -776,7 +788,7 @@ up_app() {
   remove_old_preview_containers
   printf 'CAPSTONE_UP=PASS\nCAPSTONE_PERSISTENT_CONTAINERS=%s\n' "$running"
   printf 'CAPSTONE_DASHBOARD_URL=http://127.0.0.1:%s\n' "${P1_DASHBOARD_PORT:-3000}"
-  printf 'CAPSTONE_API_URL=http://127.0.0.1:%s\n' "${P1_API_PORT:-18080}"
+  printf 'CAPSTONE_API_URL=http://127.0.0.1:%s\n' "$(api_port)"
   if ((mock)); then
     printf 'KIS_BROKERAGE_MODE=KIS_MOCK\n'
   else
@@ -814,7 +826,7 @@ reconcile_automation_intent() {
 # 배포를 세우는 쪽이 훨씬 나쁘다. 대신 무슨 일이 있었는지는 마커로 남긴다.
 reconcile_ai_judgement() {
   local base enabled
-  base="http://127.0.0.1:$(sed -n 's/^P1_API_PORT=//p' "$RUNTIME_ENV")"
+  base="http://127.0.0.1:$(api_port)"
   enabled=$(compose exec -T postgres psql -U postgres -d capstone_p1 -At \
     -c "select ai_judgement_enabled from strong_llm_owner_settings where owner_user_id='usr_demo_user'" \
     2>/dev/null | tr -d '\r') || {
@@ -892,10 +904,18 @@ logs() {
     -e 's/(password|secret|token|account|credential|bundle|hmac|jwt|private[_-]?key|kek|dsn)([=:][^ ,}]*)/\1=[REDACTED]/Ig'
 }
 
+api_port() {
+  local port=${P1_API_PORT:-}
+  if [[ -z $port ]]; then
+    port=$(sed -n 's/^P1_API_PORT=//p' "$RUNTIME_ENV")
+  fi
+  printf '%s' "${port:-18080}"
+}
+
 smoke() {
   state_ready || die NOT_INITIALIZED
   require_command python3
-  local base="http://127.0.0.1:$(sed -n 's/^P1_API_PORT=//p' "$RUNTIME_ENV")"
+  local base="http://127.0.0.1:$(api_port)"
   P1_BASE_URL=$base P1_USER_PASSWORD_FILE=$SECRETS_DIR/demo-user.password python3 - <<'PY'
 import json, os, urllib.request
 with urllib.request.urlopen(os.environ["P1_BASE_URL"] + "/actuator/health", timeout=5) as response:
@@ -967,7 +987,6 @@ team_a_acceptance() {
   fi
   if [[ $result == 0 ]] && ! P1_DASHBOARD_URL="http://127.0.0.1:${P1_DASHBOARD_PORT:-3000}" \
     P1_USER_PASSWORD_FILE="$SECRETS_DIR/demo-user.password" \
-    P1_ADMIN_PASSWORD_FILE="$SECRETS_DIR/demo-admin.password" \
     npm --prefix "$REPO_ROOT/workspaces/experience-dashboard" run test:e2e:owner-acceptance; then
     result=$?
     [[ $result != 0 ]] || result=1

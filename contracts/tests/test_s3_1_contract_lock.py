@@ -5,7 +5,8 @@ import unittest as _pub_unittest
 
 _CI_DEFINITIONS = _pub_pathlib.Path(__file__).resolve().parents[2] / ".github"
 _needs_ci_definitions = _pub_unittest.skipUnless(
-    _CI_DEFINITIONS.is_dir(), "CI 정의(.github)는 공개본에 포함하지 않는다"
+    any(path.name != "public-content-policy.yml" for path in _CI_DEFINITIONS.glob("workflows/*.yml")),
+    "Release workflows are outside the team submission repository",
 )
 
 

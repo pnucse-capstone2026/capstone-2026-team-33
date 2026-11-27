@@ -194,8 +194,8 @@ class P1ReleaseWorkflowSecurityTest(unittest.TestCase):
             dockerfile,
         )
         self.assertIn("postgres:16.14-alpine3.24@sha256:", dockerfile)
-        self.assertIn("libcrypto3=3.5.8-r0", dockerfile)
-        self.assertIn("libssl3=3.5.8-r0", dockerfile)
+        self.assertIn("libcrypto3=3.5.9-r1", dockerfile)
+        self.assertIn("libssl3=3.5.9-r1", dockerfile)
         self.assertIn("libuuid=2.42.3-r1", dockerfile)
         self.assertIn("PGVECTOR_VERSION=0.8.6", dockerfile)
         self.assertIn(
@@ -214,8 +214,8 @@ class P1ReleaseWorkflowSecurityTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("redis:7.2-alpine@sha256:", dockerfile)
-        self.assertIn("libcrypto3=3.3.7-r1", dockerfile)
-        self.assertIn("libssl3=3.3.7-r1", dockerfile)
+        self.assertIn("libcrypto3=3.3.7-r2", dockerfile)
+        self.assertIn("libssl3=3.3.7-r2", dockerfile)
 
     def test_runtime_images_and_secret_boundary_are_pinned(self) -> None:
         python_dockerfile = (
@@ -241,7 +241,10 @@ class P1ReleaseWorkflowSecurityTest(unittest.TestCase):
         self.assertIn("openjdk-25-jre=25.0.4.1-r0", spring_dockerfile)
         self.assertIn('runtimeOnly("org.postgresql:postgresql:42.7.12")', build)
         self.assertIn('group_add: ["${P1_SECRET_GID}"]', compose)
-        self.assertIn('chmod 640 "$SECRETS_DIR"/*', p1ctl)
+        for filename in ("kis-mock-approval-private.pem", "p1-provider-claim.dsn"):
+            self.assertIn(f'state_write_file "$SECRETS_DIR/{filename}" 0600', p1ctl)
+        self.assertIn('state_write_file "$SECRETS_DIR/postgres.env" 0640', p1ctl)
+        self.assertNotIn('chmod 640 "$SECRETS_DIR"/*', p1ctl)
 
     def test_gradle_dependencies_are_locked_and_checksum_verified(self) -> None:
         project = REPOSITORY_ROOT / "workspaces" / "decision-platform" / "spring-api"
@@ -259,6 +262,7 @@ class P1ReleaseWorkflowSecurityTest(unittest.TestCase):
         dockerignore = (REPOSITORY_ROOT / ".dockerignore").read_text(encoding="utf-8")
         self.assertIn("deploy/p1/.state", dockerignore.splitlines())
         self.assertIn("deploy/p1/.state/**", dockerignore.splitlines())
+        self.assertIn("deploy/p1/.state-app/**", dockerignore.splitlines())
         self.assertIn("**/.state", dockerignore.splitlines())
 
     @_needs_ci_definitions

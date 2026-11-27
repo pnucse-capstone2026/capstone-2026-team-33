@@ -59,7 +59,21 @@ def expected_public_readme() -> str:
         kept.append(line)
     if in_screenshot_table:
         raise ValueError("baseline README screenshot table has no closing row")
-    return "".join(kept)
+    text = "".join(kept)
+    # Keep the clean-install correction explicit in the baseline comparison.
+    previous_start = """./capstone up --mock
+```
+
+- 첫 실행 때 비밀값을 생성하고 이미지를 빌드한 뒤 DB 마이그레이션까지 적용합니다. `--mock`을 빼면 자동매매가 꺼진 채로 뜹니다.
+- 출력에 `CAPSTONE_UP=PASS`와 `CAPSTONE_AUTOMATION_RECONCILED=ARMED`가 모두 보이면 기동이 끝난 것입니다."""
+    current_start = """./capstone up
+```
+
+- 첫 실행 때 비밀값을 생성하고 이미지 빌드와 DB 마이그레이션을 진행합니다. `CAPSTONE_UP=PASS`가 표시되면 웹과 API를 열 수 있습니다. 이 실행은 KIS 키 없이 시작하며 자동운용은 꺼져 있습니다.
+- KIS 모의계좌를 쓰려면 별도로 계좌 설정과 인증을 마친 뒤 `./capstone up --mock`을 실행합니다. `CAPSTONE_AUTOMATION_RECONCILED=ARMED`는 자동운용 준비 상태입니다."""
+    if text.count(previous_start) != 1:
+        raise ValueError("baseline README startup instructions are missing or ambiguous")
+    return text.replace(previous_start, current_start, 1)
 
 
 def main() -> int:

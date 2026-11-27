@@ -227,6 +227,7 @@ class S49VertexStrongLlmGenerationAdapterTest {
         S49StrongLlmProperties(
             enabled = true,
             localRoot = "/tmp",
+            serviceAccountJsonB64 = "dGVzdA==",
             ownerConsentPolicySha256 = "0".repeat(64),
             ownerConsentProcessorSetSha256 = "1".repeat(64),
         ),
